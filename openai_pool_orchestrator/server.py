@@ -1118,10 +1118,10 @@ async def api_get_sync_config() -> Dict[str, Any]:
         if not isinstance(pcfg, dict):
             continue
         sc = dict(pcfg)
-        for secret_key in ("bearer_token", "api_key"):
+        for secret_key, keep in (("bearer_token", 8), ("api_key", 8), ("forward_to_token", 12), ("forward_to_password", 8)):
             val = str(sc.get(secret_key, ""))
             if val:
-                sc[f"{secret_key}_preview"] = (val[:8] + "...") if len(val) > 8 else val
+                sc[f"{secret_key}_preview"] = (val[:keep] + "...") if len(val) > keep else val
                 sc.pop(secret_key, None)
         safe_configs[pname] = sc
     cfg["mail_provider_configs"] = safe_configs
@@ -1871,12 +1871,11 @@ async def api_get_mail_config() -> Dict[str, Any]:
     cfg = _sync_config
     # 兼容旧格式
     mail_cfg = dict(cfg.get("mail_config") or {})
-    token = str(mail_cfg.get("bearer_token", ""))
-    mail_cfg["bearer_token_preview"] = (token[:12] + "...") if len(token) > 12 else token
-    mail_cfg.pop("bearer_token", None)
-    key = str(mail_cfg.get("api_key", ""))
-    mail_cfg["api_key_preview"] = (key[:8] + "...") if len(key) > 8 else key
-    mail_cfg.pop("api_key", None)
+    for secret_key, keep in (("bearer_token", 12), ("api_key", 8), ("forward_to_token", 12), ("forward_to_password", 8)):
+        secret_value = str(mail_cfg.get(secret_key, ""))
+        if secret_value:
+            mail_cfg[f"{secret_key}_preview"] = (secret_value[:keep] + "...") if len(secret_value) > keep else secret_value
+            mail_cfg.pop(secret_key, None)
 
     # 脱敏 provider_configs 中的敏感字段
     raw_configs = cfg.get("mail_provider_configs") or {}

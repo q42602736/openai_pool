@@ -9,6 +9,15 @@
     "mailtm": {
       "api_base": "https://api.mail.tm"
     },
+    "mailtm_forward": {
+      "api_base": "https://api.mail.tm",
+      "custom_domains": "example.com,example.net",
+      "forward_to_email": "your-mailtm@xx.mail.tm",
+      "forward_to_password": "",
+      "forward_to_token": "",
+      "alias_prefix": "oc",
+      "alias_length": 12
+    },
     "duckmail": {
       "api_base": "https://api.duckmail.sbs"
     },

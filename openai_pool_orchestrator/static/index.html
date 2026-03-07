@@ -504,6 +504,44 @@
                 </div>
               </div>
             </div>
+            <div class="provider-item" data-provider="mailtm_forward">
+              <label class="provider-toggle">
+                <input type="checkbox" class="mail-provider-check" value="mailtm_forward" />
+                <span class="provider-check-mark"></span>
+                自定义域名 + Mail.tm 转发
+              </label>
+              <div class="provider-config" style="display:none;">
+                <div class="config-field">
+                  <label>自定义域名</label>
+                  <textarea data-key="custom_domains" rows="3" placeholder="example.com,
+example.net" autocomplete="off" spellcheck="false"></textarea>
+                </div>
+                <div class="config-field">
+                  <label>Mail.tm API 地址</label>
+                  <input type="text" data-key="api_base" placeholder="https://api.mail.tm" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="config-field">
+                  <label>转发目标邮箱</label>
+                  <input type="text" data-key="forward_to_email" placeholder="your-mailtm@xx.mail.tm" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="config-field">
+                  <label>转发目标邮箱密码</label>
+                  <input type="password" data-key="forward_to_password" placeholder="Mail.tm 邮箱密码" autocomplete="off" />
+                </div>
+                <div class="config-field">
+                  <label>转发目标 Bearer Token（可选）</label>
+                  <input type="password" data-key="forward_to_token" placeholder="已知可直接填写，否则留空" autocomplete="off" />
+                </div>
+                <div class="config-field">
+                  <label>别名前缀</label>
+                  <input type="text" data-key="alias_prefix" placeholder="oc" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="config-field">
+                  <label>随机长度</label>
+                  <input type="number" data-key="alias_length" min="6" max="24" placeholder="12" autocomplete="off" />
+                </div>
+              </div>
+            </div>
             <div class="provider-item" data-provider="moemail">
               <label class="provider-toggle">
                 <input type="checkbox" class="mail-provider-check" value="moemail" />
