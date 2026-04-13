@@ -1,0 +1,20 @@
+{
+  "_comment": "分享版示例：把下面占位值替换成你自己的 cfmail 信息后，再另存为 zhuce5_cfmail_accounts.json 使用。",
+  "_how_to_fill": [
+    "name: 自定义配置名，例如 hk-node-1 / us-node-2。",
+    "worker_domain: 你的 cfmail worker / 后端接口域名，例如 apimail.example.com。不要带 https://。",
+    "email_domain: 你的邮箱域名，例如 example.com。",
+    "admin_password: 你的 cfmail 管理员密码。",
+    "enabled: true 表示启用，false 表示保留但暂不参与轮询。"
+  ],
+  "accounts": [
+    {
+      "_comment": "主节点示例：请把所有 <...> 占位符替换掉。",
+      "name": "",
+      "worker_domain": "",
+      "email_domain": "",
+      "admin_password": "",
+      "enabled": true
+    }
+  ]
+}

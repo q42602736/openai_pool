@@ -9,7 +9,10 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -21,6 +24,10 @@ try:
     import aiohttp
 except ImportError:
     aiohttp = None
+
+from .check_alive import check_access_token, try_refresh_token
+from .codex_checker import check_quota
+from .token_compat import normalize_token_data
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +66,148 @@ def _extract_account_id(item: Dict[str, Any]) -> Optional[str]:
         if val:
             return str(val)
     return None
+
+
+def _parse_time_to_epoch(raw: Any) -> float:
+    text = str(raw or "").strip()
+    if not text:
+        return 0.0
+    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        return datetime.fromisoformat(iso_text).timestamp()
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except Exception:
+            continue
+    return 0.0
+
+
+def _coerce_json_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            data = json.loads(text)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _first_non_empty_str(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _normalize_expired_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.utcfromtimestamp(float(value)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            return ""
+    return str(value or "").strip()
+
+
+def _extract_token_bundle(item: Dict[str, Any]) -> Dict[str, str]:
+    normalized_item = normalize_token_data(item, default_type=str(item.get("type") or "codex"))
+    sources: List[Dict[str, Any]] = [normalized_item]
+    for key in (
+        "credentials",
+        "extra",
+        "content",
+        "body",
+        "data",
+        "payload",
+        "auth_data",
+        "file_content",
+        "json",
+    ):
+        nested = _coerce_json_dict(item.get(key))
+        if nested:
+            sources.append(nested)
+            nested_credentials = _coerce_json_dict(nested.get("credentials"))
+            if nested_credentials:
+                sources.append(nested_credentials)
+            nested_extra = _coerce_json_dict(nested.get("extra"))
+            if nested_extra:
+                sources.append(nested_extra)
+
+    access_token = ""
+    refresh_token = ""
+    account_id = ""
+    chatgpt_user_id = ""
+    session_token = ""
+    id_token = ""
+    plan_type = ""
+    email = ""
+    expired = ""
+
+    for source in sources:
+        access_token = access_token or _first_non_empty_str(
+            source.get("access_token"),
+            source.get("accessToken"),
+        )
+        refresh_token = refresh_token or _first_non_empty_str(
+            source.get("refresh_token"),
+            source.get("refreshToken"),
+        )
+        account_id = account_id or _first_non_empty_str(
+            source.get("account_id"),
+            source.get("accountId"),
+            source.get("chatgpt_account_id"),
+            source.get("chatgptAccountId"),
+            _extract_account_id(source),
+        )
+        chatgpt_user_id = chatgpt_user_id or _first_non_empty_str(
+            source.get("chatgpt_user_id"),
+            source.get("chatgptUserId"),
+        )
+        session_token = session_token or _first_non_empty_str(
+            source.get("session_token"),
+            source.get("sessionToken"),
+        )
+        id_token = id_token or _first_non_empty_str(
+            source.get("id_token"),
+            source.get("idToken"),
+        )
+        plan_type = plan_type or _first_non_empty_str(
+            source.get("plan_type"),
+            source.get("planType"),
+        )
+        email = email or _first_non_empty_str(
+            source.get("email"),
+            source.get("username"),
+            source.get("name"),
+        ).lower()
+        expired = expired or _normalize_expired_value(
+            source.get("expired")
+            or source.get("expire")
+            or source.get("expires_at")
+            or source.get("expiresAt")
+        )
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "account_id": account_id,
+        "chatgpt_user_id": chatgpt_user_id,
+        "session_token": session_token,
+        "id_token": id_token,
+        "plan_type": plan_type,
+        "email": email,
+        "expired": expired,
+    }
 
 
 class PoolMaintainer:
@@ -155,14 +304,124 @@ class PoolMaintainer:
                 "auth_index": auth_index,
                 "invalid_401": False,
                 "invalid_used_percent": False,
+                "invalid_alive": False,
+                "invalid_quota": False,
                 "used_percent": None,
+                "refresh_status": "",
+                "access_status": "",
+                "quota_status": "",
+                "invalid_reason": "",
                 "error": None,
             }
+
+            token_bundle = _extract_token_bundle(item)
+            max_token_tries = max(1, retries + 1)
+
+            refresh_token = token_bundle.get("refresh_token") or ""
+            if refresh_token:
+                try:
+                    refresh_status, refresh_data, refresh_error = await asyncio.to_thread(
+                        try_refresh_token,
+                        refresh_token,
+                        None,
+                        max_token_tries,
+                    )
+                    result["refresh_status"] = refresh_status
+                    if refresh_status == "alive" and isinstance(refresh_data, dict):
+                        merged_bundle = normalize_token_data(
+                            {
+                                **token_bundle,
+                                **refresh_data,
+                            },
+                            default_type="codex",
+                        )
+                        token_bundle["access_token"] = _first_non_empty_str(
+                            merged_bundle.get("access_token"),
+                            token_bundle.get("access_token"),
+                        )
+                        token_bundle["refresh_token"] = _first_non_empty_str(
+                            merged_bundle.get("refresh_token"),
+                            token_bundle.get("refresh_token"),
+                        )
+                        token_bundle["account_id"] = _first_non_empty_str(
+                            merged_bundle.get("account_id"),
+                            token_bundle.get("account_id"),
+                        )
+                        token_bundle["chatgpt_user_id"] = _first_non_empty_str(
+                            merged_bundle.get("chatgpt_user_id"),
+                            token_bundle.get("chatgpt_user_id"),
+                        )
+                        token_bundle["session_token"] = _first_non_empty_str(
+                            merged_bundle.get("session_token"),
+                            token_bundle.get("session_token"),
+                        )
+                        token_bundle["id_token"] = _first_non_empty_str(
+                            merged_bundle.get("id_token"),
+                            token_bundle.get("id_token"),
+                        )
+                        token_bundle["plan_type"] = _first_non_empty_str(
+                            merged_bundle.get("plan_type"),
+                            token_bundle.get("plan_type"),
+                        )
+                        token_bundle["email"] = _first_non_empty_str(
+                            merged_bundle.get("email"),
+                            token_bundle.get("email"),
+                        ).lower()
+                        token_bundle["expired"] = _normalize_expired_value(
+                            merged_bundle.get("expired") or merged_bundle.get("expires_at") or token_bundle.get("expired")
+                        )
+                    elif refresh_status in {"deleted", "token_invalid"}:
+                        result["invalid_alive"] = True
+                        result["invalid_reason"] = refresh_error or refresh_status
+                        return result
+                except Exception as exc:
+                    result["error"] = str(exc)
+
+            access_token = token_bundle.get("access_token") or ""
+            if access_token:
+                try:
+                    access_status, access_error = await asyncio.to_thread(
+                        check_access_token,
+                        access_token,
+                        None,
+                        max_token_tries,
+                    )
+                    result["access_status"] = access_status
+                    if access_status in {"deleted", "expired"}:
+                        result["invalid_alive"] = True
+                        result["invalid_reason"] = access_error or access_status
+                        return result
+                except Exception as exc:
+                    result["error"] = str(exc)
+
+                try:
+                    quota_result = await asyncio.to_thread(
+                        check_quota,
+                        token_bundle,
+                        None,
+                        max(15, timeout),
+                    )
+                    result["quota_status"] = str(quota_result.get("status") or "")
+                    if quota_result.get("used_percent") is not None:
+                        result["used_percent"] = quota_result.get("used_percent")
+                    if result["quota_status"] == "exhausted":
+                        result["invalid_quota"] = True
+                        result["invalid_reason"] = str(quota_result.get("detail") or "额度已耗尽")
+                        return result
+                    if result["quota_status"] == "expired_token" and not result["invalid_alive"]:
+                        result["invalid_alive"] = True
+                        result["invalid_reason"] = str(quota_result.get("detail") or "额度检测判定 token 无效")
+                        return result
+                except Exception as exc:
+                    if not result.get("error"):
+                        result["error"] = str(exc)
+
             if not auth_index:
-                result["error"] = "missing auth_index"
+                if not (result["refresh_status"] or result["access_status"] or result["quota_status"]):
+                    result["error"] = result["error"] or "missing auth_index"
                 return result
 
-            account_id = _extract_account_id(item)
+            account_id = _first_non_empty_str(token_bundle.get("account_id"), _extract_account_id(item))
             call_header = {
                 "Authorization": "Bearer $TOKEN$",
                 "Content-Type": "application/json",
@@ -196,7 +455,7 @@ class PoolMaintainer:
                             if sc == 200:
                                 try:
                                     body_data = _safe_json(data.get("body", ""))
-                                    used_pct = (body_data.get("rate_limit", {}).get("primary_window", {}).get("used_percent"))
+                                    used_pct = body_data.get("rate_limit", {}).get("primary_window", {}).get("used_percent")
                                     if used_pct is not None:
                                         result["used_percent"] = used_pct
                                         result["invalid_used_percent"] = used_pct >= self.used_percent_threshold
@@ -230,7 +489,12 @@ class PoolMaintainer:
             tasks = [asyncio.create_task(probe_one(session, item)) for item in candidates]
             for task in asyncio.as_completed(tasks):
                 result = await task
-                if result.get("invalid_401") or result.get("invalid_used_percent"):
+                if (
+                    result.get("invalid_401")
+                    or result.get("invalid_used_percent")
+                    or result.get("invalid_alive")
+                    or result.get("invalid_quota")
+                ):
                     invalid_list.append(result)
 
         return {
@@ -302,22 +566,24 @@ class PoolMaintainer:
     def upload_token(self, filename: str, token_data: Dict[str, Any], proxy: str = "") -> bool:
         if not self.base_url or not self.token:
             return False
-        session = _build_session(proxy)
-        content = json.dumps(token_data, ensure_ascii=False).encode("utf-8")
+        normalized_token = normalize_token_data(token_data, default_type=str(token_data.get("type") or "codex"))
+        content = json.dumps(normalized_token, ensure_ascii=False).encode("utf-8")
         files = {"file": (filename, content, "application/json")}
         headers = {"Authorization": f"Bearer {self.token}"}
-        for attempt in range(3):
-            try:
-                resp = session.post(
-                    f"{self.base_url}/v0/management/auth-files",
-                    files=files, headers=headers, verify=False, timeout=30,
-                )
-                if resp.status_code in (200, 201, 204):
-                    return True
-            except Exception:
-                pass
-            if attempt < 2:
-                time.sleep(2 ** attempt)
+        
+        with _build_session(proxy) as session:
+            for attempt in range(3):
+                try:
+                    resp = session.post(
+                        f"{self.base_url}/v0/management/auth-files",
+                        files=files, headers=headers, verify=False, timeout=30,
+                    )
+                    if resp.status_code in (200, 201, 204):
+                        return True
+                except Exception:
+                    pass
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
         return False
 
 
@@ -337,7 +603,7 @@ class Sub2ApiMaintainer:
         self.min_candidates = min_candidates
         self.email = email
         self.password = password
-        self._session = _build_session()
+        self._auth_lock = threading.Lock()
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -347,32 +613,41 @@ class Sub2ApiMaintainer:
         }
 
     def _login(self) -> str:
-        resp = self._session.post(
-            f"{self.base_url}/api/v1/auth/login",
-            json={"email": self.email, "password": self.password},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        token = (
-            data.get("token")
-            or data.get("access_token")
-            or (data.get("data") or {}).get("token")
-            or (data.get("data") or {}).get("access_token")
-            or ""
-        )
-        if token:
-            self.bearer_token = token
-        return token
+        with _build_session() as session:
+            resp = session.post(
+                f"{self.base_url}/api/v1/auth/login",
+                json={"email": self.email, "password": self.password},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            token = (
+                data.get("token")
+                or data.get("access_token")
+                or (data.get("data") or {}).get("token")
+                or (data.get("data") or {}).get("access_token")
+                or ""
+            )
+            if token:
+                self.bearer_token = token
+            return token
 
     def _request(self, method: str, path: str, **kwargs) -> _requests.Response:
         kwargs.setdefault("timeout", 15)
         url = f"{self.base_url}{path}"
-        resp = self._session.request(method, url, headers=self._headers(), **kwargs)
-        if resp.status_code == 401 and self.email and self.password:
-            self._login()
-            resp = self._session.request(method, url, headers=self._headers(), **kwargs)
-        return resp
+        with _build_session() as session:
+            resp = session.request(method, url, headers=self._headers(), **kwargs)
+            if resp.status_code == 401 and self.email and self.password:
+                current_token = self.bearer_token
+                with self._auth_lock:
+                    if self.bearer_token == current_token:
+                        self._login()
+                refreshed_token = self.bearer_token
+                if refreshed_token or self.bearer_token != current_token:
+                    resp = session.request(method, url, headers=self._headers(), **kwargs)
+                    return resp
+                resp = session.request(method, url, headers=self._headers(), **kwargs)
+            return resp
 
     def get_dashboard_stats(self, timeout: int = 15) -> Dict[str, Any]:
         resp = self._request(
@@ -398,6 +673,456 @@ class Sub2ApiMaintainer:
         data = resp.json()
         return data.get("data") if isinstance(data.get("data"), dict) else data
 
+    def _list_all_accounts(self, timeout: int = 15, page_size: int = 100) -> List[Dict[str, Any]]:
+        all_accounts: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            data = self.list_accounts(page=page, page_size=page_size, timeout=timeout)
+            items = data.get("items") or []
+            if not isinstance(items, list):
+                items = []
+            all_accounts.extend([i for i in items if isinstance(i, dict)])
+            if not items or len(items) < page_size:
+                break
+            total = data.get("total")
+            if isinstance(total, int) and total > 0 and len(all_accounts) >= total:
+                break
+            page += 1
+        return all_accounts
+
+    def _account_identity(self, item: Dict[str, Any]) -> Dict[str, str]:
+        email = ""
+        rt = ""
+        extra = item.get("extra")
+        if isinstance(extra, dict):
+            email = str(extra.get("email") or "").strip().lower()
+        if not email:
+            name = str(item.get("name") or "").strip().lower()
+            if "@" in name:
+                email = name
+        creds = item.get("credentials")
+        if isinstance(creds, dict):
+            rt = str(creds.get("refresh_token") or "").strip()
+        return {"email": email, "refresh_token": rt}
+
+    @staticmethod
+    def _account_sort_key(item: Dict[str, Any]) -> tuple[float, int]:
+        updated = _parse_time_to_epoch(item.get("updated_at") or item.get("updatedAt"))
+        try:
+            item_id = int(item.get("id") or 0)
+        except (TypeError, ValueError):
+            item_id = 0
+        return (updated, item_id)
+
+    @staticmethod
+    def _normalize_account_id(raw: Any) -> Optional[int]:
+        try:
+            account_id = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if account_id <= 0:
+            return None
+        return account_id
+
+    @staticmethod
+    def _is_abnormal_status(status: Any) -> bool:
+        return str(status or "").strip().lower() in ("error", "disabled")
+
+    def _build_dedupe_plan(self, all_accounts: List[Dict[str, Any]], details_limit: int = 120) -> Dict[str, Any]:
+        id_to_account: Dict[int, Dict[str, Any]] = {}
+        parent: Dict[int, int] = {}
+        key_to_ids: Dict[str, List[int]] = {}
+
+        for item in all_accounts:
+            acc_id = self._normalize_account_id(item.get("id"))
+            if acc_id is None:
+                continue
+            id_to_account[acc_id] = item
+            parent[acc_id] = acc_id
+
+            identity = self._account_identity(item)
+            email = identity["email"]
+            refresh_token = identity["refresh_token"]
+            if email:
+                key_to_ids.setdefault(f"email:{email}", []).append(acc_id)
+            if refresh_token:
+                key_to_ids.setdefault(f"rt:{refresh_token}", []).append(acc_id)
+
+        def find(x: int) -> int:
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != x:
+                nxt = parent[x]
+                parent[x] = root
+                x = nxt
+            return root
+
+        def union(a: int, b: int) -> None:
+            ra = find(a)
+            rb = find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for ids in key_to_ids.values():
+            if len(ids) > 1:
+                head = ids[0]
+                for acc_id in ids[1:]:
+                    union(head, acc_id)
+
+        components: Dict[int, List[int]] = {}
+        for acc_id in id_to_account.keys():
+            root = find(acc_id)
+            components.setdefault(root, []).append(acc_id)
+
+        duplicate_groups = [ids for ids in components.values() if len(ids) > 1]
+        delete_ids: List[int] = []
+        group_details: List[Dict[str, Any]] = []
+
+        for group_ids in duplicate_groups:
+            group_items = [id_to_account[i] for i in group_ids]
+            keep_item = max(group_items, key=self._account_sort_key)
+            keep_id = self._normalize_account_id(keep_item.get("id")) or 0
+            group_delete_ids = sorted([i for i in group_ids if i != keep_id], reverse=True)
+            delete_ids.extend(group_delete_ids)
+
+            if len(group_details) < details_limit:
+                emails_set = set()
+                for it in group_items:
+                    identity = self._account_identity(it)
+                    if identity["email"]:
+                        emails_set.add(identity["email"])
+                emails = sorted(emails_set)
+                group_details.append({
+                    "keep_id": keep_id,
+                    "delete_ids": group_delete_ids,
+                    "size": len(group_ids),
+                    "emails": emails,
+                })
+
+        return {
+            "duplicate_groups": len(duplicate_groups),
+            "duplicate_accounts": sum(len(g) for g in duplicate_groups),
+            "delete_ids": delete_ids,
+            "groups_preview": group_details,
+            "truncated_groups": max(0, len(duplicate_groups) - len(group_details)),
+        }
+
+    def list_account_inventory(self, timeout: int = 15) -> Dict[str, Any]:
+        all_accounts = self._list_all_accounts(timeout=timeout, page_size=100)
+        dedupe_plan = self._build_dedupe_plan(
+            all_accounts,
+            details_limit=max(1, len(all_accounts)),
+        )
+        duplicate_delete_ids = {
+            int(account_id)
+            for account_id in (dedupe_plan.get("delete_ids") or [])
+            if isinstance(account_id, int)
+        }
+        duplicate_map: Dict[int, Dict[str, Any]] = {}
+        for group in dedupe_plan.get("groups_preview") or []:
+            keep_id = self._normalize_account_id(group.get("keep_id"))
+            delete_ids = [
+                account_id
+                for account_id in (
+                    self._normalize_account_id(item)
+                    for item in (group.get("delete_ids") or [])
+                )
+                if account_id is not None
+            ]
+            group_ids = ([keep_id] if keep_id is not None else []) + delete_ids
+            group_size = max(1, int(group.get("size") or len(group_ids) or 1))
+            emails = [str(email).strip().lower() for email in (group.get("emails") or []) if str(email).strip()]
+            for account_id in group_ids:
+                duplicate_map[account_id] = {
+                    "group_size": group_size,
+                    "keep_id": keep_id,
+                    "delete_candidate": account_id in duplicate_delete_ids,
+                    "emails": emails,
+                }
+
+        items: List[Dict[str, Any]] = []
+        abnormal_count = 0
+        for raw_item in sorted(all_accounts, key=self._account_sort_key, reverse=True):
+            account_id = self._normalize_account_id(raw_item.get("id"))
+            if account_id is None:
+                continue
+            identity = self._account_identity(raw_item)
+            status = str(raw_item.get("status") or "").strip().lower() or "unknown"
+            if self._is_abnormal_status(status):
+                abnormal_count += 1
+            duplicate_info = duplicate_map.get(account_id) or {}
+            items.append({
+                "id": account_id,
+                "name": str(raw_item.get("name") or "").strip(),
+                "email": identity.get("email") or str(raw_item.get("name") or "").strip(),
+                "status": status,
+                "updated_at": raw_item.get("updated_at") or raw_item.get("updatedAt") or "",
+                "created_at": raw_item.get("created_at") or raw_item.get("createdAt") or "",
+                "is_duplicate": bool(duplicate_info),
+                "duplicate_group_size": int(duplicate_info.get("group_size") or 0),
+                "duplicate_keep": duplicate_info.get("keep_id") == account_id,
+                "duplicate_delete_candidate": bool(duplicate_info.get("delete_candidate")),
+                "duplicate_emails": duplicate_info.get("emails") or [],
+            })
+
+        return {
+            "total": len(items),
+            "error_count": abnormal_count,
+            "duplicate_groups": int(dedupe_plan.get("duplicate_groups", 0)),
+            "duplicate_accounts": int(dedupe_plan.get("duplicate_accounts", 0)),
+            "items": items,
+        }
+
+    def _refresh_accounts_parallel(self, account_ids: List[int], timeout: int = 30, workers: int = 8) -> Dict[str, List[int]]:
+        success_ids: List[int] = []
+        failed_ids: List[int] = []
+        ids = [i for i in account_ids if isinstance(i, int) and i > 0]
+        if not ids:
+            return {"success_ids": success_ids, "failed_ids": failed_ids}
+
+        pool_workers = max(1, min(workers, 16, len(ids)))
+        with ThreadPoolExecutor(max_workers=pool_workers) as executor:
+            future_to_id = {
+                executor.submit(self.refresh_account, account_id, timeout=timeout): account_id
+                for account_id in ids
+            }
+            for future in as_completed(future_to_id):
+                account_id = future_to_id[future]
+                try:
+                    ok = bool(future.result())
+                except Exception:
+                    ok = False
+                if ok:
+                    success_ids.append(account_id)
+                else:
+                    failed_ids.append(account_id)
+        return {"success_ids": success_ids, "failed_ids": failed_ids}
+
+    def _delete_accounts_parallel(self, account_ids: List[int], timeout: int = 15, workers: int = 12) -> Dict[str, Any]:
+        deleted_ok_ids: List[int] = []
+        failed_ids: List[int] = []
+        unique_ids = sorted({i for i in account_ids if isinstance(i, int) and i > 0}, reverse=True)
+        if not unique_ids:
+            return {"deleted_ok": 0, "deleted_fail": 0, "deleted_ok_ids": deleted_ok_ids, "failed_ids": failed_ids}
+
+        pool_workers = max(1, min(workers, 24, len(unique_ids)))
+        with ThreadPoolExecutor(max_workers=pool_workers) as executor:
+            future_to_id = {
+                executor.submit(self.delete_account, account_id, timeout=timeout): account_id
+                for account_id in unique_ids
+            }
+            for future in as_completed(future_to_id):
+                account_id = future_to_id[future]
+                try:
+                    ok = bool(future.result())
+                except Exception:
+                    ok = False
+                if ok:
+                    deleted_ok_ids.append(account_id)
+                else:
+                    failed_ids.append(account_id)
+
+        return {
+            "deleted_ok": len(deleted_ok_ids),
+            "deleted_fail": len(failed_ids),
+            "deleted_ok_ids": deleted_ok_ids,
+            "failed_ids": failed_ids,
+        }
+
+    def dedupe_duplicate_accounts(self, timeout: int = 15, dry_run: bool = True, details_limit: int = 120) -> Dict[str, Any]:
+        """
+        清理 Sub2Api 中 OpenAI OAuth 重复账号（按 email 或 refresh_token 判重）。
+        - 同一连通重复组保留“最新”账号（updated_at 优先，其次 id 最大）。
+        - dry_run=True 时仅预览，不执行删除。
+        """
+        all_accounts = self._list_all_accounts(timeout=timeout, page_size=100)
+        dedupe_plan = self._build_dedupe_plan(all_accounts, details_limit=details_limit)
+        delete_ids = dedupe_plan["delete_ids"]
+        deleted_ok = 0
+        deleted_fail = 0
+        failed_ids: List[int] = []
+        if not dry_run and delete_ids:
+            delete_result = self._delete_accounts_parallel(delete_ids, timeout=timeout, workers=12)
+            deleted_ok = int(delete_result.get("deleted_ok", 0))
+            deleted_fail = int(delete_result.get("deleted_fail", 0))
+            failed_ids = list(delete_result.get("failed_ids") or [])
+
+        return {
+            "dry_run": dry_run,
+            "total": len(all_accounts),
+            "duplicate_groups": int(dedupe_plan["duplicate_groups"]),
+            "duplicate_accounts": int(dedupe_plan["duplicate_accounts"]),
+            "to_delete": len(delete_ids),
+            "deleted_ok": deleted_ok,
+            "deleted_fail": deleted_fail,
+            "failed_delete_ids": failed_ids[:200],
+            "groups_preview": dedupe_plan["groups_preview"],
+            "truncated_groups": int(dedupe_plan["truncated_groups"]),
+        }
+
+    def probe_accounts(self, account_ids: List[int], timeout: int = 30) -> Dict[str, Any]:
+        ids = sorted({
+            account_id
+            for account_id in (
+                self._normalize_account_id(item)
+                for item in (account_ids or [])
+            )
+            if account_id is not None
+        })
+        if not ids:
+            return {
+                "requested": 0,
+                "refreshed_ok": 0,
+                "refreshed_fail": 0,
+                "recovered": 0,
+                "still_abnormal": 0,
+                "details": [],
+            }
+
+        before_status = self._list_accounts_by_ids(ids, timeout=timeout)
+        refresh_result = self._refresh_accounts_parallel(ids, timeout=max(30, timeout), workers=8)
+        success_ids = set(refresh_result.get("success_ids") or [])
+        failed_ids = set(refresh_result.get("failed_ids") or [])
+
+        if success_ids:
+            time.sleep(2)
+        after_status = self._list_accounts_by_ids(ids, timeout=timeout)
+
+        recovered_ids: List[int] = []
+        abnormal_after_ids: List[int] = []
+        details: List[Dict[str, Any]] = []
+        for account_id in ids:
+            before = str(before_status.get(account_id) or "unknown").strip().lower()
+            after = str(after_status.get(account_id) or before or "unknown").strip().lower()
+            if self._is_abnormal_status(before) and not self._is_abnormal_status(after):
+                recovered_ids.append(account_id)
+            if self._is_abnormal_status(after):
+                abnormal_after_ids.append(account_id)
+            if len(details) < 200:
+                details.append({
+                    "id": account_id,
+                    "before_status": before,
+                    "after_status": after,
+                    "refresh_ok": account_id in success_ids,
+                })
+
+        return {
+            "requested": len(ids),
+            "refreshed_ok": len(success_ids),
+            "refreshed_fail": len(failed_ids),
+            "recovered": len(recovered_ids),
+            "still_abnormal": len(abnormal_after_ids),
+            "details": details,
+        }
+
+    def delete_accounts_batch(self, account_ids: List[int], timeout: int = 15) -> Dict[str, Any]:
+        ids = [
+            account_id
+            for account_id in (
+                self._normalize_account_id(item)
+                for item in (account_ids or [])
+            )
+            if account_id is not None
+        ]
+        delete_result = self._delete_accounts_parallel(ids, timeout=timeout, workers=12)
+        return {
+            "requested": len({*ids}),
+            "deleted_ok": int(delete_result.get("deleted_ok", 0)),
+            "deleted_fail": int(delete_result.get("deleted_fail", 0)),
+            "deleted_ok_ids": list(delete_result.get("deleted_ok_ids") or []),
+            "failed_ids": list(delete_result.get("failed_ids") or []),
+        }
+
+    def handle_exception_accounts(
+        self,
+        account_ids: Optional[List[int]] = None,
+        timeout: int = 30,
+        delete_unresolved: bool = True,
+    ) -> Dict[str, Any]:
+        requested_ids = [
+            account_id
+            for account_id in (
+                self._normalize_account_id(item)
+                for item in (account_ids or [])
+            )
+            if account_id is not None
+        ]
+
+        if requested_ids:
+            current_status = self._list_accounts_by_ids(requested_ids, timeout=timeout)
+            target_ids = [
+                account_id
+                for account_id in requested_ids
+                if self._is_abnormal_status(current_status.get(account_id))
+            ]
+            skipped_non_abnormal = max(0, len(set(requested_ids)) - len(target_ids))
+        else:
+            all_accounts = self._list_all_accounts(timeout=timeout, page_size=100)
+            target_ids = [
+                account_id
+                for account_id in (
+                    self._normalize_account_id(item.get("id"))
+                    for item in all_accounts
+                    if self._is_abnormal_status(item.get("status"))
+                )
+                if account_id is not None
+            ]
+            skipped_non_abnormal = 0
+
+        unique_target_ids = sorted(set(target_ids))
+        if not unique_target_ids:
+            return {
+                "requested": len(set(requested_ids)) if requested_ids else 0,
+                "targeted": 0,
+                "refreshed_ok": 0,
+                "refreshed_fail": 0,
+                "recovered": 0,
+                "remaining_abnormal": 0,
+                "deleted_ok": 0,
+                "deleted_fail": 0,
+                "skipped_non_abnormal": skipped_non_abnormal,
+            }
+
+        refresh_result = self._refresh_accounts_parallel(unique_target_ids, timeout=max(30, timeout), workers=8)
+        if refresh_result.get("success_ids"):
+            time.sleep(2)
+        after_status = self._list_accounts_by_ids(unique_target_ids, timeout=timeout)
+        remaining_abnormal_ids = [
+            account_id
+            for account_id in unique_target_ids
+            if self._is_abnormal_status(after_status.get(account_id))
+        ]
+        remaining_abnormal_set = set(remaining_abnormal_ids)
+        recovered_ids = [
+            account_id
+            for account_id in unique_target_ids
+            if account_id not in remaining_abnormal_set
+        ]
+
+        delete_result = {
+            "deleted_ok": 0,
+            "deleted_fail": 0,
+            "deleted_ok_ids": [],
+            "failed_ids": [],
+        }
+        if delete_unresolved and remaining_abnormal_ids:
+            delete_result = self._delete_accounts_parallel(remaining_abnormal_ids, timeout=timeout, workers=12)
+
+        return {
+            "requested": len(set(requested_ids)) if requested_ids else len(unique_target_ids),
+            "targeted": len(unique_target_ids),
+            "refreshed_ok": len(refresh_result.get("success_ids") or []),
+            "refreshed_fail": len(refresh_result.get("failed_ids") or []),
+            "recovered": len(recovered_ids),
+            "remaining_abnormal": len(remaining_abnormal_ids),
+            "deleted_ok": int(delete_result.get("deleted_ok", 0)),
+            "deleted_fail": int(delete_result.get("deleted_fail", 0)),
+            "deleted_ok_ids": list(delete_result.get("deleted_ok_ids") or []),
+            "failed_ids": list(delete_result.get("failed_ids") or []),
+            "skipped_non_abnormal": skipped_non_abnormal,
+        }
+
     def refresh_account(self, account_id: int, timeout: int = 30) -> bool:
         try:
             resp = self._request(
@@ -420,10 +1145,13 @@ class Sub2ApiMaintainer:
 
     def get_pool_status(self, timeout: int = 15) -> Dict[str, Any]:
         try:
-            stats = self.get_dashboard_stats(timeout)
-            total = stats.get("total_accounts", 0)
-            normal = stats.get("normal_accounts", 0)
-            error = stats.get("error_accounts", 0)
+            all_accounts = self._list_all_accounts(timeout=timeout, page_size=100)
+            error = sum(
+                1 for account in all_accounts
+                if self._is_abnormal_status(account.get("status"))
+            )
+            total = len(all_accounts)
+            normal = max(0, total - error)
             return {
                 "total": total,
                 "candidates": normal,
@@ -444,10 +1172,10 @@ class Sub2ApiMaintainer:
 
     def test_connection(self, timeout: int = 10) -> Dict[str, Any]:
         try:
-            stats = self.get_dashboard_stats(timeout)
-            total = stats.get("total_accounts", 0)
-            normal = stats.get("normal_accounts", 0)
-            error = stats.get("error_accounts", 0)
+            status = self.get_pool_status(timeout)
+            total = int(status.get("total", 0))
+            normal = int(status.get("candidates", 0))
+            error = int(status.get("error_count", 0))
             return {
                 "ok": True,
                 "total": total,
@@ -482,79 +1210,91 @@ class Sub2ApiMaintainer:
             page += 1
         return result
 
-    def probe_and_clean_sync(self, timeout: int = 15) -> Dict[str, Any]:
-        all_accounts: List[Dict[str, Any]] = []
-        page = 1
-        page_size = 100
-        while True:
-            data = self.list_accounts(page=page, page_size=page_size, timeout=timeout)
-            items = data.get("items") or []
-            all_accounts.extend(items)
-            if not items or len(items) < page_size:
-                break
-            total = data.get("total")
-            if isinstance(total, int) and total > 0 and len(all_accounts) >= total:
-                break
-            page += 1
+    def probe_and_clean_sync(self, timeout: int = 15, actions: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
+        action_flags = {
+            "refresh_abnormal_accounts": bool((actions or {}).get("refresh_abnormal_accounts", True)),
+            "delete_abnormal_accounts": bool((actions or {}).get("delete_abnormal_accounts", True)),
+            "dedupe_duplicate_accounts": bool((actions or {}).get("dedupe_duplicate_accounts", True)),
+        }
+        started = time.time()
+        all_accounts = self._list_all_accounts(timeout=timeout, page_size=100)
 
         error_accounts = [
-            a for a in all_accounts
-            if str(a.get("status", "")).lower() in ("error", "disabled")
+            account for account in all_accounts
+            if self._is_abnormal_status(account.get("status"))
         ]
-        normal_count = len(all_accounts) - len(error_accounts)
 
-        if not error_accounts:
-            return {
-                "total": len(all_accounts), "normal": normal_count,
-                "error_count": 0, "refreshed": 0,
-                "deleted_ok": 0, "deleted_fail": 0,
-            }
+        error_ids = [
+            self._normalize_account_id(acc.get("id"))
+            for acc in error_accounts
+        ]
+        error_ids = [i for i in error_ids if i is not None]
+        initial_error_ids = set(error_ids)
 
-        # 尝试刷新所有异常账号
-        refreshed_ids = []
-        refresh_failed: List[Dict[str, Any]] = []
-        for acc in error_accounts:
-            acc_id = acc.get("id")
-            if not acc_id:
-                refresh_failed.append(acc)
-                continue
-            if self.refresh_account(acc_id, timeout=30):
-                refreshed_ids.append(acc_id)
-            else:
-                refresh_failed.append(acc)
+        refresh_result = {"success_ids": [], "failed_ids": []}
+        if action_flags["refresh_abnormal_accounts"] and error_ids:
+            refresh_result = self._refresh_accounts_parallel(error_ids, timeout=30, workers=8)
 
-        # 等待刷新生效后重新查询状态，确认是否真正恢复
-        still_error: List[Dict[str, Any]] = list(refresh_failed)
+        refreshed_ids = list(refresh_result.get("success_ids") or [])
+        refresh_failed_ids = list(refresh_result.get("failed_ids") or [])
+
+        current_accounts = all_accounts
+        current_error_ids = set(initial_error_ids)
         if refreshed_ids:
             time.sleep(2)
-            recheck = self._list_accounts_by_ids(refreshed_ids, timeout=timeout)
-            recovered = 0
-            for acc_id in refreshed_ids:
-                acc_status = recheck.get(acc_id, "error")
-                if str(acc_status).lower() in ("error", "disabled"):
-                    still_error.append({"id": acc_id})
-                else:
-                    recovered += 1
-        else:
-            recovered = 0
+        if action_flags["refresh_abnormal_accounts"] and (error_ids or refreshed_ids):
+            current_accounts = self._list_all_accounts(timeout=timeout, page_size=100)
+            current_error_ids = {
+                int(acc_id) for acc_id in (
+                    self._normalize_account_id(account.get("id"))
+                    for account in current_accounts
+                    if self._is_abnormal_status(account.get("status"))
+                ) if isinstance(acc_id, int)
+            }
+        recovered = len(initial_error_ids - current_error_ids)
 
-        # 删除不可恢复的账号
-        deleted_ok = 0
-        deleted_fail = 0
-        for acc in still_error:
-            acc_id = acc.get("id")
-            if not acc_id:
-                deleted_fail += 1
-                continue
-            if self.delete_account(acc_id, timeout=timeout):
-                deleted_ok += 1
-            else:
-                deleted_fail += 1
+        dedupe_plan = {
+            "duplicate_groups": 0,
+            "duplicate_accounts": 0,
+            "delete_ids": [],
+            "groups_preview": [],
+            "truncated_groups": 0,
+        }
+        duplicate_delete_ids: List[int] = []
+        if action_flags["dedupe_duplicate_accounts"]:
+            dedupe_plan = self._build_dedupe_plan(current_accounts, details_limit=120)
+            duplicate_delete_ids = [int(i) for i in dedupe_plan["delete_ids"] if isinstance(i, int)]
+        normal_count = len(current_accounts) - len(current_error_ids)
+
+        delete_targets: set[int] = set()
+        if action_flags["delete_abnormal_accounts"]:
+            delete_targets.update(current_error_ids)
+        if action_flags["dedupe_duplicate_accounts"]:
+            delete_targets.update(duplicate_delete_ids)
+        delete_result = self._delete_accounts_parallel(sorted(delete_targets, reverse=True), timeout=timeout, workers=12)
+        deleted_ok = int(delete_result.get("deleted_ok", 0))
+        deleted_fail = int(delete_result.get("deleted_fail", 0))
+        deleted_ok_ids = set(int(i) for i in (delete_result.get("deleted_ok_ids") or []) if isinstance(i, int))
+
+        deleted_from_error = len(deleted_ok_ids & set(current_error_ids))
+        deleted_from_duplicate = len(deleted_ok_ids & set(duplicate_delete_ids))
+
+        elapsed_ms = int((time.time() - started) * 1000)
 
         return {
-            "total": len(all_accounts), "normal": normal_count,
-            "error_count": len(error_accounts), "refreshed": recovered,
+            "actions": action_flags,
+            "total": len(current_accounts), "normal": normal_count,
+            "initial_error_count": len(initial_error_ids),
+            "error_count": len(current_error_ids), "refreshed": recovered,
+            "refresh_attempted": len(error_ids) if action_flags["refresh_abnormal_accounts"] else 0,
+            "refresh_failed": len(refresh_failed_ids),
             "deleted_ok": deleted_ok, "deleted_fail": deleted_fail,
+            "duplicate_groups": int(dedupe_plan["duplicate_groups"]),
+            "duplicate_accounts": int(dedupe_plan["duplicate_accounts"]),
+            "duplicate_to_delete": len(duplicate_delete_ids),
+            "deleted_from_error": deleted_from_error,
+            "deleted_from_duplicate": deleted_from_duplicate,
+            "duration_ms": elapsed_ms,
         }
 
     def calculate_gap(self, current_candidates: Optional[int] = None) -> int:
@@ -564,3 +1304,159 @@ class Sub2ApiMaintainer:
                 raise RuntimeError(f"Sub2Api 池状态查询失败: {status['error']}")
             current_candidates = status["candidates"]
         return max(0, self.min_candidates - current_candidates)
+
+
+# ---------------------------------------------------------------------------
+# TokenProxySyncer — 直接写入 token_proxy 的 SQLite 数据库同步 Codex 账号
+# ---------------------------------------------------------------------------
+
+import os as _os
+import sqlite3 as _sqlite3
+import re as _re
+
+
+def _sanitize_id_part(value: str) -> str:
+    """与 token_proxy 的 sanitize_id_part 逻辑一致"""
+    output = []
+    for ch in value:
+        if ch.isascii() and ch.isalnum():
+            output.append(ch.lower())
+        else:
+            output.append("_")
+    trimmed = "".join(output).strip("_")
+    return trimmed[:48] if trimmed else ""
+
+
+class TokenProxySyncer:
+    """直接写入 token_proxy 的 SQLite 数据库同步 Codex 账号"""
+
+    DEFAULT_DB_PATH = _os.path.expanduser(
+        "~/Library/Application Support/com.mxyhi.token-proxy/data.db"
+    )
+
+    _UPSERT_SQL = """
+INSERT INTO provider_accounts (
+  provider_kind, account_id, email, expires_at, expires_at_ms,
+  auth_method, provider_name, record_json, updated_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+  provider_kind = excluded.provider_kind,
+  email = excluded.email,
+  expires_at = excluded.expires_at,
+  expires_at_ms = excluded.expires_at_ms,
+  auth_method = excluded.auth_method,
+  provider_name = excluded.provider_name,
+  record_json = excluded.record_json,
+  updated_at_ms = excluded.updated_at_ms;
+"""
+
+    def __init__(self, db_path: str = ""):
+        self.db_path = db_path.strip() or self.DEFAULT_DB_PATH
+
+    def sync_account(self, token_data: Dict[str, Any]) -> bool:
+        """将 token_data 写入 token_proxy 的 provider_accounts 表，成功返回 True"""
+        if not _os.path.isfile(self.db_path):
+            logger.warning("TokenProxy 数据库不存在: %s", self.db_path)
+            return False
+
+        access_token = str(token_data.get("access_token") or "").strip()
+        if not access_token:
+            logger.warning("TokenProxy 同步跳过: 缺少 access_token")
+            return False
+
+        refresh_token = str(token_data.get("refresh_token") or "").strip()
+        id_token = str(token_data.get("id_token") or "").strip()
+        email = str(token_data.get("email") or "").strip() or None
+        chatgpt_account_id = token_data.get("account_id") or None
+
+        # 解析过期时间
+        expires_at_raw = (
+            token_data.get("expires_at")
+            or token_data.get("expired")
+            or ""
+        )
+        expires_at_str = str(expires_at_raw).strip()
+        expires_at_ms = self._parse_expires_at_ms(expires_at_str)
+
+        # 构建 record_json（匹配 token_proxy CodexTokenRecord 结构）
+        now_str = datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+        # 格式化时区为 +HH:MM
+        if len(now_str) > 5 and now_str[-3] != ":":
+            now_str = now_str[:-2] + ":" + now_str[-2:]
+        record = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": id_token,
+            "auto_refresh_enabled": True,
+            "status": "active",
+            "account_id": chatgpt_account_id,
+            "email": email,
+            "expires_at": expires_at_str,
+            "last_refresh": now_str,
+            "proxy_url": None,
+            "quota": {
+                "plan_type": None,
+                "quotas": [],
+                "error": None,
+                "checked_at": None,
+            },
+        }
+        record_json = json.dumps(record, ensure_ascii=False)
+
+        # 生成 account_id
+        id_part = _sanitize_id_part(email or chatgpt_account_id or "")
+        if not id_part:
+            id_part = str(int(time.time()))
+        account_id = f"codex-{id_part}.json"
+
+        updated_at_ms = int(time.time() * 1000)
+
+        try:
+            conn = _sqlite3.connect(self.db_path, timeout=5)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(
+                self._UPSERT_SQL,
+                (
+                    "codex",
+                    account_id,
+                    email,
+                    expires_at_str or None,
+                    expires_at_ms,
+                    None,  # auth_method
+                    None,  # provider_name
+                    record_json,
+                    updated_at_ms,
+                ),
+            )
+            conn.commit()
+            conn.close()
+            logger.info("TokenProxy 同步成功: %s -> %s", email or account_id, self.db_path)
+            return True
+        except Exception as exc:
+            logger.error("TokenProxy SQLite 写入失败: %s", exc)
+            return False
+
+    @staticmethod
+    def _parse_expires_at_ms(expires_at: str) -> Optional[int]:
+        """将过期时间字符串解析为 Unix 毫秒时间戳"""
+        if not expires_at:
+            return None
+        try:
+            from datetime import timezone
+            # 尝试多种格式
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f%z",
+                "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+            ):
+                try:
+                    dt = datetime.strptime(expires_at, fmt)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return int(dt.timestamp() * 1000)
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+        return None

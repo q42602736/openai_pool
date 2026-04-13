@@ -1,0 +1,8 @@
+{
+  "cfToken": "你的cf_temp_mail的管理员密码",
+  "APIUrl": "你的cf_temp_mail的后端地址",
+  "domain": "你的temp_mail中@后面的部分",
+  "mailUrl": "你的cf_temp_mail的前端地址",
+  "oauthClientId": "app_EMoamEEZ73f0CkXaXp7hrann",
+  "oauthRedirectPort": 1455
+}

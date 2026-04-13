@@ -1,7 +1,6 @@
 {
   "proxy": "",
   "auto_register": false,
-  "mail_provider": "mailtm",
   "mail_providers": [
     "mailtm"
   ],
@@ -9,25 +8,18 @@
     "mailtm": {
       "api_base": "https://api.mail.tm"
     },
-    "mailtm_forward": {
-      "api_base": "https://api.mail.tm",
-      "custom_domains": "example.com,example.net",
-      "forward_to_email": "your-mailtm@xx.mail.tm",
-      "forward_to_password": "",
-      "forward_to_token": "",
-      "alias_prefix": "oc",
-      "alias_length": 12
-    },
     "duckmail": {
       "api_base": "https://api.duckmail.sbs"
     },
     "moemail": {
       "api_base": "",
       "api_key": ""
+    },
+    "cloudflare_temp_email": {
+      "api_base": "cloudflare worker后端密码，不要弄成前端的",
+      "admin_password": "管理员密码",
+      "domain": "xxx.cn 邮箱域名后缀"
     }
-  },
-  "mail_config": {
-    "api_base": "https://api.mail.tm"
   },
   "mail_strategy": "round_robin",
   "multithread": false,
@@ -37,21 +29,39 @@
   "email": "",
   "password": "",
   "account_name": "AutoReg",
-  "auto_sync": "false",
+  "auto_sync": false,
   "sub2api_min_candidates": 200,
   "sub2api_auto_maintain": false,
   "sub2api_maintain_interval_minutes": 30,
-  "cpa_base_url": "CPA连接地址",
-  "cpa_token": "CPA管理员密码",
+  "sub2api_maintain_actions": {
+    "refresh_abnormal_accounts": true,
+    "delete_abnormal_accounts": true,
+    "dedupe_duplicate_accounts": true
+  },
+  "cpa_base_url": "CPA地址",
+  "cpa_token": "CPA密钥",
   "min_candidates": 1000,
   "used_percent_threshold": 95,
-  "auto_maintain": false,
+  "auto_maintain": true,
   "maintain_interval_minutes": 30,
   "upload_mode": "snapshot",
-  "proxy_pool_enabled": true,
+  "register_mode": "browser",
+  "register_mode_options": "browser | browser_manual | browser_manual_v2 | protocol",
+  "browser_headless": true,
+  "browser_timeout_ms": 90000,
+  "browser_slow_mo_ms": 0,
+  "browser_executable_path": "",
+  "browser_locale": "en-US",
+  "browser_timezone": "America/New_York",
+  "browser_block_media": true,
+  "browser_realistic_profile": true,
+  "browser_clear_runtime_state": false,
+  "proxy_pool_enabled": false,
   "proxy_pool_api_url": "https://zenproxy.top/api/fetch",
   "proxy_pool_auth_mode": "header",
   "proxy_pool_api_key": "使用自己的Key",
   "proxy_pool_count": 1,
-  "proxy_pool_country": "US"
+  "proxy_pool_country": "US",
+  "token_proxy_sync": false,
+  "token_proxy_db_path": ""
 }

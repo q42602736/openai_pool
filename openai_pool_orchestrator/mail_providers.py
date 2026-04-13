@@ -6,7 +6,6 @@ MailProvider 抽象层
 from __future__ import annotations
 
 import itertools
-import json
 import logging
 import random
 import re
@@ -15,7 +14,6 @@ import string
 import time
 import threading
 from abc import ABC, abstractmethod
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import requests as _requests
@@ -111,64 +109,42 @@ def _extract_code(content: str) -> Optional[str]:
         r"(?<![#&])\b(\d{6})\b",
     ]:
         for code in re.findall(pat, content, re.IGNORECASE):
-            if code != "177010":
-                return code
+            return code
     return None
 
 
-def _to_int(value: Any, default: int, minimum: int, maximum: int) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        number = default
-    return max(minimum, min(number, maximum))
+def _get_seen_message_ids(holder: Any, mailbox_key: str) -> set[str]:
+    tls = getattr(holder, "_tls", None)
+    if tls is None:
+        tls = threading.local()
+        setattr(holder, "_tls", tls)
+    store = getattr(tls, "seen_message_ids_store", None)
+    if store is None:
+        store = {}
+        setattr(tls, "seen_message_ids_store", store)
+    key = str(mailbox_key or "_default")
+    seen_ids = store.get(key)
+    if seen_ids is None:
+        seen_ids = set()
+        store[key] = seen_ids
+    return seen_ids
 
 
-def _split_domains(value: Any) -> List[str]:
-    if isinstance(value, list):
-        raw_items = value
-    else:
-        raw_items = re.split(r"[,\n\r]+", str(value or ""))
-    domains: List[str] = []
-    seen: set[str] = set()
-    for item in raw_items:
-        domain = str(item or "").strip().lower()
-        if not domain:
-            continue
-        if domain.startswith("@"):
-            domain = domain[1:]
-        if domain not in seen:
-            seen.add(domain)
-            domains.append(domain)
-    return domains
-
-
-def _flatten_strings(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        values: List[str] = []
-        for item in value.values():
-            values.extend(_flatten_strings(item))
-        return values
-    if isinstance(value, (list, tuple, set)):
-        values: List[str] = []
-        for item in value:
-            values.extend(_flatten_strings(item))
-        return values
-    return [str(value)]
-
-
-def _parse_iso_timestamp(value: Any) -> Optional[float]:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
+def _get_mailbox_runtime_state(holder: Any, mailbox_key: str) -> Dict[str, Any]:
+    tls = getattr(holder, "_tls", None)
+    if tls is None:
+        tls = threading.local()
+        setattr(holder, "_tls", tls)
+    store = getattr(tls, "mailbox_runtime_state_store", None)
+    if store is None:
+        store = {}
+        setattr(tls, "mailbox_runtime_state_store", store)
+    key = str(mailbox_key or "_default")
+    state = store.get(key)
+    if state is None:
+        state = {}
+        store[key] = state
+    return state
 
 
 # ==================== 抽象基类 ====================
@@ -242,36 +218,36 @@ class MailTmProvider(MailProvider):
         proxy: str = "",
         proxy_selector: Optional[Callable[[], str]] = None,
     ) -> Tuple[str, str]:
-        session = _build_session(proxy, proxy_selector)
-        domains = self._get_domains(session)
-        if not domains:
-            return "", ""
-        domain = random.choice(domains)
+        with _build_session(proxy, proxy_selector) as session:
+            domains = self._get_domains(session)
+            if not domains:
+                return "", ""
+            domain = random.choice(domains)
 
-        for _ in range(5):
-            local = f"oc{secrets.token_hex(5)}"
-            email = f"{local}@{domain}"
-            password = secrets.token_urlsafe(18)
+            for _ in range(5):
+                local = f"oc{secrets.token_hex(5)}"
+                email = f"{local}@{domain}"
+                password = secrets.token_urlsafe(18)
 
-            resp = session.post(
-                f"{self.api_base}/accounts",
-                headers=self._headers(use_json=True),
-                json={"address": email, "password": password},
-                timeout=15, verify=False,
-            )
-            if resp.status_code not in (200, 201):
-                continue
+                resp = session.post(
+                    f"{self.api_base}/accounts",
+                    headers=self._headers(use_json=True),
+                    json={"address": email, "password": password},
+                    timeout=15, verify=False,
+                )
+                if resp.status_code not in (200, 201):
+                    continue
 
-            token_resp = session.post(
-                f"{self.api_base}/token",
-                headers=self._headers(use_json=True),
-                json={"address": email, "password": password},
-                timeout=15, verify=False,
-            )
-            if token_resp.status_code == 200:
-                token = str(token_resp.json().get("token") or "").strip()
-                if token:
-                    return email, token
+                token_resp = session.post(
+                    f"{self.api_base}/token",
+                    headers=self._headers(use_json=True),
+                    json={"address": email, "password": password},
+                    timeout=15, verify=False,
+                )
+                if token_resp.status_code == 200:
+                    token = str(token_resp.json().get("token") or "").strip()
+                    if token:
+                        return email, token
         return "", ""
 
     def wait_for_otp(
@@ -283,66 +259,66 @@ class MailTmProvider(MailProvider):
         timeout: int = 120,
         stop_event: Optional[threading.Event] = None,
     ) -> str:
-        session = _build_session(proxy, proxy_selector)
-        seen_ids: set = set()
-        start = time.time()
+        with _build_session(proxy, proxy_selector) as session:
+            seen_ids = _get_seen_message_ids(self, f"{email}|{auth_credential}")
+            start = time.time()
 
-        while time.time() - start < timeout:
-            if stop_event and stop_event.is_set():
-                return ""
-            try:
-                resp = session.get(
-                    f"{self.api_base}/messages",
-                    headers=self._headers(token=auth_credential),
-                    timeout=15, verify=False,
-                )
-                if resp.status_code != 200:
-                    time.sleep(3)
-                    continue
-
-                data = resp.json()
-                messages = data if isinstance(data, list) else (
-                    data.get("hydra:member") or data.get("messages") or []
-                )
-
-                for msg in messages:
-                    if not isinstance(msg, dict):
-                        continue
-                    msg_id = str(msg.get("id") or msg.get("@id") or "").strip()
-                    if not msg_id or msg_id in seen_ids:
-                        continue
-                    seen_ids.add(msg_id)
-
-                    if msg_id.startswith("/messages/"):
-                        msg_id = msg_id.split("/")[-1]
-
-                    detail_resp = session.get(
-                        f"{self.api_base}/messages/{msg_id}",
+            while time.time() - start < timeout:
+                if stop_event and stop_event.is_set():
+                    return ""
+                try:
+                    resp = session.get(
+                        f"{self.api_base}/messages",
                         headers=self._headers(token=auth_credential),
                         timeout=15, verify=False,
                     )
-                    if detail_resp.status_code != 200:
+                    if resp.status_code != 200:
+                        time.sleep(3)
                         continue
 
-                    mail_data = detail_resp.json()
-                    sender = str(((mail_data.get("from") or {}).get("address") or "")).lower()
-                    subject = str(mail_data.get("subject") or "")
-                    intro = str(mail_data.get("intro") or "")
-                    text = str(mail_data.get("text") or "")
-                    html = mail_data.get("html") or ""
-                    if isinstance(html, list):
-                        html = "\n".join(str(x) for x in html)
-                    content = "\n".join([subject, intro, text, str(html)])
+                    data = resp.json()
+                    messages = data if isinstance(data, list) else (
+                        data.get("hydra:member") or data.get("messages") or []
+                    )
 
-                    if "openai" not in sender and "openai" not in content.lower():
-                        continue
+                    for msg in messages:
+                        if not isinstance(msg, dict):
+                            continue
+                        msg_id = str(msg.get("id") or msg.get("@id") or "").strip()
+                        if not msg_id or msg_id in seen_ids:
+                            continue
 
-                    code = _extract_code(content)
-                    if code:
-                        return code
-            except Exception:
-                pass
-            time.sleep(3)
+                        if msg_id.startswith("/messages/"):
+                            msg_id = msg_id.split("/")[-1]
+
+                        detail_resp = session.get(
+                            f"{self.api_base}/messages/{msg_id}",
+                            headers=self._headers(token=auth_credential),
+                            timeout=15, verify=False,
+                        )
+                        if detail_resp.status_code != 200:
+                            continue
+                        seen_ids.add(msg_id)
+
+                        mail_data = detail_resp.json()
+                        sender = str(((mail_data.get("from") or {}).get("address") or "")).lower()
+                        subject = str(mail_data.get("subject") or "")
+                        intro = str(mail_data.get("intro") or "")
+                        text = str(mail_data.get("text") or "")
+                        html = mail_data.get("html") or ""
+                        if isinstance(html, list):
+                            html = "\n".join(str(x) for x in html)
+                        content = "\n".join([subject, intro, text, str(html)])
+
+                        if "openai" not in sender and "openai" not in content.lower():
+                            continue
+
+                        code = _extract_code(content)
+                        if code:
+                            return code
+                except Exception as exc:
+                    logger.warning("Mail.tm 轮询验证码失败: %s", exc)
+                time.sleep(3)
         return ""
 
 
@@ -362,12 +338,68 @@ class MailTmForwardProvider(MailTmProvider):
         alias_length: Any = 12,
     ):
         super().__init__(api_base=api_base)
-        self.custom_domains = _split_domains(custom_domains)
+        self.custom_domains = self._split_domains(custom_domains)
         self.forward_to_email = str(forward_to_email or "").strip().lower()
         self.forward_to_password = str(forward_to_password or "").strip()
         self.forward_to_token = str(forward_to_token or "").strip()
         self.alias_prefix = re.sub(r"[^a-z0-9._-]", "", str(alias_prefix or "oc").strip().lower()) or "oc"
-        self.alias_length = _to_int(alias_length, default=12, minimum=6, maximum=24)
+        self.alias_length = self._to_int(alias_length, default=12, minimum=6, maximum=24)
+
+    @staticmethod
+    def _split_domains(value: Any) -> List[str]:
+        if isinstance(value, list):
+            raw_items = value
+        else:
+            raw_items = re.split(r"[,\n\r]+", str(value or ""))
+        domains: List[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            domain = str(item or "").strip().lower()
+            if not domain:
+                continue
+            if domain.startswith("@"):
+                domain = domain[1:]
+            if domain not in seen:
+                seen.add(domain)
+                domains.append(domain)
+        return domains
+
+    @staticmethod
+    def _to_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = default
+        return max(minimum, min(number, maximum))
+
+    @staticmethod
+    def _flatten_strings(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            values: List[str] = []
+            for item in value.values():
+                values.extend(MailTmForwardProvider._flatten_strings(item))
+            return values
+        if isinstance(value, (list, tuple, set)):
+            values: List[str] = []
+            for item in value:
+                values.extend(MailTmForwardProvider._flatten_strings(item))
+            return values
+        return [str(value)]
+
+    @staticmethod
+    def _parse_iso_timestamp(value: Any) -> Optional[float]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
 
     def _issue_receiver_token(self, session: _requests.Session) -> str:
         if self.forward_to_token:
@@ -396,6 +428,7 @@ class MailTmForwardProvider(MailTmProvider):
         return f"{self.alias_prefix}{random_part}@{domain}"
 
     def _pack_credential(self, token: str, email: str) -> str:
+        import json
         return json.dumps(
             {
                 "token": token,
@@ -408,6 +441,7 @@ class MailTmForwardProvider(MailTmProvider):
         )
 
     def _unpack_credential(self, auth_credential: str) -> Dict[str, Any]:
+        import json
         raw = str(auth_credential or "").strip()
         if not raw:
             return {}
@@ -426,13 +460,13 @@ class MailTmForwardProvider(MailTmProvider):
             return True
         searchable_parts: List[str] = []
         for key in ("to", "cc", "bcc", "subject", "intro", "text", "html", "headers"):
-            searchable_parts.extend(_flatten_strings(mail_data.get(key)))
+            searchable_parts.extend(self._flatten_strings(mail_data.get(key)))
         combined = "\n".join(searchable_parts).lower()
         return target in combined
 
     def _message_timestamp(self, mail_data: Dict[str, Any]) -> Optional[float]:
         for key in ("createdAt", "updatedAt"):
-            ts = _parse_iso_timestamp(mail_data.get(key))
+            ts = self._parse_iso_timestamp(mail_data.get(key))
             if ts is not None:
                 return ts
         return None
@@ -444,14 +478,14 @@ class MailTmForwardProvider(MailTmProvider):
     ) -> Tuple[str, str]:
         if not self.custom_domains:
             return "", ""
-        session = _build_session(proxy, proxy_selector)
-        token = self._issue_receiver_token(session)
-        if not token:
-            return "", ""
-        email = self._build_alias_email()
-        if not email:
-            return "", ""
-        return email, self._pack_credential(token, email)
+        with _build_session(proxy, proxy_selector) as session:
+            token = self._issue_receiver_token(session)
+            if not token:
+                return "", ""
+            email = self._build_alias_email()
+            if not email:
+                return "", ""
+            return email, self._pack_credential(token, email)
 
     def wait_for_otp(
         self,
@@ -462,111 +496,120 @@ class MailTmForwardProvider(MailTmProvider):
         timeout: int = 120,
         stop_event: Optional[threading.Event] = None,
     ) -> str:
-        session = _build_session(proxy, proxy_selector)
-        cred = self._unpack_credential(auth_credential)
-        token = str(cred.get("token") or "").strip()
-        if not token:
-            token = self._issue_receiver_token(session)
-        if not token:
-            return ""
-
-        try:
-            created_after = float(cred.get("issued_at") or 0.0)
-        except (TypeError, ValueError):
-            created_after = 0.0
-
-        seen_ids: set[str] = set()
-        start = time.time()
-
-        while time.time() - start < timeout:
-            if stop_event and stop_event.is_set():
+        with _build_session(proxy, proxy_selector) as session:
+            cred = self._unpack_credential(auth_credential)
+            token = str(cred.get("token") or "").strip()
+            if not token:
+                token = self._issue_receiver_token(session)
+            if not token:
                 return ""
+
+            try:
+                created_after = float(cred.get("issued_at") or 0.0)
+            except (TypeError, ValueError):
+                created_after = 0.0
+
+            mailbox_key = f"{email}|{auth_credential}"
+            seen_ids = _get_seen_message_ids(self, mailbox_key)
+            runtime_state = _get_mailbox_runtime_state(self, mailbox_key)
+            first_poll_started_at = float(runtime_state.get("first_poll_started_at") or 0.0)
+            if first_poll_started_at <= 0:
+                first_poll_started_at = time.time()
+                runtime_state["first_poll_started_at"] = first_poll_started_at
+            start = time.time()
+
+            while time.time() - start < timeout:
+                if stop_event and stop_event.is_set():
+                    return ""
+                try:
+                    resp = session.get(
+                        f"{self.api_base}/messages",
+                        headers=self._headers(token=token),
+                        timeout=15, verify=False,
+                    )
+                    if resp.status_code == 401 and self.forward_to_email and self.forward_to_password:
+                        token = self._issue_receiver_token(session)
+                        time.sleep(1)
+                        continue
+                    if resp.status_code != 200:
+                        time.sleep(3)
+                        continue
+
+                    data = resp.json()
+                    messages = data if isinstance(data, list) else (
+                        data.get("hydra:member") or data.get("messages") or []
+                    )
+
+                    for msg in messages:
+                        if not isinstance(msg, dict):
+                            continue
+                        raw_msg_id = str(msg.get("id") or msg.get("@id") or "").strip()
+                        if not raw_msg_id or raw_msg_id in seen_ids:
+                            continue
+
+                        msg_id = raw_msg_id
+                        if raw_msg_id.startswith("/messages/"):
+                            msg_id = raw_msg_id.split("/")[-1]
+
+                        detail_resp = session.get(
+                            f"{self.api_base}/messages/{msg_id}",
+                            headers=self._headers(token=token),
+                            timeout=15, verify=False,
+                        )
+                        if detail_resp.status_code != 200:
+                            continue
+
+                        mail_data = detail_resp.json()
+                        msg_ts = self._message_timestamp(mail_data)
+                        if created_after and msg_ts is not None and msg_ts + 2 < created_after:
+                            seen_ids.add(raw_msg_id)
+                            continue
+
+                        sender = str(((mail_data.get("from") or {}).get("address") or "")).lower()
+                        subject = str(mail_data.get("subject") or "")
+                        intro = str(mail_data.get("intro") or "")
+                        text_body = str(mail_data.get("text") or "")
+                        html = mail_data.get("html") or ""
+                        if isinstance(html, list):
+                            html = "\n".join(str(x) for x in html)
+                        content = "\n".join([subject, intro, text_body, str(html)])
+
+                        if "openai" not in sender and "openai" not in content.lower():
+                            seen_ids.add(raw_msg_id)
+                            continue
+
+                        strict_match = self._message_matches_email(mail_data, email)
+                        if not strict_match and time.time() - first_poll_started_at < 45:
+                            continue
+
+                        code = _extract_code(content)
+                        seen_ids.add(raw_msg_id)
+                        if code:
+                            return code
+                except Exception as exc:
+                    logger.warning("MailTmForward 轮询验证码失败: %s", exc)
+                time.sleep(3)
+        return ""
+
+    def test_connection(self, proxy: str = "") -> Tuple[bool, str]:
+        if not self.custom_domains:
+            return False, "未配置自定义域名"
+        with _build_session(proxy) as session:
+            token = self._issue_receiver_token(session)
+            if not token:
+                return False, "无法登录 Mail.tm 转发收件箱，请检查转发邮箱地址/密码或 Token"
             try:
                 resp = session.get(
                     f"{self.api_base}/messages",
                     headers=self._headers(token=token),
                     timeout=15, verify=False,
                 )
-                if resp.status_code == 401 and self.forward_to_email and self.forward_to_password:
-                    token = self._issue_receiver_token(session)
-                    time.sleep(1)
-                    continue
                 if resp.status_code != 200:
-                    time.sleep(3)
-                    continue
-
-                data = resp.json()
-                messages = data if isinstance(data, list) else (
-                    data.get("hydra:member") or data.get("messages") or []
-                )
-
-                for msg in messages:
-                    if not isinstance(msg, dict):
-                        continue
-                    msg_id = str(msg.get("id") or msg.get("@id") or "").strip()
-                    if not msg_id or msg_id in seen_ids:
-                        continue
-                    seen_ids.add(msg_id)
-
-                    if msg_id.startswith("/messages/"):
-                        msg_id = msg_id.split("/")[-1]
-
-                    detail_resp = session.get(
-                        f"{self.api_base}/messages/{msg_id}",
-                        headers=self._headers(token=token),
-                        timeout=15, verify=False,
-                    )
-                    if detail_resp.status_code != 200:
-                        continue
-
-                    mail_data = detail_resp.json()
-                    msg_ts = self._message_timestamp(mail_data)
-                    if created_after and msg_ts is not None and msg_ts + 2 < created_after:
-                        continue
-
-                    sender = str(((mail_data.get("from") or {}).get("address") or "")).lower()
-                    subject = str(mail_data.get("subject") or "")
-                    intro = str(mail_data.get("intro") or "")
-                    text_body = str(mail_data.get("text") or "")
-                    html = mail_data.get("html") or ""
-                    if isinstance(html, list):
-                        html = "\n".join(str(x) for x in html)
-                    content = "\n".join([subject, intro, text_body, str(html)])
-
-                    if "openai" not in sender and "openai" not in content.lower():
-                        continue
-
-                    strict_match = self._message_matches_email(mail_data, email)
-                    if not strict_match and time.time() - start < min(timeout, 45):
-                        continue
-
-                    code = _extract_code(content)
-                    if code:
-                        return code
-            except Exception:
-                pass
-            time.sleep(3)
-        return ""
-
-    def test_connection(self, proxy: str = "") -> Tuple[bool, str]:
-        if not self.custom_domains:
-            return False, "未配置自定义域名"
-        session = _build_session(proxy)
-        token = self._issue_receiver_token(session)
-        if not token:
-            return False, "无法登录 Mail.tm 转发收件箱，请检查转发邮箱地址/密码或 Token"
-        try:
-            resp = session.get(
-                f"{self.api_base}/messages",
-                headers=self._headers(token=token),
-                timeout=15, verify=False,
-            )
-            if resp.status_code != 200:
-                return False, f"Mail.tm 收件箱连接失败，状态码: {resp.status_code}"
-        except Exception as e:
-            return False, f"Mail.tm 收件箱连接失败: {e}"
-        preview_email = self._build_alias_email()
-        return True, f"转发邮箱可用，测试别名: {preview_email}"
+                    return False, f"Mail.tm 收件箱连接失败，状态码: {resp.status_code}"
+            except Exception as e:
+                return False, f"Mail.tm 收件箱连接失败: {e}"
+            preview_email = self._build_alias_email()
+            return True, f"转发邮箱可用，测试别名: {preview_email}"
 
 
 # ==================== MoeMail ====================
@@ -592,8 +635,8 @@ class MoeMailProvider(MailProvider):
                     domains = [d.strip() for d in domains_str.split(",") if d.strip()]
                     if domains:
                         return random.choice(domains)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("MoeMail 读取域名配置失败: %s", exc)
         return None
 
     def create_mailbox(
@@ -601,29 +644,29 @@ class MoeMailProvider(MailProvider):
         proxy: str = "",
         proxy_selector: Optional[Callable[[], str]] = None,
     ) -> Tuple[str, str]:
-        session = _build_session(proxy, proxy_selector)
-        domain = self._get_domain(session)
-        if not domain:
-            return "", ""
-
-        chars = string.ascii_lowercase + string.digits
-        prefix = "".join(random.choice(chars) for _ in range(random.randint(8, 13)))
-
-        try:
-            resp = session.post(
-                f"{self.api_base}/api/emails/generate",
-                json={"name": prefix, "domain": domain, "expiryTime": 0},
-                headers=self._headers(), timeout=15, verify=False,
-            )
-            if resp.status_code not in (200, 201):
+        with _build_session(proxy, proxy_selector) as session:
+            domain = self._get_domain(session)
+            if not domain:
                 return "", ""
-            data = resp.json()
-            email_id = data.get("id")
-            email = data.get("email")
-            if email_id and email:
-                return email, str(email_id)
-        except Exception:
-            pass
+
+            chars = string.ascii_lowercase + string.digits
+            prefix = "".join(random.choice(chars) for _ in range(random.randint(8, 13)))
+
+            try:
+                resp = session.post(
+                    f"{self.api_base}/api/emails/generate",
+                    json={"name": prefix, "domain": domain, "expiryTime": 0},
+                    headers=self._headers(), timeout=15, verify=False,
+                )
+                if resp.status_code not in (200, 201):
+                    return "", ""
+                data = resp.json()
+                email_id = data.get("id")
+                email = data.get("email")
+                if email_id and email:
+                    return email, str(email_id)
+            except Exception as exc:
+                logger.warning("MoeMail 创建邮箱失败: %s", exc)
         return "", ""
 
     def wait_for_otp(
@@ -635,42 +678,44 @@ class MoeMailProvider(MailProvider):
         timeout: int = 120,
         stop_event: Optional[threading.Event] = None,
     ) -> str:
-        session = _build_session(proxy, proxy_selector)
-        email_id = auth_credential
-        start = time.time()
+        with _build_session(proxy, proxy_selector) as session:
+            email_id = auth_credential
+            seen_ids = _get_seen_message_ids(self, f"{email}|{email_id}")
+            start = time.time()
 
-        while time.time() - start < timeout:
-            if stop_event and stop_event.is_set():
-                return ""
-            try:
-                resp = session.get(
-                    f"{self.api_base}/api/emails/{email_id}",
-                    headers=self._headers(), timeout=15, verify=False,
-                )
-                if resp.status_code == 200:
-                    messages = resp.json().get("messages") or []
-                    for msg in messages:
-                        if not isinstance(msg, dict):
-                            continue
-                        msg_id = msg.get("id")
-                        if not msg_id:
-                            continue
-                        detail_resp = session.get(
-                            f"{self.api_base}/api/emails/{email_id}/{msg_id}",
-                            headers=self._headers(), timeout=15, verify=False,
-                        )
-                        if detail_resp.status_code == 200:
-                            detail = detail_resp.json()
-                            msg_obj = detail.get("message") or {}
-                            content = msg_obj.get("content") or msg_obj.get("html") or ""
-                            if not content:
-                                content = detail.get("text") or detail.get("html") or ""
-                            code = _extract_code(content)
-                            if code:
-                                return code
-            except Exception:
-                pass
-            time.sleep(3)
+            while time.time() - start < timeout:
+                if stop_event and stop_event.is_set():
+                    return ""
+                try:
+                    resp = session.get(
+                        f"{self.api_base}/api/emails/{email_id}",
+                        headers=self._headers(), timeout=15, verify=False,
+                    )
+                    if resp.status_code == 200:
+                        messages = resp.json().get("messages") or []
+                        for msg in messages:
+                            if not isinstance(msg, dict):
+                                continue
+                            msg_id = msg.get("id")
+                            if not msg_id or msg_id in seen_ids:
+                                continue
+                            seen_ids.add(str(msg_id))
+                            detail_resp = session.get(
+                                f"{self.api_base}/api/emails/{email_id}/{msg_id}",
+                                headers=self._headers(), timeout=15, verify=False,
+                            )
+                            if detail_resp.status_code == 200:
+                                detail = detail_resp.json()
+                                msg_obj = detail.get("message") or {}
+                                content = msg_obj.get("content") or msg_obj.get("html") or ""
+                                if not content:
+                                    content = detail.get("text") or detail.get("html") or ""
+                                code = _extract_code(content)
+                                if code:
+                                    return code
+                except Exception as exc:
+                    logger.warning("MoeMail 轮询验证码失败: %s", exc)
+                time.sleep(3)
         return ""
 
 
@@ -692,46 +737,46 @@ class DuckMailProvider(MailProvider):
         proxy: str = "",
         proxy_selector: Optional[Callable[[], str]] = None,
     ) -> Tuple[str, str]:
-        session = _build_session(proxy, proxy_selector)
-        headers: Dict[str, str] = {"Content-Type": "application/json", "Accept": "application/json"}
-        if self.bearer_token:
-            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        with _build_session(proxy, proxy_selector) as session:
+            headers: Dict[str, str] = {"Content-Type": "application/json", "Accept": "application/json"}
+            if self.bearer_token:
+                headers["Authorization"] = f"Bearer {self.bearer_token}"
 
-        try:
-            domains_resp = session.get(f"{self.api_base}/domains", headers={"Accept": "application/json"}, timeout=15, verify=False)
-            if domains_resp.status_code != 200:
-                return "", ""
-            data = domains_resp.json()
-            items = data if isinstance(data, list) else (data.get("hydra:member") or [])
-            domains = [str(i.get("domain") or "") for i in items if isinstance(i, dict) and i.get("domain") and i.get("isActive", True)]
-            if not domains:
-                return "", ""
-            domain = random.choice(domains)
+            try:
+                domains_resp = session.get(f"{self.api_base}/domains", headers={"Accept": "application/json"}, timeout=15, verify=False)
+                if domains_resp.status_code != 200:
+                    return "", ""
+                data = domains_resp.json()
+                items = data if isinstance(data, list) else (data.get("hydra:member") or [])
+                domains = [str(i.get("domain") or "") for i in items if isinstance(i, dict) and i.get("domain") and i.get("isActive", True)]
+                if not domains:
+                    return "", ""
+                domain = random.choice(domains)
 
-            local = f"oc{secrets.token_hex(5)}"
-            email = f"{local}@{domain}"
-            password = secrets.token_urlsafe(18)
+                local = f"oc{secrets.token_hex(5)}"
+                email = f"{local}@{domain}"
+                password = secrets.token_urlsafe(18)
 
-            resp = session.post(
-                f"{self.api_base}/accounts",
-                json={"address": email, "password": password},
-                headers=headers, timeout=30, verify=False,
-            )
-            if resp.status_code not in (200, 201):
-                return "", ""
+                resp = session.post(
+                    f"{self.api_base}/accounts",
+                    json={"address": email, "password": password},
+                    headers=headers, timeout=30, verify=False,
+                )
+                if resp.status_code not in (200, 201):
+                    return "", ""
 
-            time.sleep(0.5)
-            token_resp = session.post(
-                f"{self.api_base}/token",
-                json={"address": email, "password": password},
-                headers=headers, timeout=30, verify=False,
-            )
-            if token_resp.status_code == 200:
-                mail_token = token_resp.json().get("token")
-                if mail_token:
-                    return email, str(mail_token)
-        except Exception:
-            pass
+                time.sleep(0.5)
+                token_resp = session.post(
+                    f"{self.api_base}/token",
+                    json={"address": email, "password": password},
+                    headers=headers, timeout=30, verify=False,
+                )
+                if token_resp.status_code == 200:
+                    mail_token = token_resp.json().get("token")
+                    if mail_token:
+                        return email, str(mail_token)
+            except Exception as exc:
+                logger.warning("DuckMail 创建邮箱失败: %s", exc)
         return "", ""
 
     def wait_for_otp(
@@ -743,45 +788,246 @@ class DuckMailProvider(MailProvider):
         timeout: int = 120,
         stop_event: Optional[threading.Event] = None,
     ) -> str:
-        session = _build_session(proxy, proxy_selector)
-        seen_ids: set = set()
-        start = time.time()
+        with _build_session(proxy, proxy_selector) as session:
+            seen_ids = _get_seen_message_ids(self, f"{email}|{auth_credential}")
+            start = time.time()
 
-        while time.time() - start < timeout:
-            if stop_event and stop_event.is_set():
-                return ""
+            while time.time() - start < timeout:
+                if stop_event and stop_event.is_set():
+                    return ""
+                try:
+                    resp = session.get(
+                        f"{self.api_base}/messages",
+                        headers=self._auth_headers(auth_credential),
+                        timeout=30, verify=False,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        messages = data.get("hydra:member") or data.get("member") or data.get("data") or []
+                        for msg in (messages if isinstance(messages, list) else []):
+                            if not isinstance(msg, dict):
+                                continue
+                            msg_id = msg.get("id") or msg.get("@id")
+                            if not msg_id or msg_id in seen_ids:
+                                continue
+                            raw_id = str(msg_id).split("/")[-1] if str(msg_id).startswith("/") else str(msg_id)
+
+                            detail_resp = session.get(
+                                f"{self.api_base}/messages/{raw_id}",
+                                headers=self._auth_headers(auth_credential),
+                                timeout=30, verify=False,
+                            )
+                            if detail_resp.status_code == 200:
+                                seen_ids.add(msg_id)
+                                detail = detail_resp.json()
+                                content = detail.get("text") or detail.get("html") or ""
+                                code = _extract_code(content)
+                                if code:
+                                    return code
+                except Exception as exc:
+                    logger.warning("DuckMail 轮询验证码失败: %s", exc)
+                time.sleep(3)
+        return ""
+
+
+# ==================== Cloudflare Temp Email ====================
+
+class CloudflareTempEmailProvider(MailProvider):
+    def __init__(self, api_base: str = "", admin_password: str = "", domain: str = ""):
+        self.api_base = api_base.rstrip("/")
+        self.admin_password = admin_password
+        self.domain = str(domain).strip()
+        # 使用线程本地 token，避免多线程下邮箱 token 串用。
+        self._tls = threading.local()
+
+    def _get_random_domain(self) -> str:
+        if not self.domain:
+            return ""
+        # 尝试按照 JSON 数组解析
+        if self.domain.startswith("[") and self.domain.endswith("]"):
             try:
-                resp = session.get(
-                    f"{self.api_base}/messages",
-                    headers=self._auth_headers(auth_credential),
+                import json
+                domain_list = json.loads(self.domain)
+                if isinstance(domain_list, list) and domain_list:
+                    return random.choice([str(d).strip() for d in domain_list if str(d).strip()])
+            except Exception:
+                pass
+        # 按照逗号分隔解析
+        if "," in self.domain:
+            parts = [d.strip() for d in self.domain.split(",") if d.strip()]
+            if parts:
+                return random.choice(parts)
+        return self.domain
+
+    @staticmethod
+    def _message_matches_email(msg: Dict[str, Any], target_email: str) -> bool:
+        target = str(target_email or "").strip().lower()
+        if not target:
+            return True
+
+        def _extract_text_candidates(value: Any) -> List[str]:
+            out: List[str] = []
+            if isinstance(value, str):
+                out.append(value)
+            elif isinstance(value, dict):
+                for k in ("address", "email", "name", "value"):
+                    if value.get(k):
+                        out.extend(_extract_text_candidates(value.get(k)))
+            elif isinstance(value, list):
+                for item in value:
+                    out.extend(_extract_text_candidates(item))
+            return out
+
+        candidates: List[str] = []
+        for key in ("to", "mailTo", "receiver", "receivers", "address", "email", "envelope_to"):
+            if key in msg:
+                candidates.extend(_extract_text_candidates(msg.get(key)))
+        if not candidates:
+            return True
+        target_lower = target.lower()
+        for raw in candidates:
+            text = str(raw or "").strip().lower()
+            if not text:
+                continue
+            if target_lower in text:
+                return True
+        return False
+
+    def create_mailbox(
+        self,
+        proxy: str = "",
+        proxy_selector: Optional[Callable[[], str]] = None,
+    ) -> Tuple[str, str]:
+        if not self.api_base or not self.admin_password or not self.domain:
+            return "", ""
+
+        with _build_session(proxy, proxy_selector) as session:
+            try:
+                # 生成5位字母 + 1-3位数字 + 1-3位字母的随机名
+                letters1 = ''.join(random.choices(string.ascii_lowercase, k=5))
+                numbers = ''.join(random.choices(string.digits, k=random.randint(1, 3)))
+                letters2 = ''.join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
+                name = letters1 + numbers + letters2
+
+                target_domain = self._get_random_domain()
+                if not target_domain:
+                    return "", ""
+
+                resp = session.post(
+                    f"{self.api_base}/admin/new_address",
+                    json={
+                        "enablePrefix": True,
+                        "name": name,
+                        "domain": target_domain,
+                    },
+                    headers={
+                        "x-admin-auth": self.admin_password,
+                        "Content-Type": "application/json"
+                    },
                     timeout=30, verify=False,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    messages = data.get("hydra:member") or data.get("member") or data.get("data") or []
-                    for msg in (messages if isinstance(messages, list) else []):
-                        if not isinstance(msg, dict):
-                            continue
-                        msg_id = msg.get("id") or msg.get("@id")
-                        if not msg_id or msg_id in seen_ids:
-                            continue
-                        seen_ids.add(msg_id)
-                        raw_id = str(msg_id).split("/")[-1] if str(msg_id).startswith("/") else str(msg_id)
+                    email = data.get("address")
+                    jwt_token = data.get("jwt")
+                    if email and jwt_token:
+                        self._tls.jwt_token = jwt_token
+                        return email, jwt_token
+            except Exception as exc:
+                logger.warning("Cloudflare 临时邮箱创建失败: %s", exc)
+        return "", ""
 
-                        detail_resp = session.get(
-                            f"{self.api_base}/messages/{raw_id}",
-                            headers=self._auth_headers(auth_credential),
-                            timeout=30, verify=False,
-                        )
-                        if detail_resp.status_code == 200:
-                            detail = detail_resp.json()
-                            content = detail.get("text") or detail.get("html") or ""
+    def wait_for_otp(
+        self,
+        auth_credential: str,
+        email: str,
+        proxy: str = "",
+        proxy_selector: Optional[Callable[[], str]] = None,
+        timeout: int = 120,
+        stop_event: Optional[threading.Event] = None,
+    ) -> str:
+        token = str(auth_credential or "").strip() or str(getattr(self._tls, "jwt_token", "") or "").strip()
+        if not token:
+            return ""
+        print(f"[CFMail] wait_for_otp 进入! email={email}, api_base={self.api_base}, jwt前16={token[:16] if token else 'EMPTY'}", flush=True)
+        with _build_session(proxy, proxy_selector) as session:
+            seen_ids = _get_seen_message_ids(self, f"{email}|{token}")
+            start = time.time()
+            poll_count = 0
+
+            while time.time() - start < timeout:
+                if stop_event and stop_event.is_set():
+                    print("[CFMail] stop_event 已触发，退出", flush=True)
+                    return ""
+                try:
+                    poll_count += 1
+                    url = f"{self.api_base}/api/mails?limit=10&offset=0"
+                    resp = session.get(
+                        url,
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json"
+                        },
+                        timeout=30, verify=False,
+                    )
+                    print(f"[CFMail] 轮询#{poll_count} status={resp.status_code}, body前200={str(resp.text or '')[:200]}", flush=True)
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                        except Exception as je:
+                            print(f"[CFMail] JSON解析失败: {je}", flush=True)
+                            time.sleep(3)
+                            continue
+                        # API 返回字典 {"results": [...], "count": 0}，需正确提取
+                        if isinstance(data, dict):
+                            messages = data.get("results") or []
+                        elif isinstance(data, list):
+                            messages = data
+                        else:
+                            messages = []
+                        print(f"[CFMail] 解析到 {len(messages)} 条邮件", flush=True)
+                        for msg in messages:
+                            if not isinstance(msg, dict):
+                                continue
+                            if not self._message_matches_email(msg, email):
+                                continue
+                            msg_id = msg.get("id")
+                            if not msg_id or msg_id in seen_ids:
+                                continue
+                            seen_ids.add(msg_id)
+
+                            content = msg.get("text") or msg.get("html") or ""
+                            # Cloudflare Temp Email 将邮件原文放在 raw 字段（MIME 格式）
+                            if not content and msg.get("raw"):
+                                try:
+                                    import email as _email_mod
+                                    from email import policy
+                                    parsed = _email_mod.message_from_string(msg["raw"], policy=policy.default)
+                                    # 优先取纯文本
+                                    body = parsed.get_body(preferencelist=('plain', 'html'))
+                                    if body:
+                                        content = body.get_content() or ""
+                                    if not content:
+                                        # 回退：遍历所有 part
+                                        for part in parsed.walk():
+                                            ctype = part.get_content_type()
+                                            if ctype in ("text/plain", "text/html"):
+                                                payload = part.get_content()
+                                                if payload:
+                                                    content = str(payload)
+                                                    break
+                                except Exception as parse_err:
+                                    print(f"[CFMail] MIME解析失败，回退raw: {parse_err}", flush=True)
+                                    content = msg.get("raw", "")
+                            print(f"[CFMail] 邮件id={msg_id}, 内容前200={content[:200]}", flush=True)
                             code = _extract_code(content)
                             if code:
+                                print(f"[CFMail] 成功提取验证码: {code}", flush=True)
                                 return code
-            except Exception:
-                pass
-            time.sleep(3)
+                except Exception as e:
+                    print(f"[CFMail] 轮询异常: {e}", flush=True)
+                time.sleep(3)
+        print("[CFMail] wait_for_otp 超时, 未获取到验证码", flush=True)
         return ""
 
 
@@ -817,6 +1063,8 @@ class MultiMailRouter:
                 logger.warning("创建邮箱提供商 %s 失败: %s", name, e)
 
         if not self._providers:
+            if providers_list:
+                raise RuntimeError(f"邮箱提供商配置无效: {', '.join(str(n) for n in providers_list)}")
             fallback = create_provider_by_name("mailtm", {})
             self._provider_names = ["mailtm"]
             self._providers = {"mailtm": fallback}
@@ -868,6 +1116,12 @@ def create_provider_by_name(provider_type: str, mail_cfg: Dict[str, Any]) -> Mai
             api_base=api_base or "https://api.duckmail.sbs",
             bearer_token=str(mail_cfg.get("bearer_token", "")).strip(),
         )
+    elif provider_type == "cloudflare_temp_email":
+        return CloudflareTempEmailProvider(
+            api_base=api_base,
+            admin_password=str(mail_cfg.get("admin_password", "")).strip(),
+            domain=str(mail_cfg.get("domain", "")).strip(),
+        )
     elif provider_type == "mailtm_forward":
         return MailTmForwardProvider(
             api_base=api_base or "https://api.mail.tm",
@@ -878,8 +1132,9 @@ def create_provider_by_name(provider_type: str, mail_cfg: Dict[str, Any]) -> Mai
             alias_prefix=str(mail_cfg.get("alias_prefix", "oc")).strip(),
             alias_length=mail_cfg.get("alias_length", 12),
         )
-    else:
+    elif provider_type == "mailtm":
         return MailTmProvider(api_base=api_base or "https://api.mail.tm")
+    raise ValueError(f"未知邮箱提供商: {provider_type}")
 
 
 def create_provider(config: Dict[str, Any]) -> MailProvider:

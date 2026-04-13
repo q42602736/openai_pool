@@ -1,24 +1,62 @@
 /**
- * OpenAI Pool Orchestrator — 前端交互逻辑 v5.0
+ * OpenAI Pool Orchestrator — v5.2.1
  */
 
 // ==========================================
 // 状态
 // ==========================================
 const state = {
-  status: 'idle',          // idle | running | stopping
-  successCount: 0,
-  failCount: 0,
-  logCount: 0,
-  autoScroll: true,
-  currentSteps: {},        // step名 → 状态
-  eventSource: null,
-  tokens: [],
-  tokenFilter: {
-    status: 'all',
-    keyword: '',
+  task: {
+    status: 'idle',
+    run_id: null,
+    revision: -1,
+    server_time: null,
   },
-  stepsInRun: false,       // 是否处于一轮步骤追踪中（避免多线程 start 互相清空）
+  runtime: {
+    run_id: null,
+    revision: -1,
+    focus_worker_id: null,
+    workers: [],
+    completion_semantics: 'registration_only',
+  },
+  stats: {
+    success: 0,
+    fail: 0,
+    total: 0,
+  },
+  ui: {
+    autoScroll: true,
+    logCount: 0,
+    focusWorkerId: null,
+    focusLocked: false,
+    eventSource: null,
+    tokens: [],
+    tokenFilter: {
+      status: 'all',
+      keyword: '',
+    },
+    sub2apiAccounts: [],
+    sub2apiAccountFilter: {
+      status: 'all',
+      keyword: '',
+    },
+    sub2apiAccountPager: {
+      page: 1,
+      pageSize: 20,
+      total: 0,
+      filteredTotal: 0,
+      totalPages: 1,
+    },
+    selectedSub2ApiAccountIds: new Set(),
+    sub2apiAccountsLoading: false,
+    sub2apiAccountActionBusy: false,
+    countdownTimer: null,
+    _loadTokensTimer: null,
+    latestRevisionByRun: {},
+    snapshotRequested: false,
+    forceStopEnabled: false,
+    dataPanelTab: 'dataPanelSub2Api',
+  },
 };
 
 // ==========================================
@@ -27,19 +65,87 @@ const state = {
 const $ = id => document.getElementById(id);
 const DOM = {};
 
-const STEPS = [
-  { id: 'check_proxy', label: '网络检查' },
-  { id: 'create_email', label: '创建邮箱' },
-  { id: 'oauth_init', label: 'OAuth 初始化' },
-  { id: 'sentinel', label: 'Sentinel Token' },
-  { id: 'signup', label: '提交注册' },
-  { id: 'send_otp', label: '发送验证码' },
-  { id: 'wait_otp', label: '等待验证码' },
-  { id: 'verify_otp', label: '验证 OTP' },
-  { id: 'create_account', label: '创建账户' },
-  { id: 'workspace', label: '选择 Workspace' },
-  { id: 'get_token', label: '获取 Token' },
-];
+const STEP_DISPLAY_LABELS = {
+  check_proxy: '网络检查',
+  create_email: '创建邮箱',
+  oauth_init: 'OAuth 初始化',
+  sentinel: 'Sentinel Token',
+  signup: '提交注册',
+  create_password: '设置密码',
+  send_otp: '发送验证码',
+  wait_otp: '等待验证码',
+  verify_otp: '验证 OTP',
+  create_account: '完善资料',
+  phone_verification: '手机号验证',
+  workspace: '选择 Workspace',
+  get_token: '获取 Token',
+  start: '开始新一轮',
+  saved: '保存 Token',
+  retry: '等待重试',
+  runtime: '运行异常',
+  wait: '等待下一轮',
+  stopped: '已停止',
+  dedupe: '重复检测',
+  sync: '同步 Sub2Api',
+  cpa_upload: '上传 CPA',
+  mode: '上传策略',
+  auto_stop: '自动停止',
+  stopping: '停止中',
+};
+
+const STATUS_LABEL_MAP = {
+  idle: '空闲',
+  starting: '启动中',
+  preparing: '准备中',
+  running: '运行中',
+  registering: '注册中',
+  postprocessing: '后处理中',
+  waiting: '等待中',
+  stopping: '停止中',
+  stopped: '已停止',
+  finished: '已完成',
+  failed: '失败',
+  error: '异常',
+};
+
+const PHASE_LABEL_MAP = {
+  preparing: '准备阶段',
+  registration: '注册阶段',
+  postprocess: '后处理阶段',
+  finished: '结束阶段',
+  idle: '等待任务',
+};
+
+const COMPLETION_SEMANTICS_MAP = {
+  registration_only: '注册完成即结束',
+  requires_postprocess: '注册完成后仍需后处理',
+};
+
+const WORKER_STATUS_PRIORITY = {
+  registering: 6,
+  postprocessing: 5,
+  preparing: 4,
+  running: 4,
+  waiting: 3,
+  error: 3,
+  stopping: 2,
+  stopped: 1,
+  idle: 0,
+};
+
+const SUB2API_ABNORMAL_STATUSES = new Set(['error', 'disabled']);
+
+function clearSub2ApiAccountKeywordInput() {
+  if (!DOM.sub2apiAccountKeyword) return;
+  if (state.ui.sub2apiAccountFilter.keyword) return;
+  DOM.sub2apiAccountKeyword.value = '';
+  requestAnimationFrame(() => {
+    if (!state.ui.sub2apiAccountFilter.keyword && DOM.sub2apiAccountKeyword) DOM.sub2apiAccountKeyword.value = '';
+  });
+  setTimeout(() => {
+    if (!state.ui.sub2apiAccountFilter.keyword && DOM.sub2apiAccountKeyword) DOM.sub2apiAccountKeyword.value = '';
+  }, 120);
+}
 
 // ==========================================
 // 初始化
@@ -61,13 +167,15 @@ document.addEventListener('DOMContentLoaded', () => {
     logCount: $('logCount'),
     clearLogBtn: $('clearLogBtn'),
     progressFill: $('progressFill'),
-    stepsTracker: $('stepsTracker'),
+    taskOverview: $('taskOverview'),
+    workerList: $('workerList'),
+    workerDetail: $('workerDetail'),
+    unlockFocusBtn: $('unlockFocusBtn'),
     segmentIndicator: $('segmentIndicator'),
     autoScrollCheck: $('autoScrollCheck'),
-    // 多线程
     multithreadCheck: $('multithreadCheck'),
     threadCountInput: $('threadCountInput'),
-    // Sub2Api
+    targetCountInput: $('targetCountInput'),
     sub2apiBaseUrl: $('sub2apiBaseUrl'),
     sub2apiEmail: $('sub2apiEmail'),
     sub2apiPassword: $('sub2apiPassword'),
@@ -77,7 +185,6 @@ document.addEventListener('DOMContentLoaded', () => {
     uploadModeStatus: $('uploadModeStatus'),
     saveSyncConfigBtn: $('saveSyncConfigBtn'),
     syncStatus: $('syncStatus'),
-    // Header 池状态
     headerSub2apiChip: $('headerSub2apiChip'),
     headerSub2apiLabel: $('headerSub2apiLabel'),
     headerSub2apiDelta: $('headerSub2apiDelta'),
@@ -86,8 +193,11 @@ document.addEventListener('DOMContentLoaded', () => {
     headerCpaLabel: $('headerCpaLabel'),
     headerCpaDelta: $('headerCpaDelta'),
     headerCpaBar: $('headerCpaBar'),
+    headerLocalTokenChip: $('headerLocalTokenChip'),
+    headerLocalTokenLabel: $('headerLocalTokenLabel'),
+    headerLocalTokenDelta: $('headerLocalTokenDelta'),
+    headerLocalTokenBar: $('headerLocalTokenBar'),
     themeToggleBtn: $('themeToggleBtn'),
-    // CPA config
     cpaBaseUrl: $('cpaBaseUrl'),
     cpaToken: $('cpaToken'),
     cpaMinCandidates: $('cpaMinCandidates'),
@@ -97,12 +207,14 @@ document.addEventListener('DOMContentLoaded', () => {
     cpaTestBtn: $('cpaTestBtn'),
     cpaSaveBtn: $('cpaSaveBtn'),
     cpaStatus: $('cpaStatus'),
-    // Mail config（多选）
+    tokenProxySyncCheck: $('tokenProxySyncCheck'),
+    tokenProxyDbPath: $('tokenProxyDbPath'),
+    saveTokenProxyConfigBtn: $('saveTokenProxyConfigBtn'),
+    tokenProxyStatus: $('tokenProxyStatus'),
     mailStrategySelect: $('mailStrategySelect'),
     mailTestBtn: $('mailTestBtn'),
     mailSaveBtn: $('mailSaveBtn'),
     mailStatus: $('mailStatus'),
-    // Pool tab — CPA
     poolTotal: $('poolTotal'),
     poolCandidates: $('poolCandidates'),
     poolError: $('poolError'),
@@ -111,15 +223,17 @@ document.addEventListener('DOMContentLoaded', () => {
     poolRefreshBtn: $('poolRefreshBtn'),
     poolMaintainBtn: $('poolMaintainBtn'),
     poolMaintainStatus: $('poolMaintainStatus'),
+    dataPanelSub2Api: $('dataPanelSub2Api'),
+    dataPanelCpa: $('dataPanelCpa'),
+    dataPanelLocalTokens: $('dataPanelLocalTokens'),
     poolTokenList: $('poolTokenList'),
-    poolTokenCount: $('poolTokenCount'),
     poolCopyRtBtn: $('poolCopyRtBtn'),
+    poolExportBtn: $('poolExportBtn'),
     poolPwSyncBtn: $('poolPwSyncBtn'),
     tokenFilterStatus: $('tokenFilterStatus'),
     tokenFilterKeyword: $('tokenFilterKeyword'),
     tokenFilterApplyBtn: $('tokenFilterApplyBtn'),
     tokenFilterResetBtn: $('tokenFilterResetBtn'),
-    // Pool tab — Sub2Api
     sub2apiPoolTotal: $('sub2apiPoolTotal'),
     sub2apiPoolNormal: $('sub2apiPoolNormal'),
     sub2apiPoolError: $('sub2apiPoolError'),
@@ -128,11 +242,30 @@ document.addEventListener('DOMContentLoaded', () => {
     sub2apiPoolRefreshBtn: $('sub2apiPoolRefreshBtn'),
     sub2apiPoolMaintainBtn: $('sub2apiPoolMaintainBtn'),
     sub2apiPoolMaintainStatus: $('sub2apiPoolMaintainStatus'),
-    // Sub2Api config maintenance fields
+    sub2apiAccountStatusFilter: $('sub2apiAccountStatusFilter'),
+    sub2apiAccountKeyword: $('sub2apiAccountKeyword'),
+    sub2apiAccountApplyBtn: $('sub2apiAccountApplyBtn'),
+    sub2apiAccountResetBtn: $('sub2apiAccountResetBtn'),
+    sub2apiAccountSelectAll: $('sub2apiAccountSelectAll'),
+    sub2apiAccountSelection: $('sub2apiAccountSelection'),
+    sub2apiAccountProbeBtn: $('sub2apiAccountProbeBtn'),
+    sub2apiAccountExceptionBtn: $('sub2apiAccountExceptionBtn'),
+    sub2apiDuplicateScanBtn: $('sub2apiDuplicateScanBtn'),
+    sub2apiDuplicateCleanBtn: $('sub2apiDuplicateCleanBtn'),
+    sub2apiAccountDeleteBtn: $('sub2apiAccountDeleteBtn'),
+    sub2apiAccountList: $('sub2apiAccountList'),
+    sub2apiAccountActionStatus: $('sub2apiAccountActionStatus'),
+    sub2apiAccountPrevBtn: $('sub2apiAccountPrevBtn'),
+    sub2apiAccountNextBtn: $('sub2apiAccountNextBtn'),
+    sub2apiAccountPageInfo: $('sub2apiAccountPageInfo'),
+    sub2apiAccountPageSize: $('sub2apiAccountPageSize'),
     sub2apiMinCandidates: $('sub2apiMinCandidates'),
     sub2apiInterval: $('sub2apiInterval'),
     sub2apiAutoMaintain: $('sub2apiAutoMaintain'),
     sub2apiTestPoolBtn: $('sub2apiTestPoolBtn'),
+    sub2apiMaintainRefreshAbnormal: $('sub2apiMaintainRefreshAbnormal'),
+    sub2apiMaintainDeleteAbnormal: $('sub2apiMaintainDeleteAbnormal'),
+    sub2apiMaintainDedupe: $('sub2apiMaintainDedupe'),
     proxyPoolEnabled: $('proxyPoolEnabled'),
     proxyPoolApiUrl: $('proxyPoolApiUrl'),
     proxyPoolAuthMode: $('proxyPoolAuthMode'),
@@ -142,46 +275,73 @@ document.addEventListener('DOMContentLoaded', () => {
     proxyPoolTestBtn: $('proxyPoolTestBtn'),
     proxyPoolSaveBtn: $('proxyPoolSaveBtn'),
     proxyPoolStatus: $('proxyPoolStatus'),
-    // 代理保存 & 自动注册
+    registerMode: $('registerMode'),
+    browserVisible: $('browserVisible'),
+    browserBlockMedia: $('browserBlockMedia'),
+    manualV2TestPhone: $('manualV2TestPhone'),
+    manualV2TestPassword: $('manualV2TestPassword'),
+    browserRealisticProfile: $('browserRealisticProfile'),
+    browserClearRuntimeState: $('browserClearRuntimeState'),
+    browserTimeoutMs: $('browserTimeoutMs'),
+    browserSlowMoMs: $('browserSlowMoMs'),
+    browserLocale: $('browserLocale'),
+    browserTimezone: $('browserTimezone'),
+    browserExecutablePath: $('browserExecutablePath'),
+    browserConfigSaveBtn: $('saveBrowserConfigBtn'),
+    browserConfigStatus: $('browserConfigStatus'),
     saveProxyBtn: $('saveProxyBtn'),
     autoRegisterCheck: $('autoRegisterCheck'),
   });
 
-  renderSteps();
+  clearSub2ApiAccountKeywordInput();
+
+  renderRuntimePanels();
   connectSSE();
   loadTokens();
-  updateStatus();
+  requestStatusSnapshot();
   loadSyncConfig();
+  loadBrowserConfig();
   loadProxyPoolConfig();
   loadPoolConfig();
   loadMailConfig();
   initMailCheckboxes();
+  initCustomDomainsContainer();
   pollPoolStatus();
   pollSub2ApiPoolStatus();
+  loadSub2ApiAccounts();
   initThemeSwitch();
-
-  // 折叠面板
   initCollapsibles();
+  initDataPanelTabs();
 
-  // 控制中心事件
   DOM.checkProxyBtn.addEventListener('click', checkProxy);
   if (DOM.saveProxyBtn) DOM.saveProxyBtn.addEventListener('click', saveProxy);
   DOM.btnStart.addEventListener('click', startTask);
   DOM.btnStop.addEventListener('click', stopTask);
   DOM.clearLogBtn.addEventListener('click', clearLog);
+  if (DOM.unlockFocusBtn) DOM.unlockFocusBtn.addEventListener('click', unlockFocusWorker);
 
-  // 服务配置事件
   DOM.saveSyncConfigBtn.addEventListener('click', saveSyncConfig);
+  if (DOM.saveTokenProxyConfigBtn) DOM.saveTokenProxyConfigBtn.addEventListener('click', saveTokenProxyConfig);
+  if (DOM.browserConfigSaveBtn) DOM.browserConfigSaveBtn.addEventListener('click', saveBrowserConfig);
+  if (DOM.registerMode) {
+    DOM.registerMode.addEventListener('change', () => {
+      if (DOM.registerMode.value === 'browser_manual' || DOM.registerMode.value === 'browser_manual_v2') {
+        if (DOM.browserVisible) { DOM.browserVisible.checked = true; DOM.browserVisible.disabled = true; }
+      } else {
+        if (DOM.browserVisible) { DOM.browserVisible.disabled = false; }
+      }
+    });
+  }
   if (DOM.uploadModeSaveBtn) DOM.uploadModeSaveBtn.addEventListener('click', saveUploadMode);
   DOM.cpaTestBtn.addEventListener('click', testCpaConnection);
   DOM.cpaSaveBtn.addEventListener('click', savePoolConfig);
   DOM.mailTestBtn.addEventListener('click', testMailConnection);
   DOM.mailSaveBtn.addEventListener('click', saveMailConfig);
 
-  // 账号池事件 — CPA
   DOM.poolRefreshBtn.addEventListener('click', pollPoolStatus);
   DOM.poolMaintainBtn.addEventListener('click', triggerMaintenance);
   if (DOM.poolCopyRtBtn) DOM.poolCopyRtBtn.addEventListener('click', copyAllRt);
+  if (DOM.poolExportBtn) DOM.poolExportBtn.addEventListener('click', exportLocalTokens);
   if (DOM.poolPwSyncBtn) DOM.poolPwSyncBtn.addEventListener('click', batchSync);
   if (DOM.tokenFilterApplyBtn) DOM.tokenFilterApplyBtn.addEventListener('click', applyTokenFilter);
   if (DOM.tokenFilterResetBtn) DOM.tokenFilterResetBtn.addEventListener('click', resetTokenFilter);
@@ -190,16 +350,66 @@ document.addEventListener('DOMContentLoaded', () => {
       if (e.key === 'Enter') applyTokenFilter();
     });
   }
-  // 账号池事件 — Sub2Api
-  if (DOM.sub2apiPoolRefreshBtn) DOM.sub2apiPoolRefreshBtn.addEventListener('click', pollSub2ApiPoolStatus);
+  if (DOM.sub2apiPoolRefreshBtn) {
+    DOM.sub2apiPoolRefreshBtn.addEventListener('click', () => {
+      pollSub2ApiPoolStatus();
+      loadSub2ApiAccounts();
+    });
+  }
   if (DOM.sub2apiPoolMaintainBtn) DOM.sub2apiPoolMaintainBtn.addEventListener('click', triggerSub2ApiMaintenance);
   if (DOM.sub2apiTestPoolBtn) DOM.sub2apiTestPoolBtn.addEventListener('click', testSub2ApiPoolConnection);
+  if (DOM.sub2apiAccountApplyBtn) DOM.sub2apiAccountApplyBtn.addEventListener('click', applySub2ApiAccountFilter);
+  if (DOM.sub2apiAccountResetBtn) DOM.sub2apiAccountResetBtn.addEventListener('click', resetSub2ApiAccountFilter);
+  if (DOM.sub2apiAccountKeyword) {
+    DOM.sub2apiAccountKeyword.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') applySub2ApiAccountFilter();
+    });
+  }
+
+  window.addEventListener('pageshow', () => {
+    clearSub2ApiAccountKeywordInput();
+  });
+  if (DOM.sub2apiAccountPrevBtn) DOM.sub2apiAccountPrevBtn.addEventListener('click', () => changeSub2ApiAccountPage(-1));
+  if (DOM.sub2apiAccountNextBtn) DOM.sub2apiAccountNextBtn.addEventListener('click', () => changeSub2ApiAccountPage(1));
+  if (DOM.sub2apiAccountPageSize) {
+    DOM.sub2apiAccountPageSize.addEventListener('change', () => changeSub2ApiAccountPageSize());
+  }
+  if (DOM.sub2apiAccountSelectAll) DOM.sub2apiAccountSelectAll.addEventListener('change', toggleSelectAllSub2ApiAccounts);
+  if (DOM.sub2apiAccountProbeBtn) DOM.sub2apiAccountProbeBtn.addEventListener('click', triggerSelectedSub2ApiProbe);
+  if (DOM.sub2apiAccountExceptionBtn) DOM.sub2apiAccountExceptionBtn.addEventListener('click', triggerSub2ApiExceptionHandling);
+  if (DOM.sub2apiDuplicateScanBtn) DOM.sub2apiDuplicateScanBtn.addEventListener('click', previewSub2ApiDuplicates);
+  if (DOM.sub2apiDuplicateCleanBtn) DOM.sub2apiDuplicateCleanBtn.addEventListener('click', cleanupSub2ApiDuplicates);
+  if (DOM.sub2apiAccountDeleteBtn) DOM.sub2apiAccountDeleteBtn.addEventListener('click', triggerSelectedSub2ApiDelete);
   if (DOM.proxyPoolTestBtn) DOM.proxyPoolTestBtn.addEventListener('click', testProxyPoolFetch);
   if (DOM.proxyPoolSaveBtn) DOM.proxyPoolSaveBtn.addEventListener('click', saveProxyPoolConfig);
 
-  // Token 列表事件委托
   if (DOM.poolTokenList) {
     DOM.poolTokenList.addEventListener('click', async (e) => {
+      const syncBtn = e.target.closest('.token-sync-sub2api-btn');
+      if (syncBtn) {
+        const filename = decodeURIComponent(syncBtn.dataset.filename || '');
+        const email = decodeURIComponent(syncBtn.dataset.email || '');
+        if (filename) {
+          await syncLocalTokensToSub2Api([filename], {
+            button: syncBtn,
+            label: email || filename,
+            force: syncBtn.dataset.force === '1',
+          });
+        }
+        return;
+      }
+      const clearBtn = e.target.closest('.token-clear-sub2api-btn');
+      if (clearBtn) {
+        const filename = decodeURIComponent(clearBtn.dataset.filename || '');
+        const email = decodeURIComponent(clearBtn.dataset.email || '');
+        if (filename) {
+          await clearLocalPlatformMark([filename], 'sub2api', {
+            button: clearBtn,
+            label: email || filename,
+          });
+        }
+        return;
+      }
       const copyBtn = e.target.closest('.token-copy-btn');
       if (copyBtn) {
         try {
@@ -216,27 +426,59 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  DOM.logBody.addEventListener('scroll', () => {
-    const el = DOM.logBody;
-    const isAtBottom = (el.scrollTop + el.clientHeight >= el.scrollHeight - 20);
-    state.autoScroll = isAtBottom;
-    if (DOM.autoScrollCheck) DOM.autoScrollCheck.checked = isAtBottom;
-  });
-
-  // 自动滚动开关
-  if (DOM.autoScrollCheck) {
-    DOM.autoScrollCheck.addEventListener('change', () => {
-      state.autoScroll = DOM.autoScrollCheck.checked;
-      if (state.autoScroll) DOM.logBody.scrollTop = DOM.logBody.scrollHeight;
+  if (DOM.sub2apiAccountList) {
+    DOM.sub2apiAccountList.addEventListener('click', async (e) => {
+      const probeBtn = e.target.closest('.sub2api-account-probe-btn');
+      if (probeBtn) {
+        const accountId = parseInt(probeBtn.dataset.accountId, 10);
+        if (Number.isInteger(accountId) && accountId > 0) {
+          await runSub2ApiAccountProbe([accountId], `账号 ${accountId}`);
+        }
+        return;
+      }
+      const deleteBtn = e.target.closest('.sub2api-account-delete-btn');
+      if (deleteBtn) {
+        const accountId = parseInt(deleteBtn.dataset.accountId, 10);
+        const email = decodeURIComponent(deleteBtn.dataset.email || '');
+        if (Number.isInteger(accountId) && accountId > 0) {
+          await runSub2ApiAccountDelete([accountId], email || `账号 ${accountId}`);
+        }
+      }
+    });
+    DOM.sub2apiAccountList.addEventListener('change', (e) => {
+      const checkbox = e.target.closest('.sub2api-account-check');
+      if (!checkbox) return;
+      const accountId = parseInt(checkbox.dataset.accountId, 10);
+      if (!Number.isInteger(accountId) || accountId <= 0) return;
+      if (checkbox.checked) state.ui.selectedSub2ApiAccountIds.add(accountId);
+      else state.ui.selectedSub2ApiAccountIds.delete(accountId);
+      const row = checkbox.closest('.sub2api-account-item');
+      if (row) row.classList.toggle('selected', checkbox.checked);
+      refreshSub2ApiSelectionState();
     });
   }
 
-  setInterval(updateStatus, 5000);
+  DOM.logBody.addEventListener('scroll', () => {
+    const el = DOM.logBody;
+    const isAtBottom = (el.scrollTop + el.clientHeight >= el.scrollHeight - 20);
+    state.ui.autoScroll = isAtBottom;
+    if (DOM.autoScrollCheck) DOM.autoScrollCheck.checked = isAtBottom;
+  });
+
+  if (DOM.autoScrollCheck) {
+    DOM.autoScrollCheck.checked = state.ui.autoScroll;
+    DOM.autoScrollCheck.addEventListener('change', () => {
+      state.ui.autoScroll = DOM.autoScrollCheck.checked;
+      if (state.ui.autoScroll) DOM.logBody.scrollTop = DOM.logBody.scrollHeight;
+    });
+  }
+
+  setInterval(requestStatusSnapshot, 5000);
   setInterval(loadTokens, 60000);
   setInterval(pollPoolStatus, 30000);
   setInterval(pollSub2ApiPoolStatus, 30000);
+  setInterval(() => loadSub2ApiAccounts({ silent: true }), 60000);
 
-  // Tab 导航
   initTabs();
 });
 
@@ -245,23 +487,102 @@ document.addEventListener('DOMContentLoaded', () => {
 // ==========================================
 function initTabs() {
   const tabBtns = document.querySelectorAll('.tab-btn');
-  const tabPanels = document.querySelectorAll('.tab-panel');
-  const indicator = DOM.segmentIndicator;
+  if (!tabBtns.length) return;
 
   tabBtns.forEach((btn, index) => {
     btn.addEventListener('click', () => {
-      tabBtns.forEach(b => { b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
-      tabPanels.forEach(p => p.classList.remove('active'));
-      btn.classList.add('active');
-      btn.setAttribute('aria-selected', 'true');
-      document.getElementById(btn.dataset.tab).classList.add('active');
-
-      // 滑动分段指示器
-      if (indicator) {
-        indicator.setAttribute('data-active', String(index));
-      }
+      switchMainTab(btn.dataset.tab || 'tabDashboard');
     });
   });
+
+  const activeTab = Array.from(tabBtns).find(btn => btn.classList.contains('active'))?.dataset.tab || 'tabDashboard';
+  switchMainTab(activeTab);
+}
+
+function switchMainTab(tabId) {
+  const nextTab = tabId === 'tabConfig' ? 'tabConfig' : 'tabDashboard';
+  const tabBtns = document.querySelectorAll('.tab-btn');
+  const tabPanels = document.querySelectorAll('.tab-panel');
+
+  tabBtns.forEach((btn, index) => {
+    const active = btn.dataset.tab === nextTab;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+    if (active && DOM.segmentIndicator) {
+      DOM.segmentIndicator.setAttribute('data-active', String(index));
+    }
+  });
+
+  tabPanels.forEach((panel) => {
+    panel.classList.toggle('active', panel.id === nextTab);
+  });
+}
+
+function initDataPanelTabs() {
+  const defaultTab = 'dataPanelSub2Api';
+  const tabButtons = [DOM.headerSub2apiChip, DOM.headerCpaChip, DOM.headerLocalTokenChip].filter(Boolean);
+  if (!tabButtons.length) return;
+
+  tabButtons.forEach((btn, index) => {
+    btn.addEventListener('click', () => {
+      switchDataPanelTab(btn.dataset.panelTab || defaultTab);
+    });
+
+    btn.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+
+      let nextIndex = index;
+      if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabButtons.length;
+      if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabButtons.length) % tabButtons.length;
+      if (event.key === 'Home') nextIndex = 0;
+      if (event.key === 'End') nextIndex = tabButtons.length - 1;
+
+      const targetBtn = tabButtons[nextIndex];
+      if (!targetBtn) return;
+      targetBtn.focus();
+      switchDataPanelTab(targetBtn.dataset.panelTab || defaultTab);
+    });
+  });
+
+  if (DOM.headerSub2apiChip) DOM.headerSub2apiChip.dataset.panelTab = 'dataPanelSub2Api';
+  if (DOM.headerCpaChip) DOM.headerCpaChip.dataset.panelTab = 'dataPanelCpa';
+  if (DOM.headerLocalTokenChip) DOM.headerLocalTokenChip.dataset.panelTab = 'dataPanelLocalTokens';
+
+  switchDataPanelTab(state.ui.dataPanelTab || defaultTab);
+}
+
+function switchDataPanelTab(tabId) {
+  const nextTab = ['dataPanelSub2Api', 'dataPanelCpa', 'dataPanelLocalTokens'].includes(tabId) ? tabId : 'dataPanelSub2Api';
+  state.ui.dataPanelTab = nextTab;
+
+  const panelMap = {
+    dataPanelSub2Api: DOM.dataPanelSub2Api,
+    dataPanelCpa: DOM.dataPanelCpa,
+    dataPanelLocalTokens: DOM.dataPanelLocalTokens,
+  };
+  const buttonMap = {
+    dataPanelSub2Api: DOM.headerSub2apiChip,
+    dataPanelCpa: DOM.headerCpaChip,
+    dataPanelLocalTokens: DOM.headerLocalTokenChip,
+  };
+
+  Object.entries(panelMap).forEach(([id, panel]) => {
+    if (!panel) return;
+    panel.classList.toggle('active', id === nextTab);
+  });
+  Object.entries(buttonMap).forEach(([id, btn]) => {
+    if (!btn) return;
+    const active = id === nextTab;
+    btn.classList.toggle('active-view', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    btn.tabIndex = active ? 0 : -1;
+  });
+
+  const dashboardActive = document.getElementById('tabDashboard')?.classList.contains('active');
+  if (!dashboardActive) {
+    switchMainTab('tabDashboard');
+  }
 }
 
 // ==========================================
@@ -290,40 +611,39 @@ function initCollapsibles() {
 }
 
 // ==========================================
-// SSE 日志连接
+// SSE / 快照同步
 // ==========================================
 function connectSSE() {
-  if (state.eventSource) state.eventSource.close();
+  if (state.ui.eventSource) state.ui.eventSource.close();
   const es = new EventSource('/api/logs');
-  state.eventSource = es;
+  state.ui.eventSource = es;
 
-  es.onmessage = (e) => {
-    const event = JSON.parse(e.data);
-    appendLog(event);
+  const handleEvent = (sourceType, raw) => {
+    try {
+      const payload = raw?.data ? JSON.parse(raw.data) : {};
+      const event = payload && typeof payload === 'object' ? { ...payload } : {};
+      if (!event.type && sourceType && sourceType !== 'message') event.type = sourceType;
+      if (!event.type && event.event) event.type = event.event;
 
-    if (event.level === 'token_saved') {
-      loadTokens();
-      showToast('新 Token 已保存: ' + event.message, 'success');
-    }
-    if (event.level === 'sync_ok') {
-      showToast('已自动同步: ' + event.message, 'success');
-    }
-    if (event.step === 'start' && !state.stepsInRun) {
-      state.stepsInRun = true;
-      Object.keys(state.currentSteps).forEach(k => delete state.currentSteps[k]);
-      renderSteps();
-      if (state.countdownTimer) {
-        clearInterval(state.countdownTimer);
-        state.countdownTimer = null;
+      if (event.type) {
+        applySseEvent(event);
+        return;
       }
-    }
-    if (event.step === 'wait' && event.message) {
-      const match = event.message.match(/(\d+)\s*秒/);
-      if (match) startCountdown(parseInt(match[1]));
-    }
-    if (event.step) updateStep(event.step, event.level);
+
+      if (Object.prototype.hasOwnProperty.call(event, 'task')
+        || Object.prototype.hasOwnProperty.call(event, 'runtime')
+        || Object.prototype.hasOwnProperty.call(event, 'stats')) {
+        applyStatusSnapshot(event);
+      }
+    } catch { }
   };
 
+  ['connected', 'snapshot', 'task.updated', 'worker.updated', 'worker.step.updated', 'stats.updated', 'log.appended', 'task.finished']
+    .forEach((eventName) => {
+      es.addEventListener(eventName, (e) => handleEvent(eventName, e));
+    });
+
+  es.onmessage = (e) => handleEvent('message', e);
   es.onerror = () => setTimeout(connectSSE, 3000);
 }
 
@@ -334,27 +654,313 @@ const LEVEL_ICON = { info: '›', success: '✓', error: '✗', warn: '⚠', con
 
 function appendLog(event) {
   const { ts, level, message, step } = event;
-  state.logCount++;
+  state.ui.logCount++;
   const entry = document.createElement('div');
   entry.className = 'log-entry';
   entry.innerHTML = `
-    <span class="log-ts">${ts || ''}</span>
+    <span class="log-ts">${escapeHtml(ts || '')}</span>
     <span class="log-icon">${LEVEL_ICON[level] || '·'}</span>
-    <span class="log-msg ${level}">${escapeHtml(message)}</span>
-    ${step && !['start', 'stopped', 'retry', 'wait', 'runtime'].includes(step)
-      ? `<span class="log-step">${escapeHtml(step)}</span>` : ''}
+    <span class="log-msg ${escapeHtml(level || 'info')}">${escapeHtml(message || '')}</span>
+    ${step ? `<span class="log-step">${escapeHtml(getStepDisplayLabel(step))}</span>` : ''}
   `;
   DOM.logBody.appendChild(entry);
-  DOM.logCount.textContent = state.logCount;
-  if (state.autoScroll) DOM.logBody.scrollTop = DOM.logBody.scrollHeight;
-  const entries = DOM.logBody.querySelectorAll('.log-entry');
-  if (entries.length > 2000) entries[0].remove();
+  DOM.logCount.textContent = state.ui.logCount;
+  if (state.ui.autoScroll) DOM.logBody.scrollTop = DOM.logBody.scrollHeight;
+  if (DOM.logBody.children.length > 2000) {
+    DOM.logBody.firstElementChild.remove();
+  }
+
+  if (!state.ui.forceStopEnabled) {
+    const msg = String(message || '');
+    const activeStep = step && !['wait', 'retry'].includes(step);
+    if (activeStep || /\[W\d+\]/.test(msg)) {
+      state.ui.forceStopEnabled = true;
+      if ((state.task.status || 'idle') === 'idle') requestStatusSnapshot();
+      syncTaskChrome();
+    }
+  }
 }
 
 function clearLog() {
   DOM.logBody.innerHTML = '';
-  state.logCount = 0;
+  state.ui.logCount = 0;
   DOM.logCount.textContent = '0';
+}
+
+function normalizeRevision(value, fallback = -1) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function normalizeRunId(runId) {
+  if (runId === null || runId === undefined || runId === '') return null;
+  const value = String(runId).trim();
+  return value || null;
+}
+
+function normalizeWorkerId(workerId) {
+  if (workerId === null || workerId === undefined || workerId === '') return null;
+  const value = String(workerId).trim();
+  return value || null;
+}
+
+function normalizeTaskSnapshot(task, serverTime = null) {
+  const source = task && typeof task === 'object' ? task : {};
+  return {
+    ...state.task,
+    ...source,
+    status: source.status || 'idle',
+    run_id: normalizeRunId(source.run_id) || null,
+    revision: normalizeRevision(source.revision, state.task.revision),
+    server_time: serverTime || source.server_time || state.task.server_time || null,
+  };
+}
+
+function normalizeStatsSnapshot(stats) {
+  const source = stats && typeof stats === 'object' ? stats : {};
+  const success = Number(source.success || 0);
+  const fail = Number(source.fail || 0);
+  const total = Number.isFinite(Number(source.total)) ? Number(source.total) : (success + fail);
+  return {
+    ...state.stats,
+    ...source,
+    success,
+    fail,
+    total,
+  };
+}
+
+function normalizeWorkerStep(step, fallbackIndex = 0) {
+  if (!step) return null;
+
+  const id = String(step.id || step.step_id || step.step || '').trim();
+  if (!id) return null;
+  const rawStatus = String(step.status || step.state || 'pending').toLowerCase();
+  let status = rawStatus;
+  if (['done', 'completed', 'ok'].includes(rawStatus)) status = 'done';
+  else if (['error', 'failed', 'fail'].includes(rawStatus)) status = 'error';
+  else if (['active', 'running', 'in_progress'].includes(rawStatus)) status = 'active';
+  else if (['skipped'].includes(rawStatus)) status = 'skipped';
+  else status = 'pending';
+
+  return {
+    ...step,
+    id,
+    step_id: step.step_id || id,
+    label: step.label || id,
+    status,
+    message: step.message || '',
+    index: Number.isFinite(Number(step.index)) ? Number(step.index) : fallbackIndex,
+    started_at: step.started_at || '',
+    finished_at: step.finished_at || '',
+    updated_at: step.updated_at || step.finished_at || step.started_at || '',
+  };
+}
+
+const MAX_WORKER_STEP_ITEMS = 16;
+
+function normalizeWorkerSteps(steps) {
+  const normalized = Array.isArray(steps)
+    ? steps
+      .map((step, index) => normalizeWorkerStep(step, index))
+      .filter(Boolean)
+    : (steps && typeof steps === 'object')
+      ? Object.entries(steps)
+        .map(([id, status], index) => normalizeWorkerStep({ id, status, index }, index))
+        .filter(Boolean)
+      : [];
+
+  if (!normalized.length) return [];
+
+  const deduped = new Map();
+  normalized.forEach((step, index) => {
+    const key = String(step.step_id || step.id || '').trim();
+    if (!key) return;
+
+    const normalizedIndex = Number.isFinite(Number(step.index)) ? Number(step.index) : index;
+    const nextStep = { ...step, step_id: key, id: key, index: normalizedIndex };
+    const previous = deduped.get(key);
+    if (!previous) {
+      deduped.set(key, nextStep);
+      return;
+    }
+
+    const previousUpdated = String(previous.updated_at || previous.finished_at || previous.started_at || '');
+    const nextUpdated = String(nextStep.updated_at || nextStep.finished_at || nextStep.started_at || '');
+    if (nextUpdated >= previousUpdated) {
+      deduped.set(key, { ...previous, ...nextStep, index: Math.min(previous.index, normalizedIndex) });
+    }
+  });
+
+  return [...deduped.values()]
+    .sort((a, b) => {
+      const ai = Number.isFinite(a.index) ? a.index : Number.MAX_SAFE_INTEGER;
+      const bi = Number.isFinite(b.index) ? b.index : Number.MAX_SAFE_INTEGER;
+      if (ai !== bi) return ai - bi;
+      return String(a.updated_at || '').localeCompare(String(b.updated_at || ''));
+    })
+    .slice(-MAX_WORKER_STEP_ITEMS);
+}
+
+function normalizeWorker(worker, fallbackId = null) {
+  const source = worker && typeof worker === 'object' ? worker : {};
+  const workerId = normalizeWorkerId(source.worker_id ?? fallbackId);
+  if (!workerId) return null;
+
+  return {
+    ...source,
+    worker_id: workerId,
+    worker_label: source.worker_label || `W${workerId}`,
+    status: source.status || 'idle',
+    phase: source.phase || 'idle',
+    revision: normalizeRevision(source.revision ?? source.runtime_revision, -1),
+    current_step: source.current_step || '',
+    message: source.message || '',
+    email: source.email || source.account_email || '',
+    mail_provider: source.mail_provider || '',
+    updated_at: source.updated_at || source.ts || '',
+    steps: normalizeWorkerSteps(source.steps),
+  };
+}
+
+function normalizeRuntimeSnapshot(runtime, taskRunId = null) {
+  const source = runtime && typeof runtime === 'object' ? runtime : {};
+  const workers = Array.isArray(source.workers)
+    ? source.workers.map(worker => normalizeWorker(worker)).filter(Boolean)
+    : Object.entries(source.workers || {}).map(([workerId, worker]) => normalizeWorker(worker, workerId)).filter(Boolean);
+
+  return {
+    ...state.runtime,
+    ...source,
+    run_id: normalizeRunId(source.run_id) || taskRunId || null,
+    revision: normalizeRevision(source.revision, state.runtime.revision),
+    focus_worker_id: normalizeWorkerId(source.focus_worker_id),
+    completion_semantics: source.completion_semantics || state.runtime.completion_semantics || 'registration_only',
+    workers,
+  };
+}
+
+function getKnownRevision(runId) {
+  const key = normalizeRunId(runId);
+  if (!key) return -1;
+  return normalizeRevision(state.ui.latestRevisionByRun[key], -1);
+}
+
+function rememberRevision(runId, revision) {
+  const key = normalizeRunId(runId);
+  if (!key || !Number.isFinite(revision)) return;
+  state.ui.latestRevisionByRun[key] = Math.max(getKnownRevision(key), revision);
+}
+
+function shouldIgnoreEvent(runId, revision) {
+  const key = normalizeRunId(runId) || normalizeRunId(state.task.run_id) || normalizeRunId(state.runtime.run_id);
+  if (!key || !Number.isFinite(revision)) return false;
+  const known = getKnownRevision(key);
+  if (known >= 0 && revision < known) return true;
+  if (known >= 0 && revision > known + 1) requestStatusSnapshot();
+  rememberRevision(key, revision);
+  return false;
+}
+
+function requestStatusSnapshot() {
+  if (state.ui.snapshotRequested) return;
+  state.ui.snapshotRequested = true;
+  fetch('/api/status')
+    .then(res => res.json())
+    .then(payload => applyStatusSnapshot(payload, { force: true }))
+    .catch(() => {})
+    .finally(() => {
+      state.ui.snapshotRequested = false;
+    });
+}
+
+function applyStatusSnapshot(payload, { force = false } = {}) {
+  if (!payload || typeof payload !== 'object') return;
+
+  const nextTask = normalizeTaskSnapshot(payload.task, payload.server_time || null);
+  const nextRuntime = normalizeRuntimeSnapshot(payload.runtime, nextTask.run_id);
+  const snapshotRevision = Math.max(nextTask.revision, nextRuntime.revision);
+  const snapshotRunId = normalizeRunId(nextTask.run_id) || normalizeRunId(nextRuntime.run_id);
+
+  if (!force && shouldIgnoreEvent(snapshotRunId, snapshotRevision)) return;
+  rememberRevision(snapshotRunId, snapshotRevision);
+
+  state.task = nextTask;
+  state.runtime = nextRuntime;
+  state.stats = normalizeStatsSnapshot(payload.stats);
+
+  ensureFocusWorker();
+  syncTaskChrome();
+  renderRuntimePanels();
+}
+
+function applySseEvent(event) {
+  if (!event || typeof event !== 'object') return;
+  const type = String(event.type || event.event || '').trim();
+  const runId = normalizeRunId(event.run_id || event.task?.run_id || event.runtime?.run_id || event.worker?.run_id);
+  const revision = normalizeRevision(event.revision ?? event.task?.revision ?? event.runtime?.revision ?? event.worker?.revision, NaN);
+
+  if (type && shouldIgnoreEvent(runId, revision)) return;
+
+  if (type === 'connected') {
+    appendLog({ ts: event.ts || '', level: 'connected', message: event.message || '实时事件已连接' });
+    if (event.snapshot) applyStatusSnapshot(event.snapshot, { force: true });
+    else requestStatusSnapshot();
+    return;
+  }
+
+  if (type === 'snapshot') {
+    applyStatusSnapshot(event.snapshot || event.payload || event, { force: true });
+    return;
+  }
+
+  if (type === 'log.appended') {
+    const logEvent = event.log && typeof event.log === 'object' ? event.log : event;
+    appendLog(logEvent);
+    if (logEvent.level === 'token_saved') {
+      debouncedLoadTokens();
+      showToast('新 Token 已保存: ' + (logEvent.message || ''), 'success');
+    }
+    if (logEvent.level === 'sync_ok') {
+      showToast('已自动同步: ' + (logEvent.message || ''), 'success');
+    }
+    if (logEvent.step === 'wait' && logEvent.message) {
+      const match = String(logEvent.message).match(/(\d+)\s*秒/);
+      if (match) startCountdown(parseInt(match[1], 10));
+    }
+    return;
+  }
+
+  if (type === 'task.updated' || type === 'task.finished') {
+    state.task = normalizeTaskSnapshot({ ...state.task, ...(event.task || event) }, event.server_time || state.task.server_time);
+    if (type === 'task.finished') requestStatusSnapshot();
+    syncTaskChrome();
+    renderRuntimePanels();
+    return;
+  }
+
+  if (type === 'stats.updated') {
+    state.stats = normalizeStatsSnapshot({ ...state.stats, ...(event.stats || event) });
+    syncTaskChrome();
+    renderRuntimePanels();
+    return;
+  }
+
+  if (type === 'worker.updated') {
+    mergeWorkerIntoRuntime(event.worker || event.runtime || event);
+    return;
+  }
+
+  if (type === 'worker.step.updated') {
+    mergeWorkerStepUpdate(event);
+    return;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(event, 'task')
+    || Object.prototype.hasOwnProperty.call(event, 'runtime')
+    || Object.prototype.hasOwnProperty.call(event, 'stats')) {
+    applyStatusSnapshot(event);
+  }
 }
 
 // ==========================================
@@ -393,7 +999,6 @@ async function checkProxy() {
 // ==========================================
 async function saveProxy() {
   const proxy = DOM.proxyInput.value.trim();
-  if (!proxy) { showToast('请先填写代理地址', 'error'); return; }
   const auto_register = DOM.autoRegisterCheck ? DOM.autoRegisterCheck.checked : false;
   try {
     const res = await fetch('/api/proxy/save', {
@@ -414,28 +1019,45 @@ async function saveProxy() {
 // ==========================================
 // 启动 / 停止任务
 // ==========================================
+function getRequestedWorkerCount() {
+  const multithread = DOM.multithreadCheck ? DOM.multithreadCheck.checked : false;
+  if (!multithread) return 1;
+  return Math.max(1, DOM.threadCountInput ? (parseInt(DOM.threadCountInput.value, 10) || 1) : 1);
+}
+
+function getRequestedTargetCount() {
+  if (!DOM.targetCountInput) return 0;
+  const value = parseInt(DOM.targetCountInput.value, 10);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return value;
+}
+
 async function startTask() {
   const proxy = DOM.proxyInput.value.trim();
-  const proxyPoolEnabled = DOM.proxyPoolEnabled ? DOM.proxyPoolEnabled.checked : false;
-  if (!proxy && !proxyPoolEnabled) { showToast('请填写代理地址或启用代理池', 'error'); return; }
-  const multithread = DOM.multithreadCheck ? DOM.multithreadCheck.checked : false;
-  const thread_count = DOM.threadCountInput ? parseInt(DOM.threadCountInput.value) || 3 : 1;
+  const worker_count = getRequestedWorkerCount();
+  const target_count = getRequestedTargetCount();
   try {
+    if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = '启动前自动同步浏览器配置...';
+    const browserSaved = await saveBrowserConfig({ silentSuccess: true, statusText: '启动前已同步浏览器配置' });
+    if (!browserSaved) {
+      showToast('浏览器配置未保存成功，已取消启动', 'error');
+      return;
+    }
     const res = await fetch('/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ proxy, multithread, thread_count }),
+      body: JSON.stringify({ proxy, worker_count, target_count }),
     });
     const data = await res.json();
     if (!res.ok) {
       showToast(data.detail || '启动失败', 'error');
       return;
     }
-    Object.keys(state.currentSteps).forEach(k => delete state.currentSteps[k]);
-    renderSteps();
-    const workerMsg = multithread ? ` (${data.workers || thread_count} 线程)` : '';
-    showToast('注册任务已启动' + workerMsg, 'success');
-    updateStatus();
+    applyStatusSnapshot(data, { force: true });
+    state.ui.forceStopEnabled = true;
+    const workerMsg = worker_count > 1 ? ` (${worker_count} 线程)` : '';
+    const targetMsg = target_count > 0 ? `，目标 ${target_count} 个` : '，数量不限';
+    showToast('注册任务已启动' + workerMsg + targetMsg, 'success');
   } catch (e) {
     showToast('启动请求失败: ' + e.message, 'error');
   }
@@ -444,89 +1066,340 @@ async function startTask() {
 async function stopTask() {
   try {
     const res = await fetch('/api/stop', { method: 'POST' });
+    const data = await res.json();
     if (!res.ok) {
-      const data = await res.json();
       showToast(data.detail || '停止失败', 'error');
       return;
     }
+    applyStatusSnapshot(data, { force: true });
+    state.ui.forceStopEnabled = false;
     showToast('正在停止任务...', 'info');
-    updateStatus();
+    requestStatusSnapshot();
   } catch (e) {
     showToast('停止请求失败: ' + e.message, 'error');
   }
 }
 
 // ==========================================
-// 状态更新
+// 状态更新 / 渲染
 // ==========================================
-async function updateStatus() {
-  try {
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    state.status = data.status;
-    state.successCount = data.success;
-    state.failCount = data.fail;
+function syncTaskChrome() {
+  const status = state.task.status || 'idle';
+  DOM.statusBadge.className = `status-badge ${status}`;
+  DOM.statusText.textContent = formatTaskStatusLabel(status);
 
-    DOM.statusBadge.className = `status-badge ${data.status}`;
-    const labelMap = { idle: '空闲', running: '运行中', stopping: '停止中' };
-    DOM.statusText.textContent = labelMap[data.status] || data.status;
+  const isActive = ['starting', 'running'].includes(status);
+  const isStopping = status === 'stopping';
+  const workers = Array.isArray(state.runtime.workers) ? state.runtime.workers : [];
+  const hasActiveWorker = workers.some(worker => {
+    const wStatus = String(worker?.status || 'idle');
+    return !['idle', 'stopped', 'done', 'failed', 'skipped'].includes(wStatus);
+  });
+  if (['idle', 'stopped', 'finished', 'failed'].includes(status)) {
+    state.ui.forceStopEnabled = false;
+  }
+  const canStop = isActive || isStopping || hasActiveWorker || state.ui.forceStopEnabled;
+  DOM.btnStart.disabled = isActive || isStopping;
+  DOM.btnStop.disabled = !canStop;
+  DOM.progressFill.className = isActive
+    ? 'progress-fill running'
+    : (isStopping ? 'progress-fill stopping' : 'progress-fill');
 
-    const isRunning = data.status === 'running';
-    const isStopping = data.status === 'stopping';
-    DOM.btnStart.disabled = isRunning || isStopping;
-    DOM.btnStop.disabled = !isRunning;
-    DOM.progressFill.className = isRunning ? 'progress-fill running' : 'progress-fill';
+  if (DOM.statSuccess) DOM.statSuccess.textContent = state.stats.success;
+  if (DOM.statFail) DOM.statFail.textContent = state.stats.fail;
+  if (DOM.statTotal) DOM.statTotal.textContent = state.stats.total;
 
-    DOM.statSuccess.textContent = data.success;
-    DOM.statFail.textContent = data.fail;
-    DOM.statTotal.textContent = data.success + data.fail;
-
-    // 任务结束后兜底清理步骤高亮，避免出现“状态已停但步骤还在跑”的视觉残留
-    if (data.status === 'idle') {
-      state.stepsInRun = false;
-      if (Object.keys(state.currentSteps).length > 0) {
-        Object.keys(state.currentSteps).forEach(k => delete state.currentSteps[k]);
-        renderSteps();
-      }
-      if (state.countdownTimer) {
-        clearInterval(state.countdownTimer);
-        state.countdownTimer = null;
-      }
-    }
-  } catch { }
-}
-
-// ==========================================
-// 步骤追踪
-// ==========================================
-function renderSteps() {
-  DOM.stepsTracker.innerHTML = STEPS.map(s => {
-    const st = state.currentSteps[s.id] || '';
-    return `<div class="step-item ${st}" id="step-${s.id}"><span class="step-dot"></span><span>${s.label}</span></div>`;
-  }).join('');
-}
-
-function updateStep(stepId, level) {
-  let stepState = '';
-  if (level === 'success') stepState = 'done';
-  else if (level === 'error') stepState = 'error';
-  else if (level === 'info' || level === 'warn') stepState = 'active';
-  if (stepState) {
-    state.currentSteps[stepId] = stepState;
-    const el = $(`step-${stepId}`);
-    if (el) el.className = `step-item ${stepState}`;
+  if (status === 'idle' && state.ui.countdownTimer) {
+    clearInterval(state.ui.countdownTimer);
+    state.ui.countdownTimer = null;
   }
 }
 
+function formatTaskStatusLabel(status) {
+  return STATUS_LABEL_MAP[status] || (status ? String(status) : '等待开始');
+}
+
+function getStepDisplayLabel(stepId) {
+  return STEP_DISPLAY_LABELS[stepId] || (stepId ? String(stepId) : '等待开始');
+}
+
+function getWorkerStatusLabel(status) {
+  return STATUS_LABEL_MAP[status] || (status ? String(status) : '等待开始');
+}
+
+function getPhaseLabel(phase) {
+  return PHASE_LABEL_MAP[phase] || (phase ? String(phase) : '等待任务');
+}
+
+function getCompletionSemanticsLabel(value) {
+  return COMPLETION_SEMANTICS_MAP[value] || '注册完成即结束';
+}
+
+function getWorkerSortKey(worker) {
+  return [
+    WORKER_STATUS_PRIORITY[worker?.status] || 0,
+    worker?.updated_at || '',
+    Number(worker?.worker_id || 0),
+  ];
+}
+
+function compareWorkerRuntime(a, b) {
+  const [sa, ua, wa] = getWorkerSortKey(a);
+  const [sb, ub, wb] = getWorkerSortKey(b);
+  if (sa !== sb) return sb - sa;
+  if (ua !== ub) return ub.localeCompare(ua);
+  return wb - wa;
+}
+
+function sortWorkers(workers) {
+  return [...workers].sort(compareWorkerRuntime);
+}
+
+function ensureFocusWorker() {
+  const workers = sortWorkers(state.runtime.workers || []);
+  const lockedId = normalizeWorkerId(state.ui.focusWorkerId);
+  if (state.ui.focusLocked && lockedId && workers.some(worker => worker.worker_id === lockedId)) return;
+
+  const backendFocus = normalizeWorkerId(state.runtime.focus_worker_id);
+  if (backendFocus && workers.some(worker => worker.worker_id === backendFocus)) {
+    state.ui.focusWorkerId = backendFocus;
+    return;
+  }
+
+  state.ui.focusWorkerId = workers[0]?.worker_id || null;
+}
+
+function getFocusWorker() {
+  const focusId = normalizeWorkerId(state.ui.focusWorkerId);
+  if (!focusId) return null;
+  return (state.runtime.workers || []).find(worker => worker.worker_id === focusId) || null;
+}
+
+function selectFocusWorker(nextId, { lock = false } = {}) {
+  const normalizedId = normalizeWorkerId(nextId);
+  if (!normalizedId) return;
+  if (!(state.runtime.workers || []).some(worker => worker.worker_id === normalizedId)) return;
+  state.ui.focusWorkerId = normalizedId;
+  if (lock) state.ui.focusLocked = true;
+  renderRuntimePanels();
+}
+
+function unlockFocusWorker() {
+  state.ui.focusLocked = false;
+  ensureFocusWorker();
+  renderRuntimePanels();
+}
+
+function mergeWorkerIntoRuntime(workerPatch) {
+  const normalizedWorker = normalizeWorker(workerPatch);
+  if (!normalizedWorker) return;
+
+  const workers = [...(state.runtime.workers || [])];
+  const index = workers.findIndex(worker => worker.worker_id === normalizedWorker.worker_id);
+  if (index >= 0) {
+    const prevWorker = workers[index];
+    workers[index] = normalizeWorker({
+      ...prevWorker,
+      ...normalizedWorker,
+      steps: normalizedWorker.steps.length ? normalizedWorker.steps : prevWorker.steps,
+    }, normalizedWorker.worker_id);
+  } else {
+    workers.push(normalizedWorker);
+  }
+
+  state.runtime = {
+    ...state.runtime,
+    run_id: normalizeRunId(normalizedWorker.run_id) || state.runtime.run_id || state.task.run_id,
+    focus_worker_id: normalizeWorkerId(state.runtime.focus_worker_id) || normalizedWorker.worker_id,
+    workers: sortWorkers(workers),
+  };
+
+  ensureFocusWorker();
+  renderRuntimePanels();
+}
+
+function upsertWorkerStep(existingSteps, stepPatch) {
+  const steps = normalizeWorkerSteps(existingSteps);
+  const normalizedStep = normalizeWorkerStep(stepPatch, steps.length);
+  if (!normalizedStep) return steps;
+
+  const next = [...steps];
+  const index = next.findIndex(step => step.id === normalizedStep.id);
+  if (index >= 0) next[index] = { ...next[index], ...normalizedStep };
+  else next.push(normalizedStep);
+  return normalizeWorkerSteps(next);
+}
+
+function mergeWorkerStepUpdate(event) {
+  const workerSource = event.worker && typeof event.worker === 'object' ? event.worker : event;
+  const workerId = normalizeWorkerId(workerSource.worker_id || event.worker_id);
+  if (!workerId) {
+    requestStatusSnapshot();
+    return;
+  }
+
+  const workers = [...(state.runtime.workers || [])];
+  const index = workers.findIndex(worker => worker.worker_id === workerId);
+  const baseWorker = index >= 0 ? workers[index] : normalizeWorker({ worker_id: workerId, worker_label: `W${workerId}` }, workerId);
+  const nextWorker = normalizeWorker({
+    ...baseWorker,
+    ...workerSource,
+    worker_id: workerId,
+    steps: workerSource.steps || upsertWorkerStep(baseWorker?.steps || [], event.step || workerSource.step || workerSource),
+  }, workerId);
+
+  if (index >= 0) workers[index] = nextWorker;
+  else workers.push(nextWorker);
+
+  state.runtime = {
+    ...state.runtime,
+    workers: sortWorkers(workers),
+    focus_worker_id: normalizeWorkerId(event.focus_worker_id) || state.runtime.focus_worker_id || workerId,
+  };
+
+  ensureFocusWorker();
+  renderRuntimePanels();
+}
+
+function getWorkerPrimaryStep(worker) {
+  if (!worker) return null;
+  const steps = Array.isArray(worker.steps) ? worker.steps : [];
+  const activeStep = steps.find(step => step.status === 'active');
+  if (activeStep) return activeStep;
+  return steps[steps.length - 1] || null;
+}
+
+function renderTaskOverview(task, runtime, stats) {
+  if (!DOM.taskOverview) return;
+  const workers = Array.isArray(runtime?.workers) ? runtime.workers : [];
+  const activeWorkers = workers.filter(worker => !['idle', 'stopped'].includes(String(worker.status || 'idle'))).length;
+  const cards = [
+    { label: '任务状态', value: formatTaskStatusLabel(task?.status || 'idle'), hint: task?.status || 'idle', status: `task-status-${task?.status || 'idle'}` },
+    { label: '运行标识', value: task?.run_id || '--', hint: `revision ${normalizeRevision(task?.revision, 0)}`, status: 'task-status-meta' },
+    { label: 'Worker', value: `${activeWorkers}/${workers.length}`, hint: `focus ${runtime?.focus_worker_id || '--'}`, status: 'task-status-meta' },
+    { label: '成功 / 失败', value: `${stats?.success || 0} / ${stats?.fail || 0}`, hint: `total ${stats?.total || 0}`, status: 'task-status-meta' },
+  ];
+
+  if (!task?.run_id && (task?.status || 'idle') === 'idle' && workers.length === 0) {
+    DOM.taskOverview.innerHTML = '<div class="task-overview-card empty">等待任务启动</div>';
+    return;
+  }
+
+  DOM.taskOverview.innerHTML = cards.map(card => `
+    <div class="task-overview-card ${escapeHtml(card.status)}">
+      <span class="task-overview-label">${escapeHtml(card.label)}</span>
+      <span class="task-overview-value">${escapeHtml(card.value)}</span>
+      <span class="task-overview-hint">${escapeHtml(card.hint)}</span>
+    </div>
+  `).join('');
+}
+
+function renderWorkerList(workers, focusWorkerId) {
+  if (!DOM.workerList) return;
+  const entries = sortWorkers(Array.isArray(workers) ? workers : []);
+  if (!entries.length) {
+    DOM.workerList.innerHTML = '<div class="worker-card empty">暂无 Worker 运行</div>';
+    return;
+  }
+
+  DOM.workerList.innerHTML = entries.map((worker) => {
+    const workerId = worker.worker_id;
+    const focused = normalizeWorkerId(focusWorkerId) === workerId;
+    const primaryStep = getWorkerPrimaryStep(worker);
+    const stepLabel = primaryStep ? primaryStep.label : '等待开始';
+    const email = worker.email || '等待邮箱创建';
+    const updatedAt = worker.updated_at || '--';
+    const status = String(worker.status || 'idle');
+    return `
+      <button class="worker-card worker-card-${escapeHtml(status)} ${focused ? 'focused' : ''}" type="button" data-worker-id="${escapeHtml(workerId)}">
+        <div class="worker-card-head">
+          <span class="worker-card-label">${escapeHtml(worker.worker_label || `W${workerId}`)}</span>
+          <span class="worker-status-badge ${escapeHtml(status)}">${escapeHtml(getWorkerStatusLabel(status))}</span>
+        </div>
+        <div class="worker-card-email">${escapeHtml(email)}</div>
+        <div class="worker-card-row">
+          <span class="worker-card-meta">${escapeHtml(stepLabel)}</span>
+          <span class="worker-card-meta">${escapeHtml(updatedAt)}</span>
+        </div>
+      </button>
+    `;
+  }).join('');
+
+  DOM.workerList.querySelectorAll('[data-worker-id]').forEach((button) => {
+    button.addEventListener('click', () => selectFocusWorker(button.dataset.workerId, { lock: true }));
+  });
+}
+
+function renderWorkerDetail(focusWorker) {
+  if (!DOM.workerDetail) return;
+  if (!focusWorker) {
+    DOM.workerDetail.className = 'worker-detail-card empty';
+    DOM.workerDetail.innerHTML = '等待任务启动';
+    if (DOM.unlockFocusBtn) DOM.unlockFocusBtn.disabled = !state.ui.focusLocked;
+    return;
+  }
+
+  const status = String(focusWorker.status || 'idle');
+  const completionSemantics = getCompletionSemanticsLabel(state.runtime.completion_semantics || 'registration_only');
+  const metaItems = [
+    { label: 'Worker', value: focusWorker.worker_label || `W${focusWorker.worker_id}` },
+    { label: '状态', value: `${getWorkerStatusLabel(status)} · ${getPhaseLabel(focusWorker.phase || 'idle')}` },
+    { label: '邮箱', value: focusWorker.email || '等待邮箱创建' },
+    { label: '邮箱提供商', value: focusWorker.mail_provider || '--' },
+    { label: '当前步骤', value: getWorkerPrimaryStep(focusWorker)?.label || '等待开始' },
+    { label: '完成语义', value: completionSemantics },
+    { label: '更新时间', value: focusWorker.updated_at || '--' },
+    { label: '进度消息', value: focusWorker.message || '等待后端步骤更新', wide: true },
+  ];
+
+  const steps = Array.isArray(focusWorker.steps) ? focusWorker.steps : [];
+  const stepsHtml = steps.length
+    ? steps.map((step) => `
+        <div class="step-track-item step-status-${escapeHtml(step.status || 'pending')}">
+          <div class="step-track-head">
+            <span class="step-track-label">${escapeHtml(step.label || step.step_id || step.id || '未命名步骤')}</span>
+            <span class="step-track-badge">${escapeHtml(step.status || 'pending')}</span>
+          </div>
+          ${step.message ? `<div class="step-track-message">${escapeHtml(step.message)}</div>` : ''}
+          ${step.updated_at ? `<div class="step-track-time">${escapeHtml(step.updated_at)}</div>` : ''}
+        </div>
+      `).join('')
+    : '<div class="step-track-empty">暂无步骤轨道</div>';
+
+  DOM.workerDetail.className = `worker-detail-card worker-detail-${escapeHtml(status)}`;
+  DOM.workerDetail.innerHTML = `
+    <div class="worker-detail-meta">
+      ${metaItems.map((item) => `
+        <div class="worker-detail-meta-item ${item.wide ? 'wide' : ''}">
+          <span class="worker-detail-meta-label">${escapeHtml(item.label)}</span>
+          <span class="worker-detail-meta-value">${escapeHtml(item.value)}</span>
+        </div>
+      `).join('')}
+    </div>
+    <div class="worker-detail-steps">
+      <div class="worker-detail-steps-title">步骤轨道</div>
+      <div class="step-track-list">${stepsHtml}</div>
+    </div>
+  `;
+
+  if (DOM.unlockFocusBtn) DOM.unlockFocusBtn.disabled = !state.ui.focusLocked;
+}
+
+function renderRuntimePanels() {
+  renderTaskOverview(state.task, state.runtime, state.stats);
+  renderWorkerList(state.runtime.workers, state.ui.focusWorkerId);
+  renderWorkerDetail(getFocusWorker());
+}
+
 function startCountdown(seconds) {
-  if (state.countdownTimer) clearInterval(state.countdownTimer);
+  if (state.ui.countdownTimer) clearInterval(state.ui.countdownTimer);
   let remaining = seconds;
   const entries = DOM.logBody.querySelectorAll('.log-entry');
   const countdownEntry = entries.length > 0 ? entries[entries.length - 1] : null;
   const countdownMsgEl = countdownEntry ? countdownEntry.querySelector('.log-msg') : null;
-  state.countdownTimer = setInterval(() => {
+  state.ui.countdownTimer = setInterval(() => {
     remaining--;
-    if (remaining <= 0) { clearInterval(state.countdownTimer); state.countdownTimer = null; return; }
+    if (remaining <= 0) { clearInterval(state.ui.countdownTimer); state.ui.countdownTimer = null; return; }
     if (countdownMsgEl) countdownMsgEl.textContent = `休息中... 剩余 ${remaining} 秒`;
   }, 1000);
 }
@@ -534,18 +1407,26 @@ function startCountdown(seconds) {
 // ==========================================
 // Token 列表
 // ==========================================
+function debouncedLoadTokens() {
+  if (state.ui._loadTokensTimer) clearTimeout(state.ui._loadTokensTimer);
+  state.ui._loadTokensTimer = setTimeout(() => {
+    loadTokens();
+    state.ui._loadTokensTimer = null;
+  }, 1000);
+}
+
 async function loadTokens() {
   try {
     const res = await fetch('/api/tokens');
     const data = await res.json();
-    state.tokens = data.tokens || [];
+    state.ui.tokens = data.tokens || [];
     renderTokenList();
   } catch { }
 }
 
 function getFilteredTokens(tokens) {
-  const status = state.tokenFilter.status || 'all';
-  const keyword = (state.tokenFilter.keyword || '').trim().toLowerCase();
+  const status = state.ui.tokenFilter.status || 'all';
+  const keyword = (state.ui.tokenFilter.keyword || '').trim().toLowerCase();
 
   return (tokens || []).filter((t) => {
     const platforms = getTokenUploadedPlatforms(t);
@@ -578,11 +1459,9 @@ function getTokenUploadedPlatforms(token) {
 }
 
 function renderTokenList() {
-  const allTokens = state.tokens || [];
+  const allTokens = state.ui.tokens || [];
   const filteredTokens = getFilteredTokens(allTokens);
-  if (DOM.poolTokenCount) {
-    DOM.poolTokenCount.textContent = `${filteredTokens.length}/${allTokens.length}`;
-  }
+  updateHeaderLocalTokens(allTokens);
 
   if (!DOM.poolTokenList) return;
   if (filteredTokens.length === 0) {
@@ -594,14 +1473,14 @@ function renderTokenList() {
 }
 
 function applyTokenFilter() {
-  state.tokenFilter.status = DOM.tokenFilterStatus ? DOM.tokenFilterStatus.value : 'all';
-  state.tokenFilter.keyword = DOM.tokenFilterKeyword ? DOM.tokenFilterKeyword.value.trim() : '';
+  state.ui.tokenFilter.status = DOM.tokenFilterStatus ? DOM.tokenFilterStatus.value : 'all';
+  state.ui.tokenFilter.keyword = DOM.tokenFilterKeyword ? DOM.tokenFilterKeyword.value.trim() : '';
   renderTokenList();
 }
 
 function resetTokenFilter() {
-  state.tokenFilter.status = 'all';
-  state.tokenFilter.keyword = '';
+  state.ui.tokenFilter.status = 'all';
+  state.ui.tokenFilter.keyword = '';
   if (DOM.tokenFilterStatus) DOM.tokenFilterStatus.value = 'all';
   if (DOM.tokenFilterKeyword) DOM.tokenFilterKeyword.value = '';
   renderTokenList();
@@ -610,24 +1489,43 @@ function resetTokenFilter() {
 function renderTokenItem(t) {
   const platforms = getTokenUploadedPlatforms(t);
   const uploaded = platforms.length > 0;
+  const sub2apiUploaded = platforms.includes('sub2api');
   const platformBadges = platforms.length > 0
     ? platforms.map((p) => `<span class="platform-badge ${p}">${p === 'cpa' ? 'CPA' : 'Sub2Api'}</span>`).join('')
     : '<span class="platform-badge none">未上传</span>';
   const expiredStr = formatTime(t.expired);
   const tokenPayload = encodeURIComponent(JSON.stringify(t.content || {}));
   const filePayload = encodeURIComponent(t.filename || '');
+  const emailPayload = encodeURIComponent(t.email || '');
+  const primaryAction = `<button class="btn btn-primary btn-sm token-sync-sub2api-btn" data-filename="${filePayload}" data-email="${emailPayload}" data-force="${sub2apiUploaded ? '1' : '0'}">${sub2apiUploaded ? '重导 Sub2Api' : '导入 Sub2Api'}</button>`;
+  const secondaryActions = `
+    ${sub2apiUploaded ? `<button class="btn btn-ghost btn-sm token-clear-sub2api-btn" data-filename="${filePayload}" data-email="${emailPayload}">清除标记</button>` : ''}
+    <button class="btn btn-ghost btn-sm token-copy-btn" data-payload="${tokenPayload}">复制</button>
+    <button class="btn btn-danger btn-sm token-delete-btn" data-filename="${filePayload}">删除</button>
+  `;
   return `
-    <div class="token-item${uploaded ? ' synced' : ''}" id="token-${cssEscape(t.filename)}">
-      <div class="token-info">
-        <div class="token-email" title="${escapeHtml(t.email)}">
+    <div class="token-item local-token-card${uploaded ? ' synced' : ''}" id="token-${cssEscape(t.filename)}">
+      <div class="local-token-card__header">
+        <div class="token-email" title="${escapeHtml(t.email || t.filename || '')}">
           <span class="token-email-text">${escapeHtml(t.email || t.filename)}</span>
         </div>
-        <div class="token-meta token-platforms">${platformBadges}</div>
-        <div class="token-meta">过期: ${expiredStr}</div>
       </div>
-      <div class="token-actions">
-        <button class="btn btn-ghost btn-sm token-copy-btn" data-payload="${tokenPayload}">复制</button>
-        <button class="btn btn-danger btn-sm token-delete-btn" data-filename="${filePayload}">删除</button>
+      <div class="local-token-card__body">
+        <div class="token-info local-token-card__main">
+          <div class="token-meta token-platforms">${platformBadges}</div>
+          <div class="local-token-card__meta">
+            <span class="local-token-card__meta-label">过期</span>
+            <span class="local-token-card__meta-value" title="${escapeHtml(expiredStr)}">${escapeHtml(expiredStr)}</span>
+          </div>
+        </div>
+        <div class="token-actions local-token-card__actions">
+          <div class="local-token-card__actions-primary">
+            ${primaryAction}
+          </div>
+          <div class="local-token-card__actions-secondary">
+            ${secondaryActions}
+          </div>
+        </div>
       </div>
     </div>`;
 }
@@ -665,12 +1563,59 @@ async function copyText(text) {
 
 async function copyAllRt() {
   try {
-    const visibleTokens = getFilteredTokens(state.tokens || []);
+    const visibleTokens = getFilteredTokens(state.ui.tokens || []);
     const rts = visibleTokens.map(t => (t.content || {}).refresh_token || '').filter(Boolean);
     if (rts.length === 0) { showToast('没有可用的 Refresh Token', 'error'); return; }
     const ok = await copyText(rts.join('\n'));
     showToast(ok ? `已复制 ${rts.length} 个 RT（当前筛选）` : '复制失败', ok ? 'success' : 'error');
   } catch (e) { showToast('复制失败: ' + e.message, 'error'); }
+}
+
+function downloadBlob(filename, blob) {
+  const link = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function exportLocalTokens() {
+  try {
+    const visibleTokens = getFilteredTokens(state.ui.tokens || []);
+    if (visibleTokens.length === 0) {
+      showToast('没有可导出的 Token（当前筛选）', 'error');
+      return;
+    }
+
+    const exportPayload = {
+      exported_at: new Date().toISOString(),
+      total: visibleTokens.length,
+      filter: {
+        status: state.ui.tokenFilter.status || 'all',
+        keyword: state.ui.tokenFilter.keyword || '',
+      },
+      tokens: visibleTokens.map((t) => ({
+        filename: t.filename || '',
+        email: t.email || '',
+        uploaded_platforms: getTokenUploadedPlatforms(t),
+        content: t.content || {},
+      })),
+    };
+
+    const status = String(state.ui.tokenFilter.status || 'all').replace(/[^a-z0-9_-]/gi, '_');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `local_tokens_${status}_${stamp}.json`;
+    const blob = new Blob([JSON.stringify(exportPayload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    });
+    downloadBlob(filename, blob);
+    showToast(`已导出 ${visibleTokens.length} 条 Token（当前筛选）`, 'success');
+  } catch (e) {
+    showToast('导出失败: ' + e.message, 'error');
+  }
 }
 
 async function deleteToken(filename) {
@@ -682,9 +1627,477 @@ async function deleteToken(filename) {
   } catch { showToast('删除请求失败', 'error'); }
 }
 
+function isSub2ApiAbnormalStatus(status) {
+  return SUB2API_ABNORMAL_STATUSES.has(String(status || '').trim().toLowerCase());
+}
+
+function getSub2ApiMaintainActionsFromForm() {
+  return {
+    refresh_abnormal_accounts: DOM.sub2apiMaintainRefreshAbnormal ? DOM.sub2apiMaintainRefreshAbnormal.checked : true,
+    delete_abnormal_accounts: DOM.sub2apiMaintainDeleteAbnormal ? DOM.sub2apiMaintainDeleteAbnormal.checked : true,
+    dedupe_duplicate_accounts: DOM.sub2apiMaintainDedupe ? DOM.sub2apiMaintainDedupe.checked : true,
+  };
+}
+
+function describeSub2ApiMaintainActions(actions = getSub2ApiMaintainActionsFromForm()) {
+  const labels = [];
+  if (actions.refresh_abnormal_accounts) labels.push('异常测活');
+  if (actions.delete_abnormal_accounts) labels.push('异常清理');
+  if (actions.dedupe_duplicate_accounts) labels.push('重复清理');
+  return labels.length ? labels.join('、') : '无动作';
+}
+
+function getFilteredSub2ApiAccounts(accounts = state.ui.sub2apiAccounts || []) {
+  return Array.isArray(accounts) ? accounts : [];
+}
+
+function applySub2ApiAccountFilter() {
+  state.ui.sub2apiAccountFilter.status = DOM.sub2apiAccountStatusFilter ? DOM.sub2apiAccountStatusFilter.value : 'all';
+  state.ui.sub2apiAccountFilter.keyword = DOM.sub2apiAccountKeyword ? DOM.sub2apiAccountKeyword.value.trim() : '';
+  state.ui.sub2apiAccountPager.page = 1;
+  loadSub2ApiAccounts();
+}
+
+function resetSub2ApiAccountFilter() {
+  state.ui.sub2apiAccountFilter.status = 'all';
+  state.ui.sub2apiAccountFilter.keyword = '';
+  if (DOM.sub2apiAccountStatusFilter) DOM.sub2apiAccountStatusFilter.value = 'all';
+  if (DOM.sub2apiAccountKeyword) DOM.sub2apiAccountKeyword.value = '';
+  state.ui.sub2apiAccountPager.page = 1;
+  loadSub2ApiAccounts();
+}
+
+async function loadSub2ApiAccounts({ silent = false } = {}) {
+  if (!DOM.sub2apiAccountList || state.ui.sub2apiAccountsLoading) return;
+  state.ui.sub2apiAccountsLoading = true;
+  if (!silent && DOM.sub2apiAccountActionStatus && !state.ui.sub2apiAccountActionBusy) {
+    DOM.sub2apiAccountActionStatus.textContent = '正在加载 Sub2Api 账号列表...';
+  }
+  try {
+    const params = new URLSearchParams({
+      page: String(state.ui.sub2apiAccountPager.page || 1),
+      page_size: String(state.ui.sub2apiAccountPager.pageSize || 20),
+      status: String(state.ui.sub2apiAccountFilter.status || 'all'),
+      keyword: String(state.ui.sub2apiAccountFilter.keyword || ''),
+    });
+    const res = await fetch(`/api/sub2api/accounts?${params.toString()}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Sub2Api 账号列表加载失败');
+
+    if (!data.configured) {
+      state.ui.sub2apiAccounts = [];
+      state.ui.selectedSub2ApiAccountIds.clear();
+      state.ui.sub2apiAccountPager.total = 0;
+      state.ui.sub2apiAccountPager.filteredTotal = 0;
+      state.ui.sub2apiAccountPager.totalPages = 1;
+      state.ui.sub2apiAccountPager.page = 1;
+      renderSub2ApiAccountList('请先完成 Sub2Api 平台配置');
+      if (DOM.sub2apiAccountActionStatus && !state.ui.sub2apiAccountActionBusy) {
+        DOM.sub2apiAccountActionStatus.textContent = data.error || 'Sub2Api 未配置';
+      }
+      return;
+    }
+
+    state.ui.sub2apiAccounts = Array.isArray(data.items) ? data.items : [];
+    state.ui.sub2apiAccountPager.page = parseInt(data.page, 10) || 1;
+    state.ui.sub2apiAccountPager.pageSize = parseInt(data.page_size, 10) || state.ui.sub2apiAccountPager.pageSize || 20;
+    state.ui.sub2apiAccountPager.total = parseInt(data.total, 10) || 0;
+    state.ui.sub2apiAccountPager.filteredTotal = parseInt(data.filtered_total, 10) || 0;
+    state.ui.sub2apiAccountPager.totalPages = parseInt(data.total_pages, 10) || 1;
+    renderSub2ApiAccountList();
+    if (!silent && DOM.sub2apiAccountActionStatus && !state.ui.sub2apiAccountActionBusy) {
+      DOM.sub2apiAccountActionStatus.textContent = `已加载第 ${state.ui.sub2apiAccountPager.page}/${state.ui.sub2apiAccountPager.totalPages} 页，共 ${state.ui.sub2apiAccountPager.filteredTotal} 个账号`;
+    }
+  } catch (e) {
+    state.ui.sub2apiAccounts = [];
+    state.ui.sub2apiAccountPager.filteredTotal = 0;
+    state.ui.sub2apiAccountPager.totalPages = 1;
+    renderSub2ApiAccountList('Sub2Api 账号列表加载失败');
+    if (DOM.sub2apiAccountActionStatus && !state.ui.sub2apiAccountActionBusy) {
+      DOM.sub2apiAccountActionStatus.textContent = '账号列表加载失败: ' + e.message;
+    }
+  } finally {
+    state.ui.sub2apiAccountsLoading = false;
+    refreshSub2ApiSelectionState();
+  }
+}
+
+function updateSub2ApiPagerUI() {
+  const pager = state.ui.sub2apiAccountPager || {};
+  const page = pager.page || 1;
+  const totalPages = pager.totalPages || 1;
+  const pageSize = pager.pageSize || 20;
+  if (DOM.sub2apiAccountPageInfo) {
+    DOM.sub2apiAccountPageInfo.textContent = `第 ${page}/${totalPages} 页 · 每页 ${pageSize} 条`;
+  }
+  if (DOM.sub2apiAccountPageSize && String(DOM.sub2apiAccountPageSize.value) !== String(pageSize)) {
+    DOM.sub2apiAccountPageSize.value = String(pageSize);
+  }
+  if (DOM.sub2apiAccountPrevBtn) DOM.sub2apiAccountPrevBtn.disabled = state.ui.sub2apiAccountActionBusy || page <= 1;
+  if (DOM.sub2apiAccountNextBtn) DOM.sub2apiAccountNextBtn.disabled = state.ui.sub2apiAccountActionBusy || page >= totalPages;
+}
+
+function changeSub2ApiAccountPage(delta) {
+  const nextPage = (state.ui.sub2apiAccountPager.page || 1) + delta;
+  const totalPages = state.ui.sub2apiAccountPager.totalPages || 1;
+  if (nextPage < 1 || nextPage > totalPages) return;
+  state.ui.sub2apiAccountPager.page = nextPage;
+  loadSub2ApiAccounts();
+}
+
+function changeSub2ApiAccountPageSize() {
+  const nextPageSize = DOM.sub2apiAccountPageSize ? parseInt(DOM.sub2apiAccountPageSize.value, 10) || 20 : 20;
+  state.ui.sub2apiAccountPager.pageSize = nextPageSize;
+  state.ui.sub2apiAccountPager.page = 1;
+  loadSub2ApiAccounts();
+}
+
+function renderSub2ApiAccountList(emptyMessage = '') {
+  const pageAccounts = getFilteredSub2ApiAccounts(state.ui.sub2apiAccounts || []);
+  const pager = state.ui.sub2apiAccountPager || {};
+  if (!DOM.sub2apiAccountList) return;
+  if (pageAccounts.length === 0) {
+    const hasAny = (pager.filteredTotal || 0) > 0 || (pager.total || 0) > 0;
+    const msg = emptyMessage || (!hasAny ? '暂无 Sub2Api 账号' : '暂无符合筛选条件的账号');
+    DOM.sub2apiAccountList.innerHTML = `<div class="empty-state"><div class="empty-icon">□</div><span>${escapeHtml(msg)}</span></div>`;
+    updateSub2ApiPagerUI();
+    refreshSub2ApiSelectionState();
+    return;
+  }
+  DOM.sub2apiAccountList.innerHTML = pageAccounts.map(account => renderSub2ApiAccountItem(account)).join('');
+  updateSub2ApiPagerUI();
+  refreshSub2ApiSelectionState();
+}
+
+function renderSub2ApiAccountItem(account) {
+  const accountId = Number(account.id || 0);
+  const email = account.email || account.name || `账号 ${accountId}`;
+  const status = String(account.status || 'unknown').trim().toLowerCase();
+  const isAbnormal = isSub2ApiAbnormalStatus(status);
+  const selected = state.ui.selectedSub2ApiAccountIds.has(accountId);
+  const statusLabel = {
+    error: '异常',
+    disabled: '禁用',
+    normal: '正常',
+    active: '正常',
+    ok: '正常',
+    unknown: '未知',
+  }[status] || status || '未知';
+  const statusClass = status === 'disabled' ? 'warn' : (isAbnormal ? 'danger' : 'ok');
+  const duplicateBadges = [];
+  if (account.is_duplicate) {
+    duplicateBadges.push(`<span class="account-flag-badge duplicate">重复 ${account.duplicate_group_size || 0}</span>`);
+    if (account.duplicate_keep) duplicateBadges.push('<span class="account-flag-badge keep">保留</span>');
+    if (account.duplicate_delete_candidate) duplicateBadges.push('<span class="account-flag-badge delete">候删</span>');
+  }
+  return `
+    <div class="token-item sub2api-account-item${selected ? ' selected' : ''}" id="sub2api-account-${accountId}">
+      <label class="account-check-wrap">
+        <input type="checkbox" class="sub2api-account-check" data-account-id="${accountId}" ${selected ? 'checked' : ''} />
+      </label>
+      <div class="token-info">
+        <div class="token-email" title="${escapeHtml(email)}">
+          <span class="token-email-text">${escapeHtml(email)}</span>
+          <span class="account-status-badge ${statusClass}">${escapeHtml(statusLabel)}</span>
+          ${duplicateBadges.join('')}
+        </div>
+        <div class="token-meta">ID: ${accountId} · 更新时间: ${escapeHtml(formatTime(account.updated_at))}</div>
+      </div>
+      <div class="token-actions">
+        <button class="btn btn-ghost btn-sm sub2api-account-probe-btn" data-account-id="${accountId}">测活</button>
+        <button class="btn btn-danger btn-sm sub2api-account-delete-btn" data-account-id="${accountId}" data-email="${encodeURIComponent(email)}">删除</button>
+      </div>
+    </div>`;
+}
+
+function updateHeaderLocalTokens(tokens = state.ui.tokens || []) {
+  const allTokens = Array.isArray(tokens) ? tokens : [];
+  const total = allTokens.length;
+  const now = Date.now();
+  const validCount = allTokens.filter((token) => {
+    const timeStr = token && token.expired;
+    if (!timeStr) return true;
+    const timestamp = new Date(timeStr).getTime();
+    return !Number.isNaN(timestamp) ? timestamp > now : true;
+  }).length;
+  const fillPct = total > 0 ? Math.round((validCount / total) * 100) : 0;
+  const stateName = total === 0 ? 'idle' : (fillPct >= 85 ? 'ok' : fillPct >= 50 ? 'warn' : 'danger');
+
+  if (DOM.headerLocalTokenLabel) DOM.headerLocalTokenLabel.textContent = `${validCount} / ${total}`;
+  if (DOM.headerLocalTokenDelta) DOM.headerLocalTokenDelta.textContent = `${fillPct}%`;
+  if (DOM.headerLocalTokenBar) {
+    DOM.headerLocalTokenBar.style.width = `${Math.min(100, Math.max(fillPct, 0))}%`;
+    DOM.headerLocalTokenBar.className = `pool-chip-fill ${stateName === 'idle' ? '' : stateName}`.trim();
+  }
+  setHeaderChipStatus(DOM.headerLocalTokenChip, stateName);
+  if (DOM.headerLocalTokenDelta) {
+    DOM.headerLocalTokenDelta.className = `pool-chip-delta ${stateName === 'idle' ? '' : stateName}`.trim();
+  }
+}
+
+function refreshSub2ApiSelectionState() {
+  const visibleAccounts = state.ui.sub2apiAccounts || [];
+  const visibleIds = visibleAccounts
+    .map(item => item.id)
+    .filter(id => Number.isInteger(id) && id > 0);
+  const selectedVisible = visibleIds.filter(id => state.ui.selectedSub2ApiAccountIds.has(id)).length;
+  const selectedTotal = Array.from(state.ui.selectedSub2ApiAccountIds).length;
+
+  if (DOM.sub2apiAccountSelection) {
+    DOM.sub2apiAccountSelection.textContent = `已选 ${selectedTotal} 个，当前页 ${visibleIds.length} 个`;
+  }
+  if (DOM.sub2apiAccountSelectAll) {
+    const allSelected = visibleIds.length > 0 && selectedVisible === visibleIds.length;
+    DOM.sub2apiAccountSelectAll.checked = allSelected;
+    DOM.sub2apiAccountSelectAll.indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
+  }
+}
+
+function toggleSelectAllSub2ApiAccounts() {
+  const visibleAccounts = state.ui.sub2apiAccounts || [];
+  const shouldSelect = !!(DOM.sub2apiAccountSelectAll && DOM.sub2apiAccountSelectAll.checked);
+  visibleAccounts.forEach((account) => {
+    const accountId = Number(account.id || 0);
+    if (!Number.isInteger(accountId) || accountId <= 0) return;
+    if (shouldSelect) state.ui.selectedSub2ApiAccountIds.add(accountId);
+    else state.ui.selectedSub2ApiAccountIds.delete(accountId);
+  });
+  renderSub2ApiAccountList();
+}
+
+function getSelectedSub2ApiAccountIds() {
+  return Array.from(state.ui.selectedSub2ApiAccountIds)
+    .filter(id => Number.isInteger(id) && id > 0)
+    .sort((a, b) => a - b);
+}
+
+function setSub2ApiAccountBusy(busy) {
+  state.ui.sub2apiAccountActionBusy = busy;
+  [
+    DOM.sub2apiAccountApplyBtn,
+    DOM.sub2apiAccountResetBtn,
+    DOM.sub2apiAccountProbeBtn,
+    DOM.sub2apiAccountExceptionBtn,
+    DOM.sub2apiDuplicateScanBtn,
+    DOM.sub2apiDuplicateCleanBtn,
+    DOM.sub2apiAccountDeleteBtn,
+    DOM.sub2apiAccountPrevBtn,
+    DOM.sub2apiAccountNextBtn,
+  ].forEach((btn) => {
+    if (btn) btn.disabled = busy;
+  });
+  if (DOM.sub2apiAccountSelectAll) DOM.sub2apiAccountSelectAll.disabled = busy;
+  if (DOM.sub2apiAccountPageSize) DOM.sub2apiAccountPageSize.disabled = busy;
+  if (!busy) updateSub2ApiPagerUI();
+}
+
+async function runSub2ApiAccountProbe(accountIds, label = '选中账号') {
+  if (state.ui.sub2apiAccountActionBusy) return;
+  const ids = (accountIds || []).filter(id => Number.isInteger(id) && id > 0);
+  if (!ids.length) {
+    showToast('请先选择至少一个账号', 'error');
+    return;
+  }
+
+  setSub2ApiAccountBusy(true);
+  if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = `正在测活 ${ids.length} 个账号...`;
+  try {
+    const res = await fetch('/api/sub2api/accounts/probe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account_ids: ids, timeout: 30 }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '账号测活失败');
+    const msg = `${label}: 刷新成功 ${data.refreshed_ok || 0}, 恢复 ${data.recovered || 0}, 仍异常 ${data.still_abnormal || 0}`;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'success');
+    await loadSub2ApiAccounts({ silent: true });
+    pollSub2ApiPoolStatus();
+  } catch (e) {
+    const msg = '账号测活失败: ' + e.message;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'error');
+  } finally {
+    setSub2ApiAccountBusy(false);
+  }
+}
+
+async function triggerSelectedSub2ApiProbe() {
+  await runSub2ApiAccountProbe(getSelectedSub2ApiAccountIds());
+}
+
+async function runSub2ApiExceptionHandling(accountIds = []) {
+  if (state.ui.sub2apiAccountActionBusy) return;
+  const ids = (accountIds || []).filter(id => Number.isInteger(id) && id > 0);
+
+  setSub2ApiAccountBusy(true);
+  if (DOM.sub2apiAccountActionStatus) {
+    DOM.sub2apiAccountActionStatus.textContent = ids.length
+      ? `正在处理 ${ids.length} 个异常账号...`
+      : '正在处理整池异常账号...';
+  }
+  try {
+    const res = await fetch('/api/sub2api/accounts/handle-exception', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account_ids: ids, timeout: 30, delete_unresolved: true }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '异常账号处理失败');
+    const msg = `异常处理完成: 目标 ${data.targeted || 0}, 恢复 ${data.recovered || 0}, 删除 ${data.deleted_ok || 0}, 失败 ${data.deleted_fail || 0}`;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'success');
+    await loadSub2ApiAccounts({ silent: true });
+    pollSub2ApiPoolStatus();
+  } catch (e) {
+    const msg = '异常账号处理失败: ' + e.message;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'error');
+  } finally {
+    setSub2ApiAccountBusy(false);
+  }
+}
+
+async function triggerSub2ApiExceptionHandling() {
+  const ids = getSelectedSub2ApiAccountIds();
+  if (ids.length) {
+    if (!confirm(`确认处理 ${ids.length} 个已选账号？系统会先测活，仍异常的账号会被删除。`)) return;
+    await runSub2ApiExceptionHandling(ids);
+    return;
+  }
+  if (!confirm('未选择账号，将处理整个 Sub2Api 池中的异常账号。是否继续？')) return;
+  await runSub2ApiExceptionHandling([]);
+}
+
+async function runSub2ApiAccountDelete(accountIds, label = '选中账号', requireConfirm = true) {
+  if (state.ui.sub2apiAccountActionBusy) return;
+  const ids = (accountIds || []).filter(id => Number.isInteger(id) && id > 0);
+  if (!ids.length) {
+    showToast('请先选择至少一个账号', 'error');
+    return;
+  }
+  if (requireConfirm && !confirm(`确认删除 ${label}（共 ${ids.length} 个）？`)) return;
+
+  setSub2ApiAccountBusy(true);
+  if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = `正在删除 ${ids.length} 个账号...`;
+  try {
+    const res = await fetch('/api/sub2api/accounts/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account_ids: ids, timeout: 20 }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '批量删除失败');
+    ids.forEach(id => state.ui.selectedSub2ApiAccountIds.delete(id));
+    const msg = `批量删除完成: 成功 ${data.deleted_ok || 0}, 失败 ${data.deleted_fail || 0}`;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'success');
+    await loadSub2ApiAccounts({ silent: true });
+    pollSub2ApiPoolStatus();
+  } catch (e) {
+    const msg = '批量删除失败: ' + e.message;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'error');
+  } finally {
+    setSub2ApiAccountBusy(false);
+  }
+}
+
+async function triggerSelectedSub2ApiDelete() {
+  await runSub2ApiAccountDelete(getSelectedSub2ApiAccountIds());
+}
+
+async function previewSub2ApiDuplicates() {
+  if (state.ui.sub2apiAccountActionBusy) return;
+  setSub2ApiAccountBusy(true);
+  if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = '正在检测重复账号...';
+  try {
+    const res = await fetch('/api/sub2api/pool/dedupe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: true, timeout: 20 }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '重复账号检测失败');
+    const msg = `重复预检完成: 重复组 ${data.duplicate_groups || 0}, 重复账号 ${data.duplicate_accounts || 0}, 可删 ${data.to_delete || 0}`;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'success');
+    await loadSub2ApiAccounts({ silent: true });
+  } catch (e) {
+    const msg = '重复账号检测失败: ' + e.message;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'error');
+  } finally {
+    setSub2ApiAccountBusy(false);
+  }
+}
+
+async function cleanupSub2ApiDuplicates() {
+  if (state.ui.sub2apiAccountActionBusy) return;
+  if (!confirm('确认清理 Sub2Api 中的重复账号？系统会保留每组中更新时间最新的账号。')) return;
+  setSub2ApiAccountBusy(true);
+  if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = '正在清理重复账号...';
+  try {
+    const res = await fetch('/api/sub2api/pool/dedupe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: false, timeout: 20 }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '重复账号清理失败');
+    const msg = `重复清理完成: 删除成功 ${data.deleted_ok || 0}, 删除失败 ${data.deleted_fail || 0}`;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'success');
+    await loadSub2ApiAccounts({ silent: true });
+    pollSub2ApiPoolStatus();
+  } catch (e) {
+    const msg = '重复账号清理失败: ' + e.message;
+    if (DOM.sub2apiAccountActionStatus) DOM.sub2apiAccountActionStatus.textContent = msg;
+    showToast(msg, 'error');
+  } finally {
+    setSub2ApiAccountBusy(false);
+  }
+}
+
 // ==========================================
 // Sub2Api 同步配置
 // ==========================================
+function collectBrowserConfigForm() {
+  return {
+    register_mode: DOM.registerMode ? DOM.registerMode.value : 'browser',
+    browser_headless: DOM.browserVisible ? !DOM.browserVisible.checked : true,
+    browser_block_media: DOM.browserBlockMedia ? DOM.browserBlockMedia.checked : true,
+    browser_realistic_profile: DOM.browserRealisticProfile ? DOM.browserRealisticProfile.checked : true,
+    browser_clear_runtime_state: DOM.browserClearRuntimeState ? DOM.browserClearRuntimeState.checked : false,
+    browser_timeout_ms: DOM.browserTimeoutMs ? (parseInt(DOM.browserTimeoutMs.value, 10) || 90000) : 90000,
+    browser_slow_mo_ms: DOM.browserSlowMoMs ? (parseInt(DOM.browserSlowMoMs.value, 10) || 0) : 0,
+    browser_locale: DOM.browserLocale ? DOM.browserLocale.value.trim() || 'en-US' : 'en-US',
+    browser_timezone: DOM.browserTimezone ? DOM.browserTimezone.value.trim() || 'America/New_York' : 'America/New_York',
+    browser_executable_path: DOM.browserExecutablePath ? DOM.browserExecutablePath.value.trim() : '',
+  };
+}
+
+function applyBrowserConfig(cfg) {
+  if (!cfg) return;
+  if (DOM.registerMode) DOM.registerMode.value = cfg.register_mode || 'browser';
+  if (DOM.browserVisible) DOM.browserVisible.checked = !cfg.browser_headless;
+  if ((cfg.register_mode === 'browser_manual' || cfg.register_mode === 'browser_manual_v2') && DOM.browserVisible) {
+    DOM.browserVisible.checked = true;
+    DOM.browserVisible.disabled = true;
+  } else if (DOM.browserVisible) {
+    DOM.browserVisible.disabled = false;
+  }
+  if (DOM.browserBlockMedia) DOM.browserBlockMedia.checked = cfg.browser_block_media !== false;
+  if (DOM.browserRealisticProfile) DOM.browserRealisticProfile.checked = cfg.browser_realistic_profile !== false;
+  if (DOM.browserClearRuntimeState) DOM.browserClearRuntimeState.checked = cfg.browser_clear_runtime_state === true;
+  if (DOM.browserTimeoutMs) DOM.browserTimeoutMs.value = cfg.browser_timeout_ms || 90000;
+  if (DOM.browserSlowMoMs) DOM.browserSlowMoMs.value = cfg.browser_slow_mo_ms || 0;
+  if (DOM.browserLocale) DOM.browserLocale.value = cfg.browser_locale || 'en-US';
+  if (DOM.browserTimezone) DOM.browserTimezone.value = cfg.browser_timezone || 'America/New_York';
+  if (DOM.browserExecutablePath) DOM.browserExecutablePath.value = cfg.browser_executable_path || '';
+}
+
 async function loadSyncConfig() {
   if (DOM.syncStatus) DOM.syncStatus.textContent = '';
   try {
@@ -692,17 +2105,39 @@ async function loadSyncConfig() {
     const cfg = await res.json();
     DOM.sub2apiBaseUrl.value = cfg.base_url || '';
     if (cfg.email) DOM.sub2apiEmail.value = cfg.email;
-    DOM.autoSyncCheck.checked = cfg.auto_sync !== 'false';
+    DOM.autoSyncCheck.checked = !!cfg.auto_sync;
     if (DOM.uploadMode) DOM.uploadMode.value = cfg.upload_mode || 'snapshot';
     if (DOM.uploadModeStatus) DOM.uploadModeStatus.textContent = '';
     if (DOM.sub2apiMinCandidates) DOM.sub2apiMinCandidates.value = cfg.sub2api_min_candidates || 200;
     if (DOM.sub2apiInterval) DOM.sub2apiInterval.value = cfg.sub2api_maintain_interval_minutes || 30;
     if (DOM.sub2apiAutoMaintain) DOM.sub2apiAutoMaintain.checked = !!cfg.sub2api_auto_maintain;
+    const maintainActions = cfg.sub2api_maintain_actions || {};
+    if (DOM.sub2apiMaintainRefreshAbnormal) {
+      DOM.sub2apiMaintainRefreshAbnormal.checked = maintainActions.refresh_abnormal_accounts !== false;
+    }
+    if (DOM.sub2apiMaintainDeleteAbnormal) {
+      DOM.sub2apiMaintainDeleteAbnormal.checked = maintainActions.delete_abnormal_accounts !== false;
+    }
+    if (DOM.sub2apiMaintainDedupe) {
+      DOM.sub2apiMaintainDedupe.checked = maintainActions.dedupe_duplicate_accounts !== false;
+    }
     if (DOM.multithreadCheck) DOM.multithreadCheck.checked = !!cfg.multithread;
     if (DOM.threadCountInput) DOM.threadCountInput.value = cfg.thread_count || 3;
     if (cfg.proxy && DOM.proxyInput) DOM.proxyInput.value = cfg.proxy;
     if (DOM.autoRegisterCheck) DOM.autoRegisterCheck.checked = !!cfg.auto_register;
+    if (DOM.tokenProxySyncCheck) DOM.tokenProxySyncCheck.checked = !!cfg.token_proxy_sync;
+    if (DOM.tokenProxyDbPath) DOM.tokenProxyDbPath.value = cfg.token_proxy_db_path || '';
     if (DOM.syncStatus) DOM.syncStatus.textContent = '';
+  } catch { }
+}
+
+async function loadBrowserConfig() {
+  if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = '';
+  try {
+    const res = await fetch('/api/browser-config');
+    if (!res.ok) return;
+    const cfg = await res.json();
+    applyBrowserConfig(cfg);
   } catch { }
 }
 
@@ -780,11 +2215,12 @@ async function saveSyncConfig() {
   const base_url = DOM.sub2apiBaseUrl.value.trim();
   const email = DOM.sub2apiEmail.value.trim();
   const password = DOM.sub2apiPassword.value.trim();
-  const auto_sync = DOM.autoSyncCheck.checked ? 'true' : 'false';
+  const auto_sync = !!DOM.autoSyncCheck.checked;
   const upload_mode = DOM.uploadMode ? DOM.uploadMode.value : 'snapshot';
   const sub2api_min_candidates = parseInt(DOM.sub2apiMinCandidates.value) || 200;
   const sub2api_auto_maintain = DOM.sub2apiAutoMaintain.checked;
   const sub2api_maintain_interval_minutes = parseInt(DOM.sub2apiInterval.value) || 30;
+  const sub2api_maintain_actions = getSub2ApiMaintainActionsFromForm();
   const multithread = DOM.multithreadCheck ? DOM.multithreadCheck.checked : false;
   const thread_count = DOM.threadCountInput ? parseInt(DOM.threadCountInput.value) || 3 : 3;
   const auto_register = DOM.autoRegisterCheck ? DOM.autoRegisterCheck.checked : false;
@@ -803,6 +2239,7 @@ async function saveSyncConfig() {
         base_url, email, password, account_name: 'AutoReg', auto_sync,
         upload_mode,
         sub2api_min_candidates, sub2api_auto_maintain, sub2api_maintain_interval_minutes,
+        sub2api_maintain_actions,
         multithread, thread_count, auto_register,
       }),
     });
@@ -811,6 +2248,7 @@ async function saveSyncConfig() {
       showToast('验证通过，配置已保存', 'success');
       DOM.syncStatus.textContent = '验证通过，配置已保存';
       pollSub2ApiPoolStatus();
+      loadSub2ApiAccounts();
     } else {
       showToast(data.detail || '验证失败', 'error');
       DOM.syncStatus.textContent = data.detail || '验证失败';
@@ -820,7 +2258,75 @@ async function saveSyncConfig() {
     DOM.syncStatus.textContent = '请求失败: ' + e.message;
   } finally {
     DOM.saveSyncConfigBtn.disabled = false;
-    DOM.saveSyncConfigBtn.textContent = '保存';
+    DOM.saveSyncConfigBtn.textContent = '保存平台配置';
+  }
+}
+
+async function saveTokenProxyConfig() {
+  if (!DOM.saveTokenProxyConfigBtn) return;
+  const token_proxy_sync = DOM.tokenProxySyncCheck ? DOM.tokenProxySyncCheck.checked : false;
+  const token_proxy_db_path = DOM.tokenProxyDbPath ? DOM.tokenProxyDbPath.value.trim() : '';
+  DOM.saveTokenProxyConfigBtn.disabled = true;
+  DOM.saveTokenProxyConfigBtn.textContent = '保存中...';
+  if (DOM.tokenProxyStatus) DOM.tokenProxyStatus.textContent = '';
+  try {
+    const res = await fetch('/api/token-proxy-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token_proxy_sync, token_proxy_db_path }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast('Token Proxy 配置已保存', 'success');
+      if (DOM.tokenProxyStatus) DOM.tokenProxyStatus.textContent = '已保存';
+    } else {
+      showToast(data.detail || '保存失败', 'error');
+      if (DOM.tokenProxyStatus) DOM.tokenProxyStatus.textContent = data.detail || '保存失败';
+    }
+  } catch (e) {
+    showToast('请求失败: ' + e.message, 'error');
+    if (DOM.tokenProxyStatus) DOM.tokenProxyStatus.textContent = '请求失败';
+  } finally {
+    DOM.saveTokenProxyConfigBtn.disabled = false;
+    DOM.saveTokenProxyConfigBtn.textContent = '保存';
+  }
+}
+
+async function saveBrowserConfig(options = {}) {
+  if (!DOM.browserConfigSaveBtn) return;
+  const silentSuccess = !!options.silentSuccess;
+  const statusText = options.statusText || '浏览器注册配置已保存';
+  const payload = collectBrowserConfigForm();
+  DOM.browserConfigSaveBtn.disabled = true;
+  const oldText = DOM.browserConfigSaveBtn.textContent;
+  DOM.browserConfigSaveBtn.textContent = '保存中...';
+  if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = '正在保存浏览器配置...';
+  try {
+    const res = await fetch('/api/browser-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = data.detail || '保存浏览器配置失败';
+      if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
+      showToast(msg, 'error');
+      return false;
+    }
+    applyBrowserConfig(data);
+    const msg = statusText;
+    if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
+    if (!silentSuccess) showToast(msg, 'success');
+    return true;
+  } catch (e) {
+    const msg = '请求失败: ' + e.message;
+    if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
+    showToast(msg, 'error');
+    return false;
+  } finally {
+    DOM.browserConfigSaveBtn.disabled = false;
+    DOM.browserConfigSaveBtn.textContent = oldText || '保存浏览器配置';
   }
 }
 
@@ -856,27 +2362,117 @@ async function saveUploadMode() {
   }
 }
 
-async function batchSync() {
-  const btn = DOM.poolPwSyncBtn;
-  if (!btn) return;
-  btn.disabled = true;
-  btn.textContent = '导入中...';
-  showToast('批量导入开始', 'info');
+async function syncLocalTokensToSub2Api(filenames, options = {}) {
+  const fileList = Array.from(new Set((filenames || []).map(item => String(item || '').trim()).filter(Boolean)));
+  if (fileList.length === 0) {
+    showToast('当前没有可导入的本地认证文件', 'error');
+    return null;
+  }
+  const { button = null, label = '', force = false } = options;
+  const oldText = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = force ? '重导中...' : '导入中...';
+  }
   try {
     const res = await fetch('/api/sync-batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filenames: [] }),
+      body: JSON.stringify({ filenames: fileList, force }),
     });
     const data = await res.json();
-    if (!res.ok) { showToast(data.detail || '导入失败', 'error'); return; }
-    const msg = `导入完成：共 ${data.total}，成功 ${data.ok}，失败 ${data.fail}`;
+    if (!res.ok) {
+      showToast(data.detail || (force ? '重导失败' : '导入失败'), 'error');
+      return null;
+    }
+    const actionText = force ? '重导' : '导入';
+    const targetText = label || '本地认证文件';
+    const firstResult = Array.isArray(data.results) && data.results.length === 1 ? data.results[0] : null;
+    let msg = fileList.length === 1
+      ? `${targetText}${actionText}完成：成功 ${data.ok}，跳过 ${data.skipped || 0}，失败 ${data.fail}`
+      : `${actionText}完成：共 ${data.total}，成功 ${data.ok}，跳过 ${data.skipped || 0}，失败 ${data.fail}`;
+    if (firstResult && firstResult.reason === 'exists_after_create') {
+      msg = `${targetText}${actionText}时远端已创建，但接口响应异常，已按成功处理`;
+    } else if (firstResult && firstResult.reason === 'updated_existing_before_create') {
+      msg = `${targetText}${actionText}时命中已存在账号，已更新远端凭据`;
+    }
     showToast(msg, data.fail > 0 ? 'info' : 'success');
+    await loadTokens();
+    await pollSub2ApiPoolStatus();
+    await loadSub2ApiAccounts({ silent: true });
+    return data;
   } catch (e) {
-    showToast('导入失败: ' + e.message, 'error');
+    showToast((force ? '重导失败: ' : '导入失败: ') + e.message, 'error');
+    return null;
   } finally {
-    btn.disabled = false;
-    btn.textContent = '批量导入';
+    if (button) {
+      button.disabled = false;
+      button.textContent = oldText || (force ? '重导 Sub2Api' : '导入 Sub2Api');
+    }
+  }
+}
+
+async function clearLocalPlatformMark(filenames, platform, options = {}) {
+  const fileList = Array.from(new Set((filenames || []).map(item => String(item || '').trim()).filter(Boolean)));
+  if (fileList.length === 0) {
+    showToast('没有可清理标记的本地认证文件', 'error');
+    return null;
+  }
+  const platformName = String(platform || '').trim().toLowerCase();
+  const { button = null, label = '' } = options;
+  const oldText = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '清理中...';
+  }
+  try {
+    const res = await fetch('/api/tokens/platform-clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filenames: fileList, platform: platformName }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.detail || '清理标记失败', 'error');
+      return null;
+    }
+    const targetText = label || '本地认证文件';
+    const msg = fileList.length === 1
+      ? `${targetText}标记清理完成：成功 ${data.ok}，跳过 ${data.skipped || 0}，失败 ${data.fail}`
+      : `标记清理完成：共 ${data.total}，成功 ${data.ok}，跳过 ${data.skipped || 0}，失败 ${data.fail}`;
+    showToast(msg, data.fail > 0 ? 'info' : 'success');
+    await loadTokens();
+    return data;
+  } catch (e) {
+    showToast('清理标记失败: ' + e.message, 'error');
+    return null;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = oldText || '清除标记';
+    }
+  }
+}
+
+async function batchSync() {
+  const btn = DOM.poolPwSyncBtn;
+  if (!btn) return;
+  const visibleTokens = getFilteredTokens(state.ui.tokens || []);
+  const filenames = visibleTokens
+    .map((item) => String(item && item.filename ? item.filename : '').trim())
+    .filter(Boolean);
+  if (filenames.length === 0) {
+    showToast('当前筛选下没有可导入的本地认证文件', 'error');
+    return;
+  }
+  showToast(`开始导入 ${filenames.length} 个本地认证文件到 Sub2Api`, 'info');
+  await syncLocalTokensToSub2Api(filenames, {
+    button: btn,
+    label: `${filenames.length} 个本地认证文件`,
+    force: false,
+  });
+  if (btn && !btn.disabled) {
+    btn.textContent = '批量导入 Sub2Api';
   }
 }
 
@@ -1067,7 +2663,7 @@ function updateHeaderSub2Api(data) {
     if (DOM.headerSub2apiLabel) DOM.headerSub2apiLabel.textContent = '-- / --';
     if (DOM.headerSub2apiDelta) DOM.headerSub2apiDelta.textContent = '--';
     if (DOM.headerSub2apiBar) DOM.headerSub2apiBar.style.width = '0%';
-    if (DOM.headerSub2apiChip) DOM.headerSub2apiChip.className = 'pool-chip status-idle';
+    setHeaderChipStatus(DOM.headerSub2apiChip, 'idle');
     if (DOM.headerSub2apiBar) DOM.headerSub2apiBar.className = 'pool-chip-fill';
     if (DOM.headerSub2apiDelta) DOM.headerSub2apiDelta.className = 'pool-chip-delta';
     return;
@@ -1080,7 +2676,7 @@ function updateHeaderSub2Api(data) {
     DOM.headerSub2apiBar.style.width = Math.min(100, fillPct) + '%';
     DOM.headerSub2apiBar.className = `pool-chip-fill ${state}`;
   }
-  if (DOM.headerSub2apiChip) DOM.headerSub2apiChip.className = `pool-chip status-${state}`;
+  setHeaderChipStatus(DOM.headerSub2apiChip, state);
   if (DOM.headerSub2apiDelta) DOM.headerSub2apiDelta.className = `pool-chip-delta ${state}`;
 }
 
@@ -1089,7 +2685,7 @@ function updateHeaderCpa(data) {
     if (DOM.headerCpaLabel) DOM.headerCpaLabel.textContent = '-- / --';
     if (DOM.headerCpaDelta) DOM.headerCpaDelta.textContent = '--';
     if (DOM.headerCpaBar) DOM.headerCpaBar.style.width = '0%';
-    if (DOM.headerCpaChip) DOM.headerCpaChip.className = 'pool-chip status-idle';
+    setHeaderChipStatus(DOM.headerCpaChip, 'idle');
     if (DOM.headerCpaBar) DOM.headerCpaBar.className = 'pool-chip-fill';
     if (DOM.headerCpaDelta) DOM.headerCpaDelta.className = 'pool-chip-delta';
     return;
@@ -1102,8 +2698,14 @@ function updateHeaderCpa(data) {
     DOM.headerCpaBar.style.width = Math.min(100, fillPct) + '%';
     DOM.headerCpaBar.className = `pool-chip-fill ${state}`;
   }
-  if (DOM.headerCpaChip) DOM.headerCpaChip.className = `pool-chip status-${state}`;
+  setHeaderChipStatus(DOM.headerCpaChip, state);
   if (DOM.headerCpaDelta) DOM.headerCpaDelta.className = `pool-chip-delta ${state}`;
+}
+
+function setHeaderChipStatus(chip, state) {
+  if (!chip) return;
+  chip.classList.remove('status-idle', 'status-warn', 'status-danger', 'status-ok', 'status-over');
+  chip.classList.add(`status-${state}`);
 }
 
 function _headerPoolState(fillPct, errorCount) {
@@ -1122,17 +2724,20 @@ function _headerPoolDelta(fillPct) {
 }
 
 async function triggerSub2ApiMaintenance() {
+  const actionsText = describeSub2ApiMaintainActions();
   DOM.sub2apiPoolMaintainBtn.disabled = true;
   DOM.sub2apiPoolMaintainBtn.textContent = '维护中...';
-  DOM.sub2apiPoolMaintainStatus.textContent = '正在刷新异常账号并清理...';
+  DOM.sub2apiPoolMaintainStatus.textContent = `正在维护（${actionsText}）...`;
   try {
     const res = await fetch('/api/sub2api/pool/maintain', { method: 'POST' });
     const data = await res.json();
     if (res.ok) {
-      const msg = `维护完成: 异常 ${data.error_count || 0}, 刷新 ${data.refreshed || 0}, 删除 ${data.deleted_ok || 0}, 失败 ${data.deleted_fail || 0}`;
+      const sec = Math.max(0, Number(data.duration_ms || 0) / 1000).toFixed(2);
+      const msg = `维护完成(${actionsText}): 异常 ${data.error_count || 0}, 刷新恢复 ${data.refreshed || 0}, 重复组 ${data.duplicate_groups || 0}, 删除 ${data.deleted_ok || 0}, 失败 ${data.deleted_fail || 0}, ${sec}s`;
       DOM.sub2apiPoolMaintainStatus.textContent = msg;
       showToast(msg, 'success');
       pollSub2ApiPoolStatus();
+      loadSub2ApiAccounts({ silent: true });
     } else {
       DOM.sub2apiPoolMaintainStatus.textContent = data.detail || '维护失败';
       showToast(data.detail || '维护失败', 'error');
@@ -1216,6 +2821,112 @@ async function testSub2ApiPoolConnection() {
 // 邮箱配置（多选）
 // ==========================================
 
+// 域名格式验证
+function isValidDomain(domain) {
+  const trimmed = domain.trim();
+  if (!trimmed) return false;
+  // 基本域名格式：字母数字、点、连字符，不能以点或连字符开头/结尾
+  const domainRegex = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+  return domainRegex.test(trimmed);
+}
+
+// 创建域名输入行
+function createDomainInputRow(value = '') {
+  const row = document.createElement('div');
+  row.className = 'domain-input-row';
+  
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = 'example.com';
+  input.value = value;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  
+  // 实时验证
+  input.addEventListener('input', () => {
+    if (input.value.trim() && !isValidDomain(input.value)) {
+      input.classList.add('invalid');
+    } else {
+      input.classList.remove('invalid');
+    }
+  });
+  
+  const deleteBtn = document.createElement('button');
+  deleteBtn.type = 'button';
+  deleteBtn.className = 'btn btn-ghost';
+  deleteBtn.textContent = '删除';
+  deleteBtn.addEventListener('click', () => {
+    row.remove();
+  });
+  
+  row.appendChild(input);
+  row.appendChild(deleteBtn);
+  return row;
+}
+
+// 初始化域名输入容器
+function initCustomDomainsContainer() {
+  const container = document.getElementById('customDomainsContainer');
+  const addBtn = document.getElementById('addDomainBtn');
+  
+  if (!container || !addBtn) return;
+  
+  // 添加域名按钮
+  addBtn.addEventListener('click', () => {
+    container.appendChild(createDomainInputRow());
+  });
+  
+  // 初始添加一个空输入框
+  if (container.children.length === 0) {
+    container.appendChild(createDomainInputRow());
+  }
+}
+
+// 加载域名列表到容器
+function loadCustomDomains(domainsValue) {
+  const container = document.getElementById('customDomainsContainer');
+  if (!container) return;
+  
+  // 清空现有内容
+  container.innerHTML = '';
+  
+  let domains = [];
+  if (Array.isArray(domainsValue)) {
+    domains = domainsValue;
+  } else if (typeof domainsValue === 'string' && domainsValue.trim()) {
+    // 支持逗号或换行符分隔
+    domains = domainsValue.split(/[,\n\r]+/).map(d => d.trim()).filter(d => d);
+  }
+  
+  if (domains.length === 0) {
+    // 至少添加一个空输入框
+    container.appendChild(createDomainInputRow());
+  } else {
+    domains.forEach(domain => {
+      container.appendChild(createDomainInputRow(domain));
+    });
+  }
+}
+
+// 收集所有域名
+function collectCustomDomains() {
+  const container = document.getElementById('customDomainsContainer');
+  if (!container) return '';
+  
+  const domains = [];
+  container.querySelectorAll('.domain-input-row input').forEach(input => {
+    const value = input.value.trim();
+    if (value && isValidDomain(value)) {
+      domains.push(value);
+      input.classList.remove('invalid');
+    } else if (value) {
+      input.classList.add('invalid');
+    }
+  });
+  
+  return domains.join(',');
+}
+
 function initMailCheckboxes() {
   document.querySelectorAll('.mail-provider-check').forEach(cb => {
     cb.setAttribute('aria-expanded', cb.checked);
@@ -1246,10 +2957,29 @@ async function loadMailConfig() {
 
       // 填充 per-provider 配置
       const pcfg = configs[name] || {};
+      
+      // 特殊处理 mailtm_forward 的 custom_domains
+      if (name === 'mailtm_forward' && pcfg.custom_domains) {
+        loadCustomDomains(pcfg.custom_domains);
+      }
+      
       item.querySelectorAll('[data-key]').forEach(input => {
         const key = input.dataset.key;
+        // 跳过 custom_domains，已经特殊处理
+        if (key === 'custom_domains') return;
+        
         const previewKey = key + '_preview';
-        if (pcfg[key]) input.value = pcfg[key];
+        if (pcfg[key]) {
+          let value = pcfg[key];
+          // 如果是数组，用逗号+空格连接
+          if (Array.isArray(value)) {
+            value = value.join(', ');
+          } else if (typeof value === 'string') {
+            // 如果字符串包含换行符，替换为逗号+空格
+            value = value.replace(/[\r\n]+/g, ', ');
+          }
+          input.value = value;
+        }
         else if (pcfg[previewKey]) input.placeholder = pcfg[previewKey];
       });
     });
@@ -1279,9 +3009,17 @@ async function saveMailConfig() {
       checkedProviders.push(name);
       const item = cb.closest('.provider-item');
       const cfg = {};
+      
+      // 特殊处理 mailtm_forward 的 custom_domains
+      if (name === 'mailtm_forward') {
+        cfg.custom_domains = collectCustomDomains();
+      }
+      
       item.querySelectorAll('[data-key]').forEach(input => {
-        const val = input.value.trim();
-        if (val) cfg[input.dataset.key] = val;
+        const key = input.dataset.key;
+        // 跳过 custom_domains，已经特殊处理
+        if (key === 'custom_domains') return;
+        cfg[key] = input.value.trim();
       });
       providerConfigs[name] = cfg;
     }
@@ -1289,7 +3027,7 @@ async function saveMailConfig() {
 
   if (checkedProviders.length === 0) {
     showToast('请至少选择一个邮箱提供商', 'error');
-    return;
+    return false;
   }
 
   const strategy = DOM.mailStrategySelect ? DOM.mailStrategySelect.value : 'round_robin';
@@ -1309,12 +3047,17 @@ async function saveMailConfig() {
     if (res.ok) {
       showToast('邮箱配置已保存', 'success');
       DOM.mailStatus.textContent = '配置已保存';
+      return true;
     } else {
       const data = await res.json();
       DOM.mailStatus.textContent = data.detail || '保存失败';
+      showToast(DOM.mailStatus.textContent, 'error');
+      return false;
     }
   } catch (e) {
     DOM.mailStatus.textContent = '请求失败: ' + e.message;
+    showToast(DOM.mailStatus.textContent, 'error');
+    return false;
   } finally {
     DOM.mailSaveBtn.disabled = false;
   }
@@ -1324,7 +3067,8 @@ async function testMailConnection() {
   DOM.mailTestBtn.disabled = true;
   DOM.mailStatus.textContent = '测试中...';
   try {
-    await saveMailConfig();
+    const saved = await saveMailConfig();
+    if (!saved) return;
     const res = await fetch('/api/mail/test', { method: 'POST' });
     const data = await res.json();
     if (data.results) {
