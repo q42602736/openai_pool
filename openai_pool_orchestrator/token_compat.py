@@ -110,6 +110,7 @@ def normalize_token_data(
     source = copy.deepcopy(token_data if isinstance(token_data, dict) else {})
     credentials = source.get("credentials") if isinstance(source.get("credentials"), dict) else {}
     user = source.get("user") if isinstance(source.get("user"), dict) else {}
+    account = source.get("account") if isinstance(source.get("account"), dict) else {}
 
     access_token = _first_non_empty_str(
         source.get("access_token"),
@@ -153,6 +154,7 @@ def normalize_token_data(
         source.get("account_id"),
         credentials.get("chatgpt_account_id"),
         credentials.get("account_id"),
+        account.get("id"),
         id_auth.get("chatgpt_account_id"),
         access_auth.get("chatgpt_account_id"),
     )

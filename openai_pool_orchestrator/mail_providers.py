@@ -578,11 +578,10 @@ class MailTmForwardProvider(MailTmProvider):
                             seen_ids.add(raw_msg_id)
                             continue
 
-                        strict_match = self._message_matches_email(mail_data, email)
-                        if not strict_match and time.time() - first_poll_started_at < 45:
-                            continue
-
                         code = _extract_code(content)
+                        strict_match = self._message_matches_email(mail_data, email)
+                        if not strict_match and not code and time.time() - first_poll_started_at < 12:
+                            continue
                         seen_ids.add(raw_msg_id)
                         if code:
                             return code

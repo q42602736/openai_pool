@@ -16,6 +16,7 @@ import time
 import urllib.request
 import urllib.error
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -29,9 +30,10 @@ from pydantic import BaseModel, Field
 
 from . import __version__, TOKENS_DIR, CONFIG_FILE, STATE_FILE, STATIC_DIR, DATA_DIR
 from .register import EventEmitter, PhoneVerificationRequiredError, run, _fetch_proxy_from_pool
-from .mail_providers import create_provider, MultiMailRouter
+from .mail_providers import create_provider, create_provider_by_name, MultiMailRouter
 from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
 from .token_compat import normalize_token_data
+from .register import generate_oauth_url, submit_callback_url, _random_password, _random_profile_name, _random_profile_birthdate
 
 # ==========================================
 # 同步配置（内存持久化到 data/sync_config.json）
@@ -54,6 +56,30 @@ SUB2API_MAINTAIN_ACTION_DEFAULTS: Dict[str, bool] = {
     "delete_abnormal_accounts": True,
     "dedupe_duplicate_accounts": True,
 }
+
+
+@dataclass
+class ExtensionV2Session:
+    session_id: str
+    email: str
+    dev_token: str
+    account_password: str
+    profile_name: str
+    profile_birthdate: str
+    provider_name: str = "mailtm_forward"
+    created_at: float = field(default_factory=time.time)
+    last_otp_code: str = ""
+    oauth_auth_url: str = ""
+    oauth_state: str = ""
+    oauth_code_verifier: str = ""
+    oauth_redirect_uri: str = ""
+    completed: bool = False
+    token_file: str = ""
+    account_email: str = ""
+
+
+_extension_v2_sessions_lock = threading.RLock()
+_extension_v2_sessions: Dict[str, ExtensionV2Session] = {}
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -105,8 +131,8 @@ def _get_browser_config_snapshot(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
         "browser_locale": str(config.get("browser_locale", "en-US") or "en-US").strip() or "en-US",
         "browser_timezone": str(config.get("browser_timezone", "America/New_York") or "America/New_York").strip() or "America/New_York",
         "browser_block_media": _as_bool(config.get("browser_block_media", True), default=True),
-        "browser_realistic_profile": _as_bool(config.get("browser_realistic_profile", True), default=True),
-        "browser_clear_runtime_state": _as_bool(config.get("browser_clear_runtime_state", False), default=False),
+        "browser_realistic_profile": _as_bool(config.get("browser_realistic_profile", False), default=False),
+        "browser_clear_runtime_state": _as_bool(config.get("browser_clear_runtime_state", True), default=True),
     }
 
 
@@ -2103,8 +2129,8 @@ class SyncConfigRequest(BaseModel):
     browser_locale: str = "en-US"
     browser_timezone: str = "America/New_York"
     browser_block_media: bool = True
-    browser_realistic_profile: bool = True
-    browser_clear_runtime_state: bool = False
+    browser_realistic_profile: bool = False
+    browser_clear_runtime_state: bool = True
     token_proxy_sync: bool = False
     token_proxy_db_path: str = ""
 
@@ -2118,8 +2144,16 @@ class BrowserConfigRequest(BaseModel):
     browser_locale: str = "en-US"
     browser_timezone: str = "America/New_York"
     browser_block_media: bool = True
-    browser_realistic_profile: bool = True
-    browser_clear_runtime_state: bool = False
+    browser_realistic_profile: bool = False
+    browser_clear_runtime_state: bool = True
+
+
+class ExtensionV2OtpRequest(BaseModel):
+    timeout_seconds: int = 20
+
+
+class ExtensionV2CallbackRequest(BaseModel):
+    callback_url: str
 
 
 class SyncNowRequest(BaseModel):
@@ -2468,6 +2502,135 @@ async def api_set_browser_config(req: BrowserConfigRequest) -> Dict[str, Any]:
     cfg.pop("headful", None)
     saved_cfg = _save_sync_config(cfg)
     return {"status": "saved", **_get_browser_config_snapshot(saved_cfg)}
+
+
+@app.post("/api/extension/v2/session/start")
+async def api_extension_v2_start_session() -> Dict[str, Any]:
+    def _start() -> Dict[str, Any]:
+        provider = _get_mailtm_forward_provider_from_config()
+        try:
+            email, dev_token = provider.create_mailbox(proxy="", proxy_selector=None)
+        except TypeError:
+            email, dev_token = provider.create_mailbox(proxy="")
+        if not email or not dev_token:
+            raise HTTPException(status_code=500, detail="mailtm_forward 创建临时邮箱失败")
+
+        session = ExtensionV2Session(
+            session_id=str(uuid.uuid4()),
+            email=str(email).strip(),
+            dev_token=str(dev_token).strip(),
+            account_password=_random_password(16),
+            profile_name=_random_profile_name(),
+            profile_birthdate=_random_profile_birthdate(),
+        )
+        with _extension_v2_sessions_lock:
+            _extension_v2_sessions[session.session_id] = session
+        return {
+            "ok": True,
+            "session": _build_extension_v2_session_payload(session),
+        }
+
+    return await run_in_threadpool(_start)
+
+
+@app.get("/api/extension/v2/session/{session_id}")
+async def api_extension_v2_get_session(session_id: str) -> Dict[str, Any]:
+    session = _get_extension_v2_session(session_id)
+    return {"ok": True, "session": _build_extension_v2_session_payload(session)}
+
+
+@app.post("/api/extension/v2/session/{session_id}/otp")
+async def api_extension_v2_poll_otp(session_id: str, req: ExtensionV2OtpRequest) -> Dict[str, Any]:
+    def _poll() -> Dict[str, Any]:
+        session = _get_extension_v2_session(session_id)
+        provider = _get_mailtm_forward_provider_from_config()
+        timeout_seconds = max(5, min(int(req.timeout_seconds or 20), 120))
+        try:
+            code = provider.wait_for_otp(
+                session.dev_token,
+                session.email,
+                proxy="",
+                proxy_selector=None,
+                timeout=timeout_seconds,
+                stop_event=None,
+            )
+        except TypeError:
+            code = provider.wait_for_otp(
+                session.dev_token,
+                session.email,
+                proxy="",
+                timeout=timeout_seconds,
+                stop_event=None,
+            )
+        code = str(code or "").strip()
+        if code:
+            with _extension_v2_sessions_lock:
+                current = _extension_v2_sessions.get(session.session_id)
+                if current is not None:
+                    current.last_otp_code = code
+        return {"ok": bool(code), "code": code}
+
+    return await run_in_threadpool(_poll)
+
+
+@app.post("/api/extension/v2/session/{session_id}/oauth-login")
+async def api_extension_v2_oauth_login(session_id: str) -> Dict[str, Any]:
+    def _build() -> Dict[str, Any]:
+        session = _get_extension_v2_session(session_id)
+        oauth = generate_oauth_url(screen_hint="", login_hint=session.email)
+        with _extension_v2_sessions_lock:
+            current = _extension_v2_sessions.get(session.session_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="扩展 V2 会话不存在或已失效")
+            current.oauth_auth_url = oauth.auth_url
+            current.oauth_state = oauth.state
+            current.oauth_code_verifier = oauth.code_verifier
+            current.oauth_redirect_uri = oauth.redirect_uri
+        return {
+            "ok": True,
+            "auth_url": oauth.auth_url,
+            "redirect_uri": oauth.redirect_uri,
+        }
+
+    return await run_in_threadpool(_build)
+
+
+@app.post("/api/extension/v2/session/{session_id}/callback")
+async def api_extension_v2_complete_callback(session_id: str, req: ExtensionV2CallbackRequest) -> Dict[str, Any]:
+    def _complete() -> Dict[str, Any]:
+        session = _get_extension_v2_session(session_id)
+        if not session.oauth_code_verifier or not session.oauth_state or not session.oauth_redirect_uri:
+            raise HTTPException(status_code=400, detail="当前会话尚未生成 OAuth 登录链接")
+
+        token_json = _build_extension_token_from_callback(
+            callback_url=str(req.callback_url or "").strip(),
+            code_verifier=session.oauth_code_verifier,
+            redirect_uri=session.oauth_redirect_uri,
+            expected_state=session.oauth_state,
+        )
+        file_name, file_path, account_email, token_data = _save_extension_token_locally(token_json)
+        upload_results = _sync_extension_token_to_targets(
+            file_name=file_name,
+            file_path=file_path,
+            token_json=token_json,
+            token_data=token_data,
+            email=account_email,
+        )
+        with _extension_v2_sessions_lock:
+            current = _extension_v2_sessions.get(session.session_id)
+            if current is not None:
+                current.completed = True
+                current.token_file = file_name
+                current.account_email = account_email
+        return {
+            "ok": True,
+            "session": _build_extension_v2_session_payload(session),
+            "token_file": file_name,
+            "email": account_email,
+            "upload_results": upload_results,
+        }
+
+    return await run_in_threadpool(_complete)
 
 
 @app.post("/api/sync-config")
@@ -3342,6 +3505,142 @@ def _push_account_api_with_dedupe(
 
     result.setdefault("skipped", False)
     return result
+
+
+def _get_extension_v2_session(session_id: str) -> ExtensionV2Session:
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    with _extension_v2_sessions_lock:
+        session = _extension_v2_sessions.get(sid)
+    if session is None:
+        raise HTTPException(status_code=404, detail="扩展 V2 会话不存在或已失效")
+    return session
+
+
+def _build_extension_v2_session_payload(session: ExtensionV2Session) -> Dict[str, Any]:
+    return {
+        "session_id": session.session_id,
+        "email": session.email,
+        "account_password": session.account_password,
+        "profile_name": session.profile_name,
+        "profile_birthdate": session.profile_birthdate,
+        "provider_name": session.provider_name,
+        "created_at": datetime.fromtimestamp(session.created_at).isoformat(timespec="seconds"),
+        "completed": bool(session.completed),
+        "token_file": session.token_file,
+        "account_email": session.account_email,
+    }
+
+
+def _get_mailtm_forward_provider_from_config() -> Any:
+    cfg = _get_sync_config()
+    provider_configs = cfg.get("mail_provider_configs") or {}
+    provider_cfg = provider_configs.get("mailtm_forward") if isinstance(provider_configs, dict) else {}
+    try:
+        provider = create_provider_by_name("mailtm_forward", provider_cfg or {})
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"mailtm_forward 配置无效: {exc}") from exc
+    return provider
+
+
+def _save_extension_token_locally(token_json: str) -> tuple[str, str, str, Dict[str, Any]]:
+    try:
+        token_data = _normalize_token_payload(json.loads(token_json))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"token_json 解析失败: {exc}") from exc
+
+    email = str(token_data.get("email") or "unknown").strip() or "unknown"
+    refresh_token = str(token_data.get("refresh_token") or "").strip()
+    local_identity_keys = _load_local_token_identity_keys()
+    if any(key in local_identity_keys for key in _sub2api_identity_keys(email, refresh_token)):
+        raise HTTPException(status_code=409, detail=f"本地已存在相同账号（email/refresh_token）: {email}")
+
+    safe_email = email.replace("@", "_")
+    file_name = f"token_{safe_email}_{time.time_ns()}.json"
+    file_path = os.path.join(TOKENS_DIR, file_name)
+    _write_json_atomic(Path(file_path), token_data)
+    return file_name, file_path, email, token_data
+
+
+def _sync_extension_token_to_targets(
+    *,
+    file_name: str,
+    file_path: str,
+    token_json: str,
+    token_data: Dict[str, Any],
+    email: str,
+) -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    upload_results: Dict[str, Any] = {
+        "cpa": None,
+        "sub2api": None,
+        "token_proxy": None,
+    }
+
+    cpa_base_url = str(cfg.get("cpa_base_url") or "").strip()
+    cpa_token = str(cfg.get("cpa_token") or "").strip()
+    if cpa_base_url and cpa_token:
+        try:
+            pool_maintainer = PoolMaintainer(cpa_base_url=cpa_base_url, cpa_token=cpa_token)
+            cpa_ok = bool(pool_maintainer.upload_token(file_name, token_data, proxy=""))
+            upload_results["cpa"] = cpa_ok
+            if cpa_ok:
+                _mark_token_uploaded_platform(file_path, "cpa")
+        except Exception as exc:
+            upload_results["cpa"] = {"ok": False, "error": str(exc)}
+
+    base_url = str(cfg.get("base_url") or "").strip()
+    bearer = str(cfg.get("bearer_token") or "").strip()
+    refresh_token = str(token_data.get("refresh_token") or "").strip()
+    if _is_auto_sync_enabled(cfg) and base_url and bearer:
+        if refresh_token:
+            try:
+                sub2api_result = _push_account_api_with_dedupe(
+                    base_url=base_url,
+                    bearer=bearer,
+                    email=email,
+                    token_data=token_data,
+                    check_before=True,
+                    check_after=True,
+                )
+                upload_results["sub2api"] = sub2api_result
+                if sub2api_result.get("ok"):
+                    _mark_token_uploaded_platform(file_path, "sub2api")
+            except Exception as exc:
+                upload_results["sub2api"] = {"ok": False, "error": str(exc)}
+        else:
+            upload_results["sub2api"] = {"ok": False, "error": "缺少 refresh_token，无法同步到 Sub2Api"}
+
+    if cfg.get("token_proxy_sync"):
+        try:
+            from .pool_maintainer import TokenProxySyncer
+
+            syncer = TokenProxySyncer(db_path=str(cfg.get("token_proxy_db_path") or ""))
+            upload_results["token_proxy"] = bool(syncer.sync_account(token_data))
+        except Exception as exc:
+            upload_results["token_proxy"] = {"ok": False, "error": str(exc)}
+
+    return upload_results
+
+
+def _build_extension_token_from_callback(
+    *,
+    callback_url: str,
+    code_verifier: str,
+    redirect_uri: str,
+    expected_state: str,
+) -> str:
+    try:
+        return submit_callback_url(
+            callback_url=callback_url,
+            code_verifier=code_verifier,
+            redirect_uri=redirect_uri,
+            expected_state=expected_state,
+            proxy=None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"OAuth callback 兑换 token 失败: {exc}") from exc
 
 
 @app.post("/api/sync-batch")

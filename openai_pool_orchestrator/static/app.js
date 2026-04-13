@@ -280,8 +280,6 @@ document.addEventListener('DOMContentLoaded', () => {
     browserBlockMedia: $('browserBlockMedia'),
     manualV2TestPhone: $('manualV2TestPhone'),
     manualV2TestPassword: $('manualV2TestPassword'),
-    browserRealisticProfile: $('browserRealisticProfile'),
-    browserClearRuntimeState: $('browserClearRuntimeState'),
     browserTimeoutMs: $('browserTimeoutMs'),
     browserSlowMoMs: $('browserSlowMoMs'),
     browserLocale: $('browserLocale'),
@@ -2068,8 +2066,8 @@ function collectBrowserConfigForm() {
     register_mode: DOM.registerMode ? DOM.registerMode.value : 'browser',
     browser_headless: DOM.browserVisible ? !DOM.browserVisible.checked : true,
     browser_block_media: DOM.browserBlockMedia ? DOM.browserBlockMedia.checked : true,
-    browser_realistic_profile: DOM.browserRealisticProfile ? DOM.browserRealisticProfile.checked : true,
-    browser_clear_runtime_state: DOM.browserClearRuntimeState ? DOM.browserClearRuntimeState.checked : false,
+    browser_realistic_profile: false,
+    browser_clear_runtime_state: true,
     browser_timeout_ms: DOM.browserTimeoutMs ? (parseInt(DOM.browserTimeoutMs.value, 10) || 90000) : 90000,
     browser_slow_mo_ms: DOM.browserSlowMoMs ? (parseInt(DOM.browserSlowMoMs.value, 10) || 0) : 0,
     browser_locale: DOM.browserLocale ? DOM.browserLocale.value.trim() || 'en-US' : 'en-US',
@@ -2089,8 +2087,6 @@ function applyBrowserConfig(cfg) {
     DOM.browserVisible.disabled = false;
   }
   if (DOM.browserBlockMedia) DOM.browserBlockMedia.checked = cfg.browser_block_media !== false;
-  if (DOM.browserRealisticProfile) DOM.browserRealisticProfile.checked = cfg.browser_realistic_profile !== false;
-  if (DOM.browserClearRuntimeState) DOM.browserClearRuntimeState.checked = cfg.browser_clear_runtime_state === true;
   if (DOM.browserTimeoutMs) DOM.browserTimeoutMs.value = cfg.browser_timeout_ms || 90000;
   if (DOM.browserSlowMoMs) DOM.browserSlowMoMs.value = cfg.browser_slow_mo_ms || 0;
   if (DOM.browserLocale) DOM.browserLocale.value = cfg.browser_locale || 'en-US';

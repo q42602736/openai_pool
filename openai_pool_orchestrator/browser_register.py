@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,8 +32,8 @@ DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
     "browser_locale": "en-US",
     "browser_timezone": "America/New_York",
     "browser_block_media": True,
-    "browser_realistic_profile": True,
-    "browser_clear_runtime_state": False,
+    "browser_realistic_profile": False,
+    "browser_clear_runtime_state": True,
 }
 
 
@@ -125,8 +126,8 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
         "browser_locale": locale,
         "browser_timezone": timezone_id,
         "browser_block_media": bool(source.get("browser_block_media", True)),
-        "browser_realistic_profile": bool(source.get("browser_realistic_profile", True)),
-        "browser_clear_runtime_state": bool(source.get("browser_clear_runtime_state", False)),
+        "browser_realistic_profile": bool(source.get("browser_realistic_profile", False)),
+        "browser_clear_runtime_state": bool(source.get("browser_clear_runtime_state", True)),
         "browser_keep_open_on_error": bool(
             raw_keep_open if raw_keep_open is not None else (not bool(source.get("browser_headless", True)))
         ),
@@ -869,6 +870,7 @@ def _try_build_token_from_browser_session(
     emitter: Any,
     build_browser_session_token_func: Optional[Callable[[Dict[str, Any]], Optional[str]]],
     referer_url: str = "",
+    fallback_email: str = "",
     timeout_ms: int = 15000,
 ) -> Optional[str]:
     if not callable(build_browser_session_token_func):
@@ -936,12 +938,39 @@ def _try_build_token_from_browser_session(
         if session_token:
             session_payload["session_token"] = session_token
         user_payload = session_json.get("user") if isinstance(session_json.get("user"), dict) else {}
+        account_payload = session_json.get("account") if isinstance(session_json.get("account"), dict) else {}
         if user_payload and not session_payload.get("email"):
             session_payload["email"] = str(user_payload.get("email") or "").strip()
+        if not str(session_payload.get("email") or "").strip() and str(fallback_email or "").strip():
+            session_payload["email"] = str(fallback_email or "").strip()
+        account_id = str(
+            session_json.get("account_id")
+            or session_json.get("chatgpt_account_id")
+            or account_payload.get("id")
+            or ""
+        ).strip()
+        if account_id:
+            session_payload["account_id"] = account_id
+            session_payload["chatgpt_account_id"] = account_id
         expires_value = str(session_json.get("expires") or session_json.get("expires_at") or "").strip()
         if expires_value:
             session_payload["expires_at"] = expires_value
             session_payload["expired"] = expires_value
+
+        try:
+            emitter.info(
+                "浏览器 session fast path 诊断: "
+                + f"top_keys={','.join(sorted(str(k) for k in session_json.keys())[:12]) or '-'}, "
+                + f"user.email={str(user_payload.get('email') or '').strip() or '-'}, "
+                + f"fallback_email={str(fallback_email or '').strip() or '-'}, "
+                + f"account.id={str(account_payload.get('id') or '').strip() or '-'}, "
+                + f"access_token={'有' if access_token else '无'}, "
+                + f"refresh_token={'有' if refresh_token else '无'}, "
+                + f"session_token={'有' if session_token else '无'}",
+                step="get_token",
+            )
+        except Exception:
+            pass
 
         result = build_browser_session_token_func(session_payload)
         if result:
@@ -952,7 +981,121 @@ def _try_build_token_from_browser_session(
                 )
             except Exception:
                 pass
+        else:
+            try:
+                emitter.warn("浏览器 session fast path 未能组装出完整 Token，请查看上一条 session 诊断日志。", step="get_token")
+            except Exception:
+                pass
         return result
+    finally:
+        if session_page is not None:
+            try:
+                session_page.close()
+            except Exception:
+                pass
+
+
+def _fetch_browser_session_payload(
+    *,
+    context: Any,
+    emitter: Any,
+    referer_url: str = "",
+    fallback_email: str = "",
+    timeout_ms: int = 15000,
+) -> Optional[Dict[str, Any]]:
+    session_page = None
+    try:
+        session_page = context.new_page()
+        try:
+            session_page.goto(
+                "https://chatgpt.com/api/auth/session",
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+        except Exception as exc:
+            try:
+                emitter.warn(f"浏览器 session payload 打开会话接口失败: {exc}", step="get_token")
+            except Exception:
+                pass
+            return None
+        try:
+            _wait_for_load(session_page, timeout_ms=min(timeout_ms, 2500))
+        except Exception:
+            pass
+        raw_text = _get_body_raw_text(session_page).strip()
+        if not raw_text or "{" not in raw_text:
+            try:
+                emitter.warn(
+                    f"浏览器 session payload 未拿到有效 JSON: {_preview_text(raw_text, 180) or '-'}",
+                    step="get_token",
+                )
+            except Exception:
+                pass
+            return None
+        try:
+            session_json = json.loads(raw_text)
+        except Exception as exc:
+            try:
+                emitter.warn(f"浏览器 session payload JSON 解析失败: {exc}", step="get_token")
+            except Exception:
+                pass
+            return None
+        if not isinstance(session_json, dict) or not session_json:
+            return None
+        session_payload = dict(session_json)
+        access_token = str(
+            session_json.get("accessToken")
+            or session_json.get("access_token")
+            or ((session_json.get("data") or {}).get("accessToken") if isinstance(session_json.get("data"), dict) else "")
+            or ((session_json.get("data") or {}).get("access_token") if isinstance(session_json.get("data"), dict) else "")
+            or ""
+        ).strip()
+        if access_token:
+            session_payload["access_token"] = access_token
+        refresh_token = str(
+            session_json.get("refreshToken")
+            or session_json.get("refresh_token")
+            or ""
+        ).strip()
+        if refresh_token:
+            session_payload["refresh_token"] = refresh_token
+        session_token = _extract_browser_context_session_token(context)
+        if session_token:
+            session_payload["session_token"] = session_token
+        user_payload = session_json.get("user") if isinstance(session_json.get("user"), dict) else {}
+        account_payload = session_json.get("account") if isinstance(session_json.get("account"), dict) else {}
+        if user_payload and not session_payload.get("email"):
+            session_payload["email"] = str(user_payload.get("email") or "").strip()
+        if not str(session_payload.get("email") or "").strip() and str(fallback_email or "").strip():
+            session_payload["email"] = str(fallback_email or "").strip()
+        account_id = str(
+            session_json.get("account_id")
+            or session_json.get("chatgpt_account_id")
+            or account_payload.get("id")
+            or ""
+        ).strip()
+        if account_id:
+            session_payload["account_id"] = account_id
+            session_payload["chatgpt_account_id"] = account_id
+        expires_value = str(session_json.get("expires") or session_json.get("expires_at") or "").strip()
+        if expires_value:
+            session_payload["expires_at"] = expires_value
+            session_payload["expired"] = expires_value
+        try:
+            emitter.info(
+                "浏览器 session payload 诊断: "
+                + f"top_keys={','.join(sorted(str(k) for k in session_json.keys())[:12]) or '-'}, "
+                + f"user.email={str(user_payload.get('email') or '').strip() or '-'}, "
+                + f"fallback_email={str(fallback_email or '').strip() or '-'}, "
+                + f"account.id={str(account_payload.get('id') or '').strip() or '-'}, "
+                + f"access_token={'有' if access_token else '无'}, "
+                + f"refresh_token={'有' if refresh_token else '无'}, "
+                + f"session_token={'有' if session_token else '无'}",
+                step="get_token",
+            )
+        except Exception:
+            pass
+        return session_payload
     finally:
         if session_page is not None:
             try:
@@ -2080,7 +2223,18 @@ def _is_session_ended_login_shell_page(url: str, body_text: str, page: Any) -> b
 
 def _is_manual_v2_phone_stage_page(url: str, body_text: str, page: Any) -> bool:
     url_lower = str(url or "").lower()
-    if "chatgpt.com" in url_lower:
+    body_lower = str(body_text or "").lower()
+    if (
+        "email-verification" in url_lower
+        or "add-email" in url_lower
+        or "callback" in url_lower
+        or "consent" in url_lower
+        or "workspace" in url_lower
+    ):
+        return False
+    if "check your inbox" in body_lower or "验证码" in body_text or "verification code" in body_lower:
+        return False
+    if "chatgpt.com/auth/login_with" in url_lower:
         return True
     if _is_phone_verification_page(url, body_text, page):
         return True
@@ -2091,6 +2245,19 @@ def _is_manual_v2_phone_stage_page(url: str, body_text: str, page: Any) -> bool:
     if _is_phone_input_page(url, body_text, page):
         return True
     return False
+
+
+def _is_manual_v2_login_phone_input_stage(url: str, body_text: str, page: Any) -> bool:
+    url_lower = str(url or "").lower()
+    if (
+        "email-verification" in url_lower
+        or "add-email" in url_lower
+        or "callback" in url_lower
+        or _is_contact_verification_page(url, body_text, page)
+        or _is_create_account_password_page(url, body_text, page)
+    ):
+        return False
+    return _is_phone_input_page(url, body_text, page)
 
 
 def _is_otp_page(url: str, body_text: str, page: Any) -> bool:
@@ -2802,6 +2969,8 @@ def run_browser_registration(
     generate_oauth_url_func: Callable[[], Any],
     generate_login_oauth_url_func: Callable[[], Any],
     submit_callback_func: Callable[..., str],
+    exchange_callback_payload_func: Optional[Callable[..., Dict[str, Any]]] = None,
+    build_token_result_func: Optional[Callable[..., str]] = None,
     build_browser_session_token_func: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
     fallback_wait_for_otp_func: Optional[Callable[..., str]] = None,
     random_password_func: Optional[Callable[[int], str]] = None,
@@ -2869,6 +3038,7 @@ def run_browser_registration(
     otp_resend_attempts = 0
     wired_page_ids: set[int] = set()
     recent_network_events = deque(maxlen=40)
+    manual_v2_login_oauth = None
     manual_v2_phone_number = ""
     manual_v2_wait_phone_logged = False
     manual_v2_wait_contact_logged = False
@@ -2900,8 +3070,14 @@ def run_browser_registration(
         if value and "code=" in value and "state=" in value:
             callback_state["url"] = value
 
+    def _active_oauth_start() -> Any:
+        if is_manual_v2_mode and manual_v2_login_flow_started and manual_v2_login_oauth is not None:
+            return manual_v2_login_oauth
+        return current_oauth
+
     def _extract_callback_url_from_page(current_url: str, body_text: str) -> str:
-        redirect_base = str(current_oauth.redirect_uri or "").strip()
+        oauth_start = _active_oauth_start()
+        redirect_base = str(getattr(oauth_start, "redirect_uri", "") or "").strip()
         if not redirect_base:
             return ""
         direct_url = str(current_url or "").strip()
@@ -2920,7 +3096,8 @@ def run_browser_registration(
     def _handle_route(route: Any) -> None:
         request = route.request
         request_url = str(getattr(request, "url", "") or "").strip()
-        if request_url.startswith(str(current_oauth.redirect_uri or "").strip()):
+        oauth_start = _active_oauth_start()
+        if request_url.startswith(str(getattr(oauth_start, "redirect_uri", "") or "").strip()):
             _record_callback(request_url)
             route.fulfill(
                 status=200,
@@ -3235,19 +3412,21 @@ def run_browser_registration(
             emitter=emitter,
             build_browser_session_token_func=build_browser_session_token_func,
             referer_url=current_url,
+            fallback_email=ctx.email,
         )
 
     def _restart_current_page_oauth_flow(*, target_phase: str, reason: str) -> None:
-        nonlocal current_phase, current_oauth, deadline
+        nonlocal current_phase, current_oauth, deadline, manual_v2_login_oauth
         reason_text = str(reason or "").strip() or "浏览器流程需要重新拉起 OAuth"
         emitter.warn(reason_text, step="oauth_init")
         _reset_browser_phase_state(clear_profile=True)
         current_phase = "login" if str(target_phase or "").strip().lower() == "login" else "signup"
-        current_oauth = (
-            generate_login_oauth_url_func()
-            if current_phase == "login"
-            else generate_oauth_url_func()
-        )
+        if current_phase == "login":
+            current_oauth = generate_login_oauth_url_func()
+            manual_v2_login_oauth = current_oauth
+        else:
+            current_oauth = generate_oauth_url_func()
+            manual_v2_login_oauth = None
         deadline = time.time() + max(90, int(cfg["browser_timeout_ms"] / 1000) + 60)
         _start_oauth_flow(page, current_oauth, current_phase)
 
@@ -3303,6 +3482,7 @@ def run_browser_registration(
 
     def _prepare_manual_v2_login_flow(reason: str) -> None:
         nonlocal current_phase, email_submitted, password_submitted, profile_submitted
+        nonlocal current_oauth, manual_v2_login_oauth
         nonlocal manual_v2_contact_seen, manual_v2_wait_contact_logged
         nonlocal manual_v2_login_flow_started, manual_v2_phone_entry_clicked
         nonlocal manual_v2_login_phone_prefilled, manual_v2_login_password_prefilled
@@ -3347,16 +3527,21 @@ def run_browser_registration(
         manual_v2_reset_password_flow_started = False
         manual_v2_reset_password_continue_clicked = False
         emitter.info(reason, step="oauth_init")
-        previous_page = page
-        new_page = context.new_page()
-        _wire_page_once(new_page)
-        page = new_page
+        current_oauth = generate_login_oauth_url_func()
+        manual_v2_login_oauth = current_oauth
+        emitter.info(
+            "浏览器模式2 正在打开标准 OAuth 授权地址，进入第二步手机登录链路...",
+            step="oauth_init",
+        )
         try:
-            if previous_page is not None and _page_is_usable(previous_page):
-                previous_page.close()
+            emitter.info(
+                "浏览器模式2 第二步登录 OAuth 授权地址: "
+                + _mask_secret(str(getattr(current_oauth, "auth_url", "") or ""), head=160, tail=24),
+                step="oauth_init",
+            )
         except Exception:
             pass
-        page.goto("https://auth.openai.com/log-in", wait_until="domcontentloaded", timeout=cfg["browser_timeout_ms"])
+        _start_oauth_flow(page, current_oauth, "login")
         _wait_for_load(page, timeout_ms=2500)
         current_url, body_text = _describe_page(page)
         if _is_session_ended_login_shell_page(current_url, body_text, page):
@@ -3481,9 +3666,15 @@ def run_browser_registration(
 
         try:
             if is_manual_v2_mode:
-                emitter.info("浏览器模式2 启动后先打开 ChatGPT 首页，等待人工输入手机号开始注册...", step="oauth_init")
-                page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=cfg["browser_timeout_ms"])
+                emitter.info("浏览器模式2 已恢复为完整注册流程：先打开 ChatGPT 首页执行步骤1，再衔接步骤2手机登录与补邮箱流程...", step="oauth_init")
+                page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=cfg["browser_timeout_ms"])
                 _wait_for_load(page, timeout_ms=2500)
+                emitter.info(
+                    f"浏览器模式2 步骤1首页落点: {_mask_secret(page.url, head=48, tail=12)}",
+                    step="oauth_init",
+                )
+                if not cfg["browser_headless"]:
+                    emitter.info("当前为可见浏览器模式，可直接观察 ChatGPT 首页到手机注册入口的切换过程", step="oauth_init")
             else:
                 _start_oauth_flow(page, current_oauth, current_phase)
 
@@ -3497,18 +3688,85 @@ def run_browser_registration(
                     return None
 
                 if callback_state["url"]:
-                    if is_manual_v2_mode and not manual_v2_oauth_resumed:
-                        emitter.info("浏览器模式2 当前仍处于注册前半段，忽略提前出现的 callback，等待进入后续授权流程...", step="get_token")
+                    callback_url_value = str(callback_state["url"] or "").strip()
+                    callback_is_real = ("code=" in callback_url_value and "state=" in callback_url_value)
+                    oauth_for_exchange = _active_oauth_start()
+                    if is_manual_v2_mode and not manual_v2_oauth_resumed and not callback_is_real:
+                        emitter.info("浏览器模式2 当前仍处于注册前半段，忽略提前出现的 callback 线索，等待进入后续授权流程...", step="get_token")
                         callback_state["url"] = ""
                     else:
-                        emitter.info("已在浏览器中捕获 OAuth callback，准备交换 Token...", step="get_token")
-                        token_json = submit_callback_func(
-                            callback_url=callback_state["url"],
-                            code_verifier=current_oauth.code_verifier,
-                            redirect_uri=current_oauth.redirect_uri,
-                            expected_state=current_oauth.state,
-                            proxy=ctx.proxy or None,
-                        )
+                        if is_manual_v2_mode and not manual_v2_oauth_resumed and callback_is_real:
+                            emitter.info("浏览器模式2 已捕获真实 OAuth callback，直接使用当前登录链路的 PKCE 参数兑换 Token...", step="get_token")
+                            manual_v2_oauth_resumed = True
+                        else:
+                            emitter.info("已在浏览器中捕获 OAuth callback，准备交换 Token...", step="get_token")
+                        try:
+                            if is_manual_v2_mode and callback_is_real and callable(exchange_callback_payload_func) and callable(build_token_result_func):
+                                raw_token_payload = exchange_callback_payload_func(
+                                    callback_url=callback_url_value,
+                                    code_verifier=oauth_for_exchange.code_verifier,
+                                    redirect_uri=oauth_for_exchange.redirect_uri,
+                                    expected_state=oauth_for_exchange.state,
+                                    proxy=ctx.proxy or None,
+                                )
+                                session_payload = _fetch_browser_session_payload(
+                                    context=context,
+                                    emitter=emitter,
+                                    referer_url=current_url or callback_url_value,
+                                    fallback_email=ctx.email,
+                                ) or {}
+                                token_json = build_token_result_func(raw_token_payload, session_payload)
+                            else:
+                                token_json = submit_callback_func(
+                                    callback_url=callback_url_value,
+                                    code_verifier=oauth_for_exchange.code_verifier,
+                                    redirect_uri=oauth_for_exchange.redirect_uri,
+                                    expected_state=oauth_for_exchange.state,
+                                    proxy=ctx.proxy or None,
+                                )
+                        except Exception as exc:
+                            if is_manual_v2_mode and "state mismatch" in str(exc).lower() and callback_is_real:
+                                parsed_cb = urllib.parse.urlparse(callback_url_value)
+                                callback_state_value = (
+                                    urllib.parse.parse_qs(parsed_cb.query).get("state", [""])[0] or ""
+                                ).strip()
+                                emitter.warn(
+                                    "浏览器模式2 callback 首次兑换触发 state mismatch，准备使用 callback 中的实际 state 再试一次。"
+                                    + f" expected={_mask_secret(oauth_for_exchange.state, head=10, tail=8)},"
+                                    + f" callback={_mask_secret(callback_state_value, head=10, tail=8)}",
+                                    step="get_token",
+                                )
+                                if callable(exchange_callback_payload_func) and callable(build_token_result_func):
+                                    raw_token_payload = exchange_callback_payload_func(
+                                        callback_url=callback_url_value,
+                                        code_verifier=oauth_for_exchange.code_verifier,
+                                        redirect_uri=oauth_for_exchange.redirect_uri,
+                                        expected_state=(callback_state_value or oauth_for_exchange.state),
+                                        proxy=ctx.proxy or None,
+                                    )
+                                    session_payload = _fetch_browser_session_payload(
+                                        context=context,
+                                        emitter=emitter,
+                                        referer_url=current_url or callback_url_value,
+                                        fallback_email=ctx.email,
+                                    ) or {}
+                                    token_json = build_token_result_func(raw_token_payload, session_payload)
+                                else:
+                                    token_json = submit_callback_func(
+                                        callback_url=callback_url_value,
+                                        code_verifier=oauth_for_exchange.code_verifier,
+                                        redirect_uri=oauth_for_exchange.redirect_uri,
+                                        expected_state=(callback_state_value or oauth_for_exchange.state),
+                                        proxy=ctx.proxy or None,
+                                    )
+                            elif "token result missing email/account_id" in str(exc).lower():
+                                emitter.warn(
+                                    "浏览器模式2 token 交换已完成，但返回结果缺少 email/account_id；请查看上方 session payload/组装诊断日志继续排查。",
+                                    step="get_token",
+                                )
+                                raise
+                            else:
+                                raise
                         emitter.success(
                             "浏览器" + ("二次登录" if current_phase == "login" else "注册") + "获取 Token 成功",
                             step="get_token",
@@ -3528,10 +3786,14 @@ def run_browser_registration(
                 otp_route_locked = ("email-verification" in current_url_lower or "email-otp" in current_url_lower)
                 callback_candidate = _extract_callback_url_from_page(current_url, body_text)
                 if callback_candidate and not callback_state["url"]:
-                    if is_manual_v2_mode and not manual_v2_oauth_resumed:
+                    callback_is_real = ("code=" in callback_candidate and "state=" in callback_candidate)
+                    if is_manual_v2_mode and not manual_v2_oauth_resumed and not callback_is_real:
                         emitter.info("浏览器模式2 注册前半段检测到 callback 线索，暂不处理，等待后续授权流程重新拉起...", step="get_token")
                     else:
-                        emitter.info("已从页面跳转/错误页文本中提取到 OAuth callback，准备继续交换 Token...", step="get_token")
+                        if is_manual_v2_mode and not manual_v2_oauth_resumed and callback_is_real:
+                            emitter.info("浏览器模式2 已从页面提取到真实 OAuth callback，准备直接兑换 Token...", step="get_token")
+                        else:
+                            emitter.info("已从页面跳转/错误页文本中提取到 OAuth callback，准备继续交换 Token...", step="get_token")
                         _record_callback(callback_candidate)
                         continue
 
@@ -3644,6 +3906,33 @@ def run_browser_registration(
                             )
                     else:
                         manual_v2_password_page_logged = False
+
+                    if (
+                        not manual_v2_login_flow_started
+                        and not manual_v2_contact_seen
+                        and not is_create_password_page
+                        and not _is_login_password_page(current_url, body_text, page)
+                        and _is_phone_input_page(current_url, body_text, page)
+                    ):
+                        if _manual_phone_input_ready(page):
+                            if not manual_v2_wait_phone_logged or manual_v2_wait_phone_last_url != current_url + "#ready":
+                                manual_v2_wait_phone_logged = True
+                                manual_v2_wait_phone_last_url = current_url + "#ready"
+                                emitter.info(
+                                    "浏览器模式2 检测到你已输入步骤1手机号，请你手动点击继续；提交后程序会自动接管后续流程...",
+                                    step="add_phone",
+                                )
+                            _sleep_with_page(page, 800)
+                            continue
+                        if not manual_v2_wait_phone_logged or manual_v2_wait_phone_last_url != current_url:
+                            manual_v2_wait_phone_logged = True
+                            manual_v2_wait_phone_last_url = current_url
+                            emitter.info(
+                                "浏览器模式2 已进入步骤1手机号输入页，请先手动输入手机号；输完后请你手动点击继续...",
+                                step="add_phone",
+                            )
+                        _sleep_with_page(page, 800)
+                        continue
 
                     if (
                         not manual_v2_login_flow_started
@@ -4049,6 +4338,15 @@ def run_browser_registration(
 
                     if manual_v2_login_flow_started and manual_v2_phone_entry_clicked and not manual_v2_login_phone_submitted:
                         _extend_manual_v2_deadline(1800)
+                        if not _is_manual_v2_login_phone_input_stage(current_url, body_text, page):
+                            if (
+                                _is_add_email_page(current_url, body_text, page)
+                                or _is_otp_page(current_url, body_text, page)
+                                or _is_login_with_bridge_page(current_url, body_text)
+                            ):
+                                manual_v2_wait_phone_logged = False
+                            _sleep_with_page(page, 300)
+                            continue
                         phone_input = _first_visible_locator(
                             page,
                             [
@@ -4067,9 +4365,17 @@ def run_browser_registration(
                                     ["phone", "mobile", "手机号", "电话", "tel"],
                                 )
                             if not manual_v2_phone_number:
-                                emitter.info("浏览器模式2 正等待读取已输入的手机号，再自动提交登录...", step="create_email")
+                                if not manual_v2_wait_phone_logged or manual_v2_wait_phone_last_url != current_url:
+                                    manual_v2_wait_phone_logged = True
+                                    manual_v2_wait_phone_last_url = current_url
+                                    emitter.info(
+                                        "浏览器模式2 当前位于手机号输入页，正等待读取你已输入的手机号，再自动提交登录...",
+                                        step="create_email",
+                                    )
                                 _sleep_with_page(page, 800)
                                 continue
+                            manual_v2_wait_phone_logged = False
+                            manual_v2_wait_phone_last_url = current_url
                             if not _write_text_to_locator(phone_input, manual_v2_phone_number):
                                 raise RuntimeError("浏览器模式2 填写手机号失败")
                             if not _click_primary_action(page, ["Continue", "Next", "继续", "下一步"], allow_generic_fallback=True):
@@ -4378,6 +4684,10 @@ def run_browser_registration(
                             step="create_email",
                         )
                         emitter.info(
+                            "当前阶段仅等待页面从密码页跳到 add-email / email-verification；邮箱验证码轮询会在进入 email-verification 页面后才启动。",
+                            step="create_email",
+                        )
+                        emitter.info(
                             "第二步密码提交后会话诊断: cookies="
                             + _browser_cookie_presence_summary(context)
                             + f", current_url={_mask_secret(current_url, head=56, tail=12)}",
@@ -4434,6 +4744,20 @@ def run_browser_registration(
                     )
                     continue
 
+                if (
+                    is_manual_v2_mode
+                    and manual_v2_login_flow_started
+                    and not email_submitted
+                    and "email-verification" in current_url_lower
+                ):
+                    email_submitted = True
+                    manual_v2_post_login_pending_email = False
+                    manual_v2_bridge_entered_at = 0.0
+                    manual_v2_bridge_logged = False
+                    emitter.info(
+                        "浏览器模式2 检测到页面已直接进入 email-verification，自动同步为“邮箱已提交”状态，继续进入验证码阶段...",
+                        step="send_otp",
+                    )
                 otp_visible = _is_otp_page(current_url, body_text, page)
                 if is_manual_v2_mode and (not manual_v2_login_flow_started or not email_submitted):
                     otp_visible = False
@@ -4769,12 +5093,10 @@ def run_browser_registration(
                     manual_v2_post_login_pending_email = False
                     manual_v2_bridge_entered_at = 0.0
                     manual_v2_bridge_logged = False
-                    emitter.info("浏览器模式2 已完成手机号登录与邮箱绑定，正在拉起 OAuth 登录流程获取 Token...", step="oauth_init")
-                    _restart_current_page_oauth_flow(
-                        target_phase="login",
-                        reason="浏览器模式2 已完成手机号登录与邮箱绑定，切换到 OAuth 登录流程获取 Token",
+                    emitter.info(
+                        "浏览器模式2 已进入最终授权阶段，继续沿用当前这条 OAuth/PKCE 上下文完成授权与回调，不再重新拉起新的 OAuth。",
+                        step="oauth_init",
                     )
-                    continue
 
                 if any(keyword in body_lower for keyword in ("authorize", "workspace", "organization", "allow access")):
                     emitter.info("浏览器正在尝试确认授权...", step="workspace")

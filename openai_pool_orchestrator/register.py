@@ -1652,6 +1652,60 @@ def submit_callback_url(
     return _build_token_result(token_resp)
 
 
+def exchange_callback_to_token_payload(
+    *,
+    callback_url: str,
+    expected_state: str,
+    code_verifier: str,
+    redirect_uri: str = DEFAULT_REDIRECT_URI,
+    proxy: str = "",
+) -> Dict[str, Any]:
+    cb = _parse_callback_url(callback_url)
+    if cb["error"]:
+        desc = cb["error_description"]
+        raise RuntimeError(f"oauth error: {cb['error']}: {desc}".strip())
+    if not cb["code"]:
+        raise ValueError("callback url missing ?code=")
+    if not cb["state"]:
+        raise ValueError("callback url missing ?state=")
+    if cb["state"] != expected_state:
+        raise ValueError("state mismatch")
+
+    return _post_form(
+        TOKEN_URL,
+        {
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "code": cb["code"],
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
+        },
+        proxy=proxy,
+    )
+
+
+def build_token_result_from_payloads(*payloads: Dict[str, Any]) -> str:
+    merged: Dict[str, Any] = {}
+    for item in payloads:
+        if not isinstance(item, dict) or not item:
+            continue
+        for key, value in item.items():
+            if key not in merged:
+                merged[key] = value
+                continue
+            existing = merged.get(key)
+            if isinstance(existing, dict) and isinstance(value, dict):
+                combined = dict(existing)
+                for sub_key, sub_value in value.items():
+                    if sub_key not in combined or str(combined.get(sub_key) or "").strip() == "":
+                        combined[sub_key] = sub_value
+                merged[key] = combined
+                continue
+            if str(existing or "").strip() == "" and str(value or "").strip() != "":
+                merged[key] = value
+    return _build_token_result(merged)
+
+
 # ==========================================
 # 核心注册逻辑
 # ==========================================
@@ -2256,8 +2310,18 @@ def run(
         if session_token:
             session_payload["session_token"] = session_token
         user_payload = session_json.get("user") if isinstance(session_json.get("user"), dict) else {}
+        account_payload = session_json.get("account") if isinstance(session_json.get("account"), dict) else {}
         if user_payload and not session_payload.get("email"):
             session_payload["email"] = str(user_payload.get("email") or "").strip()
+        account_id = str(
+            session_json.get("account_id")
+            or session_json.get("chatgpt_account_id")
+            or account_payload.get("id")
+            or ""
+        ).strip()
+        if account_id:
+            session_payload["account_id"] = account_id
+            session_payload["chatgpt_account_id"] = account_id
         expires_value = str(session_json.get("expires") or session_json.get("expires_at") or "").strip()
         if expires_value:
             session_payload["expires_at"] = expires_value
@@ -2267,7 +2331,19 @@ def run(
             result = _build_token_result(session_payload)
         except Exception as exc:
             if verbose_auth_logs:
-                emitter.warn(f"{source_label} 组装 Token 失败: {exc}", step="get_token")
+                normalized_preview = normalize_token_data(session_payload, default_type="codex")
+                emitter.warn(
+                    f"{source_label} 组装 Token 失败: {exc}; "
+                    + f"top_keys={','.join(sorted(str(k) for k in session_json.keys())[:12]) or '-'}, "
+                    + f"user.email={str(user_payload.get('email') or '').strip() or '-'}, "
+                    + f"account.id={str(account_payload.get('id') or '').strip() or '-'}, "
+                    + f"normalized.email={str(normalized_preview.get('email') or '').strip() or '-'}, "
+                    + f"normalized.account_id={_mask_secret(normalized_preview.get('account_id') or normalized_preview.get('chatgpt_account_id') or '', head=12, tail=6) or '-'}, "
+                    + f"id_token={'有' if str(session_payload.get('id_token') or '').strip() else '无'}, "
+                    + f"access_token={'有' if access_token else '无'}, "
+                    + f"session_token={'有' if session_token else '无'}",
+                    step="get_token",
+                )
             return None
 
         try:
@@ -3670,11 +3746,17 @@ def run(
                     user_agent=fingerprint_profile.user_agent,
                     fingerprint_profile=fingerprint_profile,
                     generate_oauth_url_func=lambda: generate_oauth_url(screen_hint="signup"),
-                    generate_login_oauth_url_func=lambda: generate_oauth_url(
-                        screen_hint="",
-                        login_hint=email,
+                    generate_login_oauth_url_func=(
+                        (lambda: generate_oauth_url(screen_hint="", prompt="", login_hint=""))
+                        if str(normalized_browser_config.get("register_mode") or "").strip().lower() == "browser_manual_v2"
+                        else (lambda: generate_oauth_url(
+                            screen_hint="",
+                            login_hint=email,
+                        ))
                     ),
                     submit_callback_func=submit_callback_url,
+                    exchange_callback_payload_func=exchange_callback_to_token_payload,
+                    build_token_result_func=build_token_result_from_payloads,
                     build_browser_session_token_func=lambda session_payload: _build_token_from_chatgpt_session_payload(
                         session_payload,
                         source_label="浏览器 session fast path",
