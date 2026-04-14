@@ -44,6 +44,22 @@ def _auth_claims(payload: Dict[str, Any]) -> Dict[str, Any]:
     return auth if isinstance(auth, dict) else {}
 
 
+def _default_org_id(claims: Dict[str, Any]) -> str:
+    organizations = claims.get("organizations") if isinstance(claims, dict) else []
+    if not isinstance(organizations, list):
+        return ""
+    first_id = ""
+    for item in organizations:
+        if not isinstance(item, dict):
+            continue
+        org_id = _first_non_empty_str(item.get("id"))
+        if not first_id and org_id:
+            first_id = org_id
+        if org_id and bool(item.get("is_default")):
+            return org_id
+    return first_id
+
+
 def _epoch_from_value(value: Any) -> int:
     if value is None:
         return 0
@@ -167,9 +183,21 @@ def normalize_token_data(
     )
     plan_type = _first_non_empty_str(
         source.get("plan_type"),
+        source.get("chatgpt_plan_type"),
         credentials.get("plan_type"),
         id_auth.get("plan_type"),
+        id_auth.get("chatgpt_plan_type"),
         access_auth.get("plan_type"),
+        access_auth.get("chatgpt_plan_type"),
+    )
+    organization_id = _first_non_empty_str(
+        source.get("organization_id"),
+        credentials.get("organization_id"),
+        id_auth.get("organization_id"),
+        access_auth.get("organization_id"),
+        access_auth.get("poid"),
+        _default_org_id(id_auth),
+        _default_org_id(access_auth),
     )
 
     expires_epoch = max(
@@ -226,6 +254,9 @@ def normalize_token_data(
         normalized["chatgpt_user_id"] = chatgpt_user_id
     if plan_type:
         normalized["plan_type"] = plan_type
+        normalized["chatgpt_plan_type"] = plan_type
+    if organization_id:
+        normalized["organization_id"] = organization_id
     if expires_at:
         normalized["expires_at"] = expires_at
         normalized["expired"] = expires_at
@@ -252,6 +283,9 @@ def normalize_token_data(
         normalized_credentials["chatgpt_user_id"] = chatgpt_user_id
     if plan_type:
         normalized_credentials["plan_type"] = plan_type
+        normalized_credentials["chatgpt_plan_type"] = plan_type
+    if organization_id:
+        normalized_credentials["organization_id"] = organization_id
     if expires_epoch > 0:
         normalized_credentials["expires_at"] = expires_epoch
     if last_refresh:

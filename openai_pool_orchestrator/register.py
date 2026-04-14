@@ -44,9 +44,9 @@ except ImportError:
         generate_fingerprint_profile,
     )
 try:
-    from .token_compat import normalize_token_data
+    from .token_compat import AUTH_CLAIM_KEY, decode_jwt_payload, normalize_token_data
 except ImportError:
-    from token_compat import normalize_token_data  # type: ignore
+    from token_compat import AUTH_CLAIM_KEY, decode_jwt_payload, normalize_token_data  # type: ignore
 
 # ==========================================
 # 日志事件发射器
@@ -1505,6 +1505,297 @@ def _post_form(
         ) from exc
 
 
+CHATGPT_ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+
+
+def _first_non_empty_str(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _auth_claims(payload: Dict[str, Any]) -> Dict[str, Any]:
+    auth = payload.get(AUTH_CLAIM_KEY) if isinstance(payload, dict) else {}
+    return auth if isinstance(auth, dict) else {}
+
+
+def _extract_default_org_id(organizations: Any) -> str:
+    if not isinstance(organizations, list):
+        return ""
+    first_id = ""
+    for item in organizations:
+        if not isinstance(item, dict):
+            continue
+        org_id = str(item.get("id") or "").strip()
+        if not first_id and org_id:
+            first_id = org_id
+        if org_id and bool(item.get("is_default")):
+            return org_id
+    return first_id
+
+
+def _extract_org_id_from_token_payload(token_payload: Dict[str, Any]) -> str:
+    normalized = normalize_token_data(token_payload, default_type="codex")
+    access_payload = decode_jwt_payload(normalized.get("access_token"))
+    id_payload = decode_jwt_payload(normalized.get("id_token"))
+    access_auth = _auth_claims(access_payload)
+    id_auth = _auth_claims(id_payload)
+    return _first_non_empty_str(
+        normalized.get("organization_id"),
+        token_payload.get("organization_id"),
+        access_auth.get("poid"),
+        access_auth.get("organization_id"),
+        id_auth.get("organization_id"),
+        _extract_default_org_id(id_auth.get("organizations")),
+        _extract_default_org_id(access_auth.get("organizations")),
+    )
+
+
+def _build_accounts_check_candidate(raw: Any, *, org_hint: str = "") -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    account_payload = raw.get("account") if isinstance(raw.get("account"), dict) else {}
+    user_payload = raw.get("user") if isinstance(raw.get("user"), dict) else {}
+    owner_payload = raw.get("owner") if isinstance(raw.get("owner"), dict) else {}
+    entitlement_payload = raw.get("entitlement") if isinstance(raw.get("entitlement"), dict) else {}
+    organization_payload = raw.get("organization") if isinstance(raw.get("organization"), dict) else {}
+    organization_id = _first_non_empty_str(
+        raw.get("organization_id"),
+        raw.get("org_id"),
+        organization_payload.get("id"),
+        account_payload.get("organization_id"),
+        account_payload.get("org_id"),
+        org_hint,
+    )
+    account_id = _first_non_empty_str(
+        raw.get("chatgpt_account_id"),
+        raw.get("account_id"),
+        account_payload.get("chatgpt_account_id"),
+        account_payload.get("account_id"),
+        account_payload.get("id"),
+    )
+    email = _first_non_empty_str(
+        raw.get("email"),
+        user_payload.get("email"),
+        owner_payload.get("email"),
+        account_payload.get("email"),
+    ).lower()
+    plan_type = _first_non_empty_str(
+        raw.get("plan_type"),
+        account_payload.get("plan_type"),
+        entitlement_payload.get("subscription_plan"),
+    )
+    subscription_expires_at = _first_non_empty_str(
+        raw.get("subscription_expires_at"),
+        entitlement_payload.get("expires_at"),
+    )
+    is_default = bool(
+        raw.get("is_default")
+        or account_payload.get("is_default")
+        or organization_payload.get("is_default")
+    )
+    return {
+        "organization_id": organization_id,
+        "account_id": account_id,
+        "email": email,
+        "plan_type": plan_type,
+        "subscription_expires_at": subscription_expires_at,
+        "is_default": is_default,
+    }
+
+
+def _extract_accounts_check_payload(
+    response_payload: Dict[str, Any],
+    *,
+    preferred_org_id: str = "",
+    fallback_email: str = "",
+) -> Dict[str, Any]:
+    if not isinstance(response_payload, dict) or not response_payload:
+        return {}
+
+    preferred_org = str(preferred_org_id or "").strip()
+    fallback_email_value = str(fallback_email or "").strip().lower()
+    candidates: list[Dict[str, Any]] = []
+    root_candidate = _build_accounts_check_candidate(response_payload)
+    if any(root_candidate.get(key) for key in ("account_id", "email", "plan_type", "organization_id")):
+        candidates.append(root_candidate)
+
+    accounts_payload = response_payload.get("accounts")
+    if isinstance(accounts_payload, dict):
+        for org_key, acct_raw in accounts_payload.items():
+            candidate = _build_accounts_check_candidate(acct_raw, org_hint=str(org_key or "").strip())
+            if candidate:
+                candidates.append(candidate)
+    elif isinstance(accounts_payload, list):
+        for acct_raw in accounts_payload:
+            candidate = _build_accounts_check_candidate(acct_raw)
+            if candidate:
+                candidates.append(candidate)
+
+    selected: Dict[str, Any] = {}
+    if preferred_org:
+        for candidate in candidates:
+            if str(candidate.get("organization_id") or "").strip() == preferred_org:
+                selected = candidate
+                break
+    if not selected:
+        for candidate in candidates:
+            if bool(candidate.get("is_default")):
+                selected = candidate
+                break
+    if not selected:
+        for candidate in candidates:
+            if str(candidate.get("account_id") or "").strip():
+                selected = candidate
+                break
+    if not selected and candidates:
+        selected = candidates[0]
+
+    result: Dict[str, Any] = {}
+    account_id = _first_non_empty_str(
+        selected.get("account_id"),
+        root_candidate.get("account_id"),
+    )
+    email = _first_non_empty_str(
+        selected.get("email"),
+        root_candidate.get("email"),
+        fallback_email_value,
+    ).lower()
+    plan_type = _first_non_empty_str(
+        selected.get("plan_type"),
+        root_candidate.get("plan_type"),
+    )
+    organization_id = _first_non_empty_str(
+        selected.get("organization_id"),
+        root_candidate.get("organization_id"),
+        preferred_org,
+    )
+    subscription_expires_at = _first_non_empty_str(
+        selected.get("subscription_expires_at"),
+        root_candidate.get("subscription_expires_at"),
+    )
+    if account_id:
+        result["account_id"] = account_id
+        result["chatgpt_account_id"] = account_id
+    if email:
+        result["email"] = email
+    if plan_type:
+        result["plan_type"] = plan_type
+    if organization_id:
+        result["organization_id"] = organization_id
+    if subscription_expires_at:
+        result["subscription_expires_at"] = subscription_expires_at
+    result["_accounts_check_meta"] = {
+        "accounts_count": len(candidates),
+        "preferred_org_id": preferred_org,
+        "selected_org_id": organization_id,
+        "selected_account_id": account_id,
+        "selected_email": email,
+    }
+    return result
+
+
+def _fetch_chatgpt_account_payload_by_access_token(
+    *,
+    access_token: str,
+    proxy: str = "",
+    fallback_email: str = "",
+    emitter: Any = None,
+) -> Dict[str, Any]:
+    token_value = str(access_token or "").strip()
+    if not token_value:
+        return {}
+    normalized_proxy = _normalize_proxy_value(proxy)
+    proxies = _to_proxies_dict(normalized_proxy)
+    access_payload = decode_jwt_payload(token_value)
+    access_auth = _auth_claims(access_payload)
+    preferred_org_id = _first_non_empty_str(
+        access_auth.get("poid"),
+        access_auth.get("organization_id"),
+        _extract_default_org_id(access_auth.get("organizations")),
+    )
+    headers = {
+        "Authorization": f"Bearer {token_value}",
+        "Accept": "application/json",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+        "User-Agent": _current_user_agent(),
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-dest": "empty",
+    }
+    try:
+        resp = _call_with_http_fallback(
+            requests.get,
+            CHATGPT_ACCOUNTS_CHECK_URL,
+            headers=headers,
+            proxies=proxies,
+            http_version=DEFAULT_HTTP_VERSION,
+            impersonate=_current_impersonate(),
+            timeout=20,
+        )
+    except Exception as exc:
+        if emitter is not None:
+            try:
+                emitter.warn(
+                    f"access_token 直连 accounts/check 失败: {exc}",
+                    step="get_token",
+                )
+            except Exception:
+                pass
+        return {}
+    body_text = str(getattr(resp, "text", "") or "")
+    if int(getattr(resp, "status_code", 0) or 0) != 200:
+        if emitter is not None:
+            try:
+                emitter.warn(
+                    "access_token 直连 accounts/check 非 200: "
+                    + f"status={getattr(resp, 'status_code', 0)}, body={_preview_text(body_text, 220) or '-'}",
+                    step="get_token",
+                )
+            except Exception:
+                pass
+        return {}
+    try:
+        response_payload = resp.json() or {}
+    except Exception as exc:
+        if emitter is not None:
+            try:
+                emitter.warn(
+                    f"access_token 直连 accounts/check JSON 解析失败: {exc}",
+                    step="get_token",
+                )
+            except Exception:
+                pass
+        return {}
+    if not isinstance(response_payload, dict) or not response_payload:
+        return {}
+    extracted = _extract_accounts_check_payload(
+        response_payload,
+        preferred_org_id=preferred_org_id,
+        fallback_email=fallback_email,
+    )
+    meta = extracted.get("_accounts_check_meta") if isinstance(extracted.get("_accounts_check_meta"), dict) else {}
+    if emitter is not None:
+        try:
+            emitter.info(
+                "access_token accounts/check 诊断: "
+                + f"top_keys={','.join(sorted(str(k) for k in response_payload.keys())[:12]) or '-'}, "
+                + f"preferred_org_id={_mask_secret(preferred_org_id, head=12, tail=6) or '-'}, "
+                + f"accounts_count={meta.get('accounts_count') or 0}, "
+                + f"selected_org_id={_mask_secret(meta.get('selected_org_id') or '', head=12, tail=6) or '-'}, "
+                + f"account_id={_mask_secret(meta.get('selected_account_id') or '', head=12, tail=6) or '-'}, "
+                + f"email={str(meta.get('selected_email') or '').strip() or '-'}",
+                step="get_token",
+            )
+        except Exception:
+            pass
+    extracted.pop("_accounts_check_meta", None)
+    return extracted
+
+
 def _build_token_result(token_payload: Dict[str, Any]) -> str:
     normalized = normalize_token_data(token_payload, default_type="codex")
     access_token = str(normalized.get("access_token") or "").strip()
@@ -1684,11 +1975,20 @@ def exchange_callback_to_token_payload(
     )
 
 
-def build_token_result_from_payloads(*payloads: Dict[str, Any]) -> str:
+def build_token_result_from_payloads(
+    *payloads: Dict[str, Any],
+    proxy: str = "",
+    emitter: Any = None,
+    fallback_email: str = "",
+) -> str:
     merged: Dict[str, Any] = {}
-    for item in payloads:
+    payload_key_parts: list[str] = []
+    for index, item in enumerate(payloads, start=1):
         if not isinstance(item, dict) or not item:
             continue
+        payload_key_parts.append(
+            f"p{index}={','.join(sorted(str(key) for key in item.keys())[:10]) or '-'}"
+        )
         for key, value in item.items():
             if key not in merged:
                 merged[key] = value
@@ -1703,6 +2003,65 @@ def build_token_result_from_payloads(*payloads: Dict[str, Any]) -> str:
                 continue
             if str(existing or "").strip() == "" and str(value or "").strip() != "":
                 merged[key] = value
+    if not str(merged.get("email") or "").strip() and str(fallback_email or "").strip():
+        merged["email"] = str(fallback_email or "").strip().lower()
+    normalized_preview = normalize_token_data(merged, default_type="codex")
+    access_payload = decode_jwt_payload(normalized_preview.get("access_token"))
+    access_auth = _auth_claims(access_payload)
+    id_payload = decode_jwt_payload(normalized_preview.get("id_token"))
+    id_auth = _auth_claims(id_payload)
+    if emitter is not None:
+        try:
+            emitter.info(
+                "token 组装前诊断: "
+                + f"{' | '.join(payload_key_parts) or 'payloads=-'}, "
+                + f"email={str(normalized_preview.get('email') or '').strip() or '-'}, "
+                + f"account_id={_mask_secret(normalized_preview.get('account_id') or normalized_preview.get('chatgpt_account_id') or '', head=12, tail=6) or '-'}, "
+                + f"refresh_token={'有' if str(normalized_preview.get('refresh_token') or '').strip() else '无'}, "
+                + f"id_token={'有' if str(normalized_preview.get('id_token') or '').strip() else '无'}, "
+                + f"session_token={'有' if str(normalized_preview.get('session_token') or '').strip() else '无'}, "
+                + f"access.auth.account_id={_mask_secret(access_auth.get('chatgpt_account_id') or '', head=12, tail=6) or '-'}, "
+                + f"access.auth.poid={_mask_secret(access_auth.get('poid') or '', head=12, tail=6) or '-'}, "
+                + f"id.email={str(id_payload.get('email') or '').strip() or '-'}, "
+                + f"id.account_id={_mask_secret(id_auth.get('chatgpt_account_id') or '', head=12, tail=6) or '-'}",
+                step="get_token",
+            )
+        except Exception:
+            pass
+    if (
+        str(normalized_preview.get("access_token") or "").strip()
+        and (
+            not str(normalized_preview.get("email") or "").strip()
+            or not str(normalized_preview.get("account_id") or normalized_preview.get("chatgpt_account_id") or "").strip()
+        )
+    ):
+        accounts_check_payload = _fetch_chatgpt_account_payload_by_access_token(
+            access_token=str(normalized_preview.get("access_token") or "").strip(),
+            proxy=proxy,
+            fallback_email=str(
+                normalized_preview.get("email")
+                or fallback_email
+                or ""
+            ).strip(),
+            emitter=emitter,
+        )
+        if accounts_check_payload:
+            for key, value in accounts_check_payload.items():
+                if key not in merged or str(merged.get(key) or "").strip() == "":
+                    merged[key] = value
+            normalized_preview = normalize_token_data(merged, default_type="codex")
+            if emitter is not None:
+                try:
+                    emitter.info(
+                        "token 组装后诊断: "
+                        + f"email={str(normalized_preview.get('email') or '').strip() or '-'}, "
+                        + f"account_id={_mask_secret(normalized_preview.get('account_id') or normalized_preview.get('chatgpt_account_id') or '', head=12, tail=6) or '-'}, "
+                        + f"plan_type={str(normalized_preview.get('plan_type') or '').strip() or '-'}, "
+                        + f"organization_id={_mask_secret(_extract_org_id_from_token_payload(merged), head=12, tail=6) or '-'}",
+                        step="get_token",
+                    )
+                except Exception:
+                    pass
     return _build_token_result(merged)
 
 

@@ -6,6 +6,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import time
 import urllib.parse
 from collections import deque
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -43,6 +45,9 @@ _ACTIVE_TEMP_USER_DATA_DIRS: set[str] = set()
 _ACTIVE_TEMP_USER_DATA_DIRS_LOCK = threading.Lock()
 _UC_TEMP_DIR_PREFIX = "opo_uc_"
 _UC_STALE_DIR_TTL_SECONDS = 6 * 60 * 60
+_LOOPBACK_CALLBACK_TTL_SECONDS = 30 * 60
+_LOOPBACK_CALLBACK_HUB_LOCK = threading.Lock()
+_LOOPBACK_CALLBACK_HUB: Optional["_LoopbackCallbackHub"] = None
 
 
 class BrowserPhoneVerificationRequiredError(RuntimeError):
@@ -90,6 +95,159 @@ class BrowserLaunchResources:
     persistent_user_data_dir: bool = False
     launch_mode: str = "uc-bridge"
     owner_thread_id: int = 0
+
+
+class _IPv4LoopbackServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    address_family = socket.AF_INET
+
+
+class _IPv6LoopbackServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:  # pragma: no cover - 平台相关兜底
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        except Exception:
+            pass
+        super().server_bind()
+
+
+class _LoopbackCallbackHub:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._callbacks: Dict[str, tuple[str, float]] = {}
+        self._servers: list[ThreadingHTTPServer] = []
+        self._threads: list[threading.Thread] = []
+        self._redirect_path = "/auth/callback"
+        self._redirect_port = 1455
+        self._started_hosts: list[str] = []
+
+    def ensure_started(self, redirect_uri: str) -> bool:
+        parsed = urllib.parse.urlparse(str(redirect_uri or "").strip())
+        port = int(parsed.port or 1455)
+        path = str(parsed.path or "/auth/callback").strip() or "/auth/callback"
+        with self._lock:
+            self._prune_locked()
+            if self._servers:
+                return True
+
+            self._redirect_port = port
+            self._redirect_path = path
+            self._started_hosts = []
+            handler_cls = self._build_handler()
+            bind_specs = [
+                ("127.0.0.1", _IPv4LoopbackServer),
+                ("::1", _IPv6LoopbackServer),
+            ]
+            for host, server_cls in bind_specs:
+                try:
+                    server = server_cls((host, port), handler_cls)
+                except OSError:
+                    continue
+                thread = threading.Thread(
+                    target=server.serve_forever,
+                    name=f"opo-loopback-{host}-{port}",
+                    daemon=True,
+                )
+                thread.start()
+                self._servers.append(server)
+                self._threads.append(thread)
+                self._started_hosts.append(host)
+            return bool(self._servers)
+
+    def pop_callback(self, expected_state: str) -> str:
+        state = str(expected_state or "").strip()
+        if not state:
+            return ""
+        with self._lock:
+            self._prune_locked()
+            record = self._callbacks.pop(state, None)
+        return str(record[0] if record else "").strip()
+
+    def describe_listener(self) -> str:
+        with self._lock:
+            hosts = ", ".join(self._started_hosts) if self._started_hosts else "-"
+            return f"localhost:{self._redirect_port}{self._redirect_path} ({hosts})"
+
+    def _store_callback(self, callback_url: str) -> None:
+        value = str(callback_url or "").strip()
+        if not value:
+            return
+        parsed = urllib.parse.urlparse(value)
+        state = str((urllib.parse.parse_qs(parsed.query).get("state", [""])[0] or "")).strip()
+        code = str((urllib.parse.parse_qs(parsed.query).get("code", [""])[0] or "")).strip()
+        if not state or not code:
+            return
+        with self._lock:
+            self._callbacks[state] = (value, time.time())
+            self._prune_locked()
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        stale_states = [
+            state
+            for state, (_, created_at) in self._callbacks.items()
+            if now - float(created_at or 0.0) > _LOOPBACK_CALLBACK_TTL_SECONDS
+        ]
+        for state in stale_states:
+            self._callbacks.pop(state, None)
+
+    def _build_handler(self) -> type[BaseHTTPRequestHandler]:
+        hub = self
+
+        class LoopbackCallbackHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+            def do_GET(self) -> None:
+                parsed = urllib.parse.urlparse(str(self.path or "").strip())
+                if parsed.path != hub._redirect_path:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(b"not found")
+                    return
+
+                callback_url = f"http://localhost:{hub._redirect_port}{parsed.path}"
+                if parsed.query:
+                    callback_url += f"?{parsed.query}"
+                hub._store_callback(callback_url)
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(
+                    b"<html><body><h3>OAuth callback captured</h3><p>You can close this page now.</p></body></html>"
+                )
+
+        return LoopbackCallbackHandler
+
+
+def _ensure_loopback_callback_hub(redirect_uri: str, emitter: Any) -> Optional[_LoopbackCallbackHub]:
+    global _LOOPBACK_CALLBACK_HUB
+    with _LOOPBACK_CALLBACK_HUB_LOCK:
+        if _LOOPBACK_CALLBACK_HUB is None:
+            _LOOPBACK_CALLBACK_HUB = _LoopbackCallbackHub()
+        hub = _LOOPBACK_CALLBACK_HUB
+    if hub.ensure_started(redirect_uri):
+        try:
+            emitter.info(f"已启动本地 OAuth 回调监听: {hub.describe_listener()}", step="oauth_init")
+        except Exception:
+            pass
+        return hub
+    try:
+        emitter.warn(
+            "本地 OAuth 回调监听启动失败，仍将继续依赖浏览器拦截和页面提取兜底。",
+            step="oauth_init",
+        )
+    except Exception:
+        pass
+    return None
 
 
 def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -3015,6 +3173,10 @@ def run_browser_registration(
         fallback_wait_for_otp_func=fallback_wait_for_otp_func,
     )
     callback_state: Dict[str, str] = {"url": ""}
+    loopback_callback_hub = _ensure_loopback_callback_hub(
+        str(getattr(current_oauth, "redirect_uri", "") or ""),
+        emitter,
+    )
     otp_wait_started = False
     otp_page_ready_logged = False
     otp_initial_send_triggered = False
@@ -3074,6 +3236,18 @@ def run_browser_registration(
         if is_manual_v2_mode and manual_v2_login_flow_started and manual_v2_login_oauth is not None:
             return manual_v2_login_oauth
         return current_oauth
+
+    def _consume_loopback_callback() -> str:
+        if loopback_callback_hub is None:
+            return ""
+        oauth_start = _active_oauth_start()
+        expected_state = str(getattr(oauth_start, "state", "") or "").strip()
+        if not expected_state:
+            return ""
+        callback_url = loopback_callback_hub.pop_callback(expected_state)
+        if callback_url:
+            _record_callback(callback_url)
+        return callback_url
 
     def _extract_callback_url_from_page(current_url: str, body_text: str) -> str:
         oauth_start = _active_oauth_start()
@@ -3454,6 +3628,8 @@ def run_browser_registration(
                     return latest_url, latest_body
                 _sleep_with_page(None, 300)
                 continue
+            if not callback_state["url"]:
+                _consume_loopback_callback()
             _wait_for_load(page, timeout_ms=1200)
             latest_url, latest_body = _describe_page(page)
             latest_url_lower = latest_url.lower()
@@ -3687,6 +3863,10 @@ def run_browser_registration(
                 if _stopped(ctx.stop_event):
                     return None
 
+                if not callback_state["url"]:
+                    loopback_callback = _consume_loopback_callback()
+                    if loopback_callback:
+                        emitter.info("本地 OAuth 回调监听已收到 callback，准备交换 Token...", step="get_token")
                 if callback_state["url"]:
                     callback_url_value = str(callback_state["url"] or "").strip()
                     callback_is_real = ("code=" in callback_url_value and "state=" in callback_url_value)
@@ -3709,13 +3889,23 @@ def run_browser_registration(
                                     expected_state=oauth_for_exchange.state,
                                     proxy=ctx.proxy or None,
                                 )
+                                emitter.info(
+                                    "浏览器模式2 已拿到 oauth/token 原始响应，优先使用 access_token 直连补齐账号信息，浏览器 session 仅作兜底...",
+                                    step="get_token",
+                                )
                                 session_payload = _fetch_browser_session_payload(
                                     context=context,
                                     emitter=emitter,
                                     referer_url=current_url or callback_url_value,
                                     fallback_email=ctx.email,
                                 ) or {}
-                                token_json = build_token_result_func(raw_token_payload, session_payload)
+                                token_json = build_token_result_func(
+                                    raw_token_payload,
+                                    session_payload,
+                                    proxy=ctx.proxy or None,
+                                    emitter=emitter,
+                                    fallback_email=ctx.email,
+                                )
                             else:
                                 token_json = submit_callback_func(
                                     callback_url=callback_url_value,
@@ -3744,13 +3934,23 @@ def run_browser_registration(
                                         expected_state=(callback_state_value or oauth_for_exchange.state),
                                         proxy=ctx.proxy or None,
                                     )
+                                    emitter.info(
+                                        "浏览器模式2 state 重试兑换成功，继续用 access_token 直连补齐账号信息...",
+                                        step="get_token",
+                                    )
                                     session_payload = _fetch_browser_session_payload(
                                         context=context,
                                         emitter=emitter,
                                         referer_url=current_url or callback_url_value,
                                         fallback_email=ctx.email,
                                     ) or {}
-                                    token_json = build_token_result_func(raw_token_payload, session_payload)
+                                    token_json = build_token_result_func(
+                                        raw_token_payload,
+                                        session_payload,
+                                        proxy=ctx.proxy or None,
+                                        emitter=emitter,
+                                        fallback_email=ctx.email,
+                                    )
                                 else:
                                     token_json = submit_callback_func(
                                         callback_url=callback_url_value,
@@ -3761,7 +3961,36 @@ def run_browser_registration(
                                     )
                             elif "token result missing email/account_id" in str(exc).lower():
                                 emitter.warn(
-                                    "浏览器模式2 token 交换已完成，但返回结果缺少 email/account_id；请查看上方 session payload/组装诊断日志继续排查。",
+                                    "浏览器模式2 当前页 access_token + session 仍未补齐 email/account_id，准备再次读取一次浏览器 session payload 复核...",
+                                    step="get_token",
+                                )
+                                _session_recovered = False
+                                try:
+                                    _sleep_with_page(page, 1200)
+                                    session_payload_retry = _fetch_browser_session_payload(
+                                        context=context,
+                                        emitter=emitter,
+                                        referer_url=current_url or callback_url_value,
+                                        fallback_email=ctx.email,
+                                    ) or {}
+                                    token_json = build_token_result_func(
+                                        raw_token_payload,
+                                        session_payload_retry,
+                                        proxy=ctx.proxy or None,
+                                        emitter=emitter,
+                                        fallback_email=ctx.email,
+                                    )
+                                    _session_recovered = True
+                                except Exception as retry_exc:
+                                    emitter.warn(
+                                        f"浏览器模式2 二次组装仍失败: {retry_exc}",
+                                        step="get_token",
+                                    )
+                                if _session_recovered:
+                                    emitter.success("浏览器模式2 二次组装恢复成功，Token 已获取", step="get_token")
+                                    return token_json
+                                emitter.warn(
+                                    "浏览器模式2 token 交换已完成，但 access_token 直连补齐 + 浏览器 session 兜底后仍缺 email/account_id；请查看上方组装诊断日志继续排查。",
                                     step="get_token",
                                 )
                                 raise
@@ -4378,7 +4607,30 @@ def run_browser_registration(
                             manual_v2_wait_phone_last_url = current_url
                             if not _write_text_to_locator(phone_input, manual_v2_phone_number):
                                 raise RuntimeError("浏览器模式2 填写手机号失败")
-                            if not _click_primary_action(page, ["Continue", "Next", "继续", "下一步"], allow_generic_fallback=True):
+                            # 精确提交手机号表单：优先用手机号输入框所在 form 的 submit，
+                            # 避免误点 "Continue with Google" 等第三方登录按钮
+                            _phone_form_submitted = _request_submit_with_button(phone_input)
+                            if not _phone_form_submitted:
+                                # form.requestSubmit 失败时，尝试精确点击排除第三方按钮的 Continue
+                                _phone_form_submitted = _click_first(
+                                    page,
+                                    [
+                                        'button[type="submit"]:not(:has-text("Google")):not(:has-text("Microsoft")):not(:has-text("Apple"))',
+                                        'form button:not([disabled]):not(:has-text("Google")):not(:has-text("Microsoft")):not(:has-text("Apple"))',
+                                    ],
+                                    timeout_ms=1500,
+                                )
+                            if not _phone_form_submitted:
+                                _phone_form_submitted = _click_primary_action(
+                                    page, ["Continue", "Next", "\u7ee7\u7eed", "\u4e0b\u4e00\u6b65"], allow_generic_fallback=False
+                                )
+                            if not _phone_form_submitted:
+                                try:
+                                    page.keyboard.press("Enter")
+                                    _phone_form_submitted = True
+                                except Exception:
+                                    pass
+                            if not _phone_form_submitted:
                                 raise RuntimeError("浏览器模式2 提交手机号失败")
                             manual_v2_login_phone_submitted = True
                             manual_v2_post_login_pending_email = False
@@ -4387,6 +4639,11 @@ def run_browser_registration(
                             manual_v2_post_login_recover_attempts = 0
                             emitter.info("浏览器模式2 已提交手机号，等待密码页...", step="create_email")
                             _wait_for_load(page, timeout_ms=5000)
+                            _post_phone_url, _post_phone_body = _describe_page(page)
+                            emitter.info(
+                                f"浏览器模式2 提交手机号后落点: {_mask_secret(_post_phone_url, head=64, tail=12)}",
+                                step="create_email",
+                            )
                             continue
 
                     if manual_v2_login_flow_started and not email_submitted and _is_add_email_page(current_url, body_text, page):
@@ -4750,12 +5007,59 @@ def run_browser_registration(
                     and not email_submitted
                     and "email-verification" in current_url_lower
                 ):
+                    # 检测页面上的目标邮箱是否是我们的临时邮箱
+                    # 如果不是，检查其域名是否属于我们 mail_provider 配置的 custom_domains
+                    # 属于 → 切换到旧邮箱继续取验证码；不属于 → 注册失败
+                    _page_shown_email = ""
+                    try:
+                        _email_match = re.search(
+                            r"sent\s+to\s+([a-zA-Z0-9_.+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})",
+                            body_text,
+                            re.IGNORECASE,
+                        )
+                        if _email_match:
+                            _page_shown_email = _email_match.group(1).strip().lower()
+                    except Exception:
+                        pass
+                    _our_email = str(ctx.email or "").strip().lower()
+                    if _page_shown_email and _our_email and _page_shown_email != _our_email:
+                        # 收集 mail_provider 的所有 custom_domains
+                        _managed_domains: set[str] = set()
+                        try:
+                            _mp = ctx.mail_provider
+                            if _mp is not None:
+                                # 直接是 MailTmForwardProvider
+                                if hasattr(_mp, "custom_domains") and _mp.custom_domains:
+                                    _managed_domains.update(str(d).strip().lower() for d in _mp.custom_domains if d)
+                                # MultiMailRouter: 遍历内部 provider
+                                if hasattr(_mp, "_providers") and isinstance(_mp._providers, dict):
+                                    for _sub_p in _mp._providers.values():
+                                        if hasattr(_sub_p, "custom_domains") and _sub_p.custom_domains:
+                                            _managed_domains.update(str(d).strip().lower() for d in _sub_p.custom_domains if d)
+                        except Exception:
+                            pass
+                        _shown_domain = _page_shown_email.split("@", 1)[-1] if "@" in _page_shown_email else ""
+                        if _shown_domain and _shown_domain in _managed_domains:
+                            # 旧邮箱域名是我们配置的自定义域名，切换到旧邮箱继续取验证码
+                            emitter.info(
+                                f"浏览器模式2 第二步登录后直接进入 email-verification，"
+                                f"页面目标邮箱 ({_page_shown_email}) 不是本次临时邮箱但属于我们的自定义域名 ({_shown_domain})，"
+                                f"切换为旧邮箱继续取验证码...",
+                                step="send_otp",
+                            )
+                            ctx.email = _page_shown_email
+                        else:
+                            raise RuntimeError(
+                                f"浏览器模式2 第二步登录后直接进入 email-verification，"
+                                f"但页面显示的目标邮箱 ({_page_shown_email}) 不是本次临时邮箱 ({_our_email})，"
+                                f"且域名不属于已配置的自定义域名，说明该手机号已绑定外部邮箱，无法继续注册"
+                            )
                     email_submitted = True
                     manual_v2_post_login_pending_email = False
                     manual_v2_bridge_entered_at = 0.0
                     manual_v2_bridge_logged = False
                     emitter.info(
-                        "浏览器模式2 检测到页面已直接进入 email-verification，自动同步为“邮箱已提交”状态，继续进入验证码阶段...",
+                        "浏览器模式2 检测到页面已直接进入 email-verification，自动同步为\u201c邮箱已提交\u201d状态，继续进入验证码阶段...",
                         step="send_otp",
                     )
                 otp_visible = _is_otp_page(current_url, body_text, page)
@@ -5070,7 +5374,26 @@ def run_browser_registration(
                         manual_v2_email_otp_completed = True
                     continue
 
-                if any(keyword in current_url_lower for keyword in ("consent", "workspace", "organization")):
+                # 检测第三方 OAuth 登录页（Google/Microsoft/Apple 等）
+                # 如果步骤2登录提交手机号后被重定向到第三方登录页，说明该手机号绑定了第三方账户，无法继续
+                _third_party_oauth_domains = (
+                    "accounts.google.com",
+                    "login.microsoftonline.com",
+                    "appleid.apple.com",
+                    "login.live.com",
+                )
+                if any(domain in current_url_lower for domain in _third_party_oauth_domains):
+                    if is_manual_v2_mode and manual_v2_login_flow_started:
+                        raise RuntimeError(
+                            f"浏览器模式2 第二步登录后被重定向到第三方登录页 ({current_url_lower.split('/')[2] if '/' in current_url_lower else current_url_lower})，"
+                            f"说明该手机号绑定了第三方账户（Google/Microsoft/Apple），无法继续注册，需要重新拉取浏览器重新注册"
+                        )
+                    # 非 manual_v2 模式下也不应该在第三方登录页上尝试授权操作
+                    _sleep_with_page(page, 1000)
+                    continue
+
+                _is_third_party_page = any(domain in current_url_lower for domain in _third_party_oauth_domains)
+                if not _is_third_party_page and any(keyword in current_url_lower for keyword in ("consent", "workspace", "organization")):
                     emitter.info(
                         f"浏览器流程进入授权页: {_mask_secret(current_url, head=48, tail=12)}",
                         step="workspace",
@@ -5083,6 +5406,7 @@ def run_browser_registration(
                     is_manual_v2_mode
                     and manual_v2_login_flow_started
                     and not manual_v2_oauth_resumed
+                    and not _is_third_party_page
                     and (
                         manual_v2_email_otp_completed
                         or ("code=" in current_url_lower and "state=" in current_url_lower)
@@ -5098,7 +5422,7 @@ def run_browser_registration(
                         step="oauth_init",
                     )
 
-                if any(keyword in body_lower for keyword in ("authorize", "workspace", "organization", "allow access")):
+                if not _is_third_party_page and any(keyword in body_lower for keyword in ("authorize", "workspace", "organization", "allow access")):
                     emitter.info("浏览器正在尝试确认授权...", step="workspace")
                     _click_primary_action(page, ["Continue", "Authorize", "Allow", "Next", "继续", "允许"])
                     _wait_for_load(page)
