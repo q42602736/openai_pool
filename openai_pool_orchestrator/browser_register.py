@@ -1826,6 +1826,202 @@ def _fill_birthdate(page: Any, birthdate: str) -> bool:
     return filled >= 2
 
 
+def _derive_profile_age(birthdate: str) -> str:
+    birth = str(birthdate or "").strip()
+    try:
+        year, month, day = [int(part) for part in birth.split("-")]
+        today = datetime.now()
+        age = int(today.year) - year
+        if (today.month, today.day) < (month, day):
+            age -= 1
+    except Exception:
+        age = 26
+    age = max(18, min(age, 60))
+    return str(age)
+
+
+def _fill_age(page: Any, birthdate: str) -> bool:
+    age_value = _derive_profile_age(birthdate)
+    if _fill_input_by_label(page, ["年龄", "age", "your age"], age_value):
+        return True
+    if _fill_first(
+        page,
+        [
+            'input[name*="age" i]',
+            'input[id*="age" i]',
+            'input[placeholder*="age" i]',
+            'input[aria-label*="age" i]',
+            'input[placeholder*="年龄"]',
+            'input[aria-label*="年龄"]',
+            'input[name*="年龄"]',
+        ],
+        age_value,
+    ):
+        return True
+
+    candidates = _collect_visible_locators(
+        page,
+        [
+            'input[type="number"]',
+            'input[inputmode="numeric"]',
+            'input[type="text"]',
+            '[role="spinbutton"]',
+            '[role="textbox"]',
+        ],
+        limit=12,
+    )
+    for locator in candidates:
+        if _locator_matches_hints(locator, ["age", "年龄", "your age", "confirm your age"]):
+            if _write_text_to_locator(locator, age_value):
+                return True
+    return False
+
+
+def _is_locator_checked(locator: Any) -> bool:
+    if locator is None:
+        return False
+    try:
+        return bool(
+            locator.evaluate(
+                """(el) => {
+                    if ('checked' in el) return !!el.checked;
+                    return el.getAttribute('aria-checked') === 'true';
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _ensure_about_you_checkbox(page: Any) -> bool:
+    checkbox = _first_visible_locator(
+        page,
+        [
+            'input[type="checkbox"][name="allCheckboxes"]',
+            'input[type="checkbox"][id*="allcheckboxes" i]',
+            'input[type="checkbox"][name*="agree" i]',
+            'input[type="checkbox"][id*="agree" i]',
+        ],
+    )
+    if checkbox is None:
+        candidates = _collect_visible_locators(page, ['input[type="checkbox"]'], limit=4)
+        if len(candidates) == 1:
+            checkbox = candidates[0]
+    if checkbox is None:
+        return True
+    if _is_locator_checked(checkbox):
+        return True
+
+    try:
+        checkbox.check(timeout=1200)
+    except Exception:
+        pass
+    if _is_locator_checked(checkbox):
+        return True
+
+    checkbox_id = ""
+    try:
+        checkbox_id = str(checkbox.get_attribute("id") or "").strip()
+    except Exception:
+        checkbox_id = ""
+    if checkbox_id and _click_first(page, [f'label[for="{checkbox_id}"]'], timeout_ms=1200):
+        return _is_locator_checked(checkbox)
+
+    if _click_locator_human_like(page, checkbox, timeout_ms=1200):
+        return _is_locator_checked(checkbox)
+    return False
+
+
+def _summarize_about_you_controls(page: Any) -> str:
+    controls = _collect_visible_locators(
+        page,
+        [
+            'input',
+            'select',
+            '[role="textbox"]',
+            '[role="spinbutton"]',
+            'button',
+            'label',
+        ],
+        limit=16,
+    )
+    snippets: list[str] = []
+    for item in controls:
+        meta = _locator_metadata(item)
+        if not meta:
+            continue
+        haystack = " ".join(meta.values())
+        if not any(
+            token in haystack
+            for token in ("month", "day", "year", "birth", "date", "dob", "age", "年龄", "checkbox", "agree", "同意")
+        ):
+            continue
+        checked = ""
+        try:
+            checked = "checked=true" if _is_locator_checked(item) else "checked=false"
+        except Exception:
+            checked = ""
+        snippets.append(
+            "|".join(
+                part
+                for part in (
+                    f"tag={meta.get('tag', '-')}",
+                    f"type={meta.get('type', '-')}",
+                    f"role={meta.get('role', '-')}",
+                    f"name={meta.get('name', '-')}",
+                    f"id={meta.get('id', '-')}",
+                    checked,
+                    f"label={_preview_text(meta.get('labels', ''), 40)}",
+                    f"aria={_preview_text(meta.get('aria_label', ''), 40)}",
+                    f"text={_preview_text(meta.get('text', ''), 40)}",
+                    f"parent={_preview_text(meta.get('parent_text', ''), 40)}",
+                )
+                if part
+            )
+        )
+        if len(snippets) >= 8:
+            break
+    return " || ".join(snippets) if snippets else "未识别到明显的 about-you 控件元数据"
+
+
+def _fill_about_you_profile(page: Any, ctx: Any) -> tuple[bool, str]:
+    if not (
+        _fill_input_by_label(page, ["全名", "姓名", "full name", "name"], ctx.profile_name)
+        or _fill_first(
+            page,
+            [
+                'input[name="name"]',
+                'input[autocomplete="name"]',
+                'input[placeholder*="name" i]',
+                'input[id*="name" i]',
+                'input[type="text"]',
+            ],
+            ctx.profile_name,
+        )
+    ):
+        return False, "name"
+
+    body_text = _get_body_text(page)
+    body_lower = str(body_text or "").lower()
+    prefers_age = (
+        "confirm your age" in body_lower
+        or "your age" in body_lower
+        or " age " in f" {body_lower} "
+        or "年龄" in body_text
+    )
+    if prefers_age:
+        if not _fill_age(page, ctx.profile_birthdate):
+            return False, "age"
+    else:
+        if not _fill_birthdate(page, ctx.profile_birthdate):
+            if not _fill_age(page, ctx.profile_birthdate):
+                return False, "birthdate"
+
+    if not _ensure_about_you_checkbox(page):
+        return False, "checkbox"
+    return True, ("age" if prefers_age else "birthdate")
+
+
 def _summarize_birthdate_controls(page: Any) -> str:
     controls = _collect_visible_locators(
         page,
@@ -1866,7 +2062,7 @@ def _summarize_birthdate_controls(page: Any) -> str:
         )
         if len(snippets) >= 6:
             break
-    return " || ".join(snippets) if snippets else "未识别到明显的生日控件元数据"
+    return " || ".join(snippets) if snippets else _summarize_about_you_controls(page)
 
 
 def _month_name(month: int, short: bool = False) -> str:
@@ -2296,6 +2492,12 @@ def _manual_contact_verification_ready(page: Any) -> bool:
 def _is_phone_input_page(url: str, body_text: str, page: Any) -> bool:
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
+    if "/create-account/password" in url_lower:
+        return False
+    if "/reset-password/new-password" in url_lower:
+        return False
+    if _is_create_account_password_page(url, body_text, page):
+        return False
     phone_input = _first_visible_locator(
         page,
         [
@@ -4316,33 +4518,27 @@ def run_browser_registration(
                         _extend_manual_v2_deadline(1800)
                         emitter.info("浏览器模式2 已进入 about-you 页面，复用资料填写流程...", step="create_account")
                         emitter.info(
-                            f"浏览器本次资料: name={ctx.profile_name}, birthdate={ctx.profile_birthdate}",
+                            f"浏览器本次资料: name={ctx.profile_name}, birthdate={ctx.profile_birthdate}, age={_derive_profile_age(ctx.profile_birthdate)}",
                             step="create_account",
                         )
-                        if not (
-                            _fill_input_by_label(page, ["全名", "姓名", "full name", "name"], ctx.profile_name)
-                            or _fill_first(
-                                page,
-                                [
-                                    'input[name="name"]',
-                                    'input[autocomplete="name"]',
-                                    'input[placeholder*="name" i]',
-                                    'input[id*="name" i]',
-                                    'input[type="text"]',
-                                ],
-                                ctx.profile_name,
-                            )
-                        ):
+                        profile_ok, profile_mode = _fill_about_you_profile(page, ctx)
+                        if not profile_ok and profile_mode == "name":
                             raise RuntimeError("浏览器模式2 在 about-you 页面填写姓名失败")
-                        if not _fill_birthdate(page, ctx.profile_birthdate):
+                        if not profile_ok and profile_mode in {"birthdate", "age"}:
                             emitter.warn(
-                                "浏览器模式2 about-you 生日控件诊断: " + _summarize_birthdate_controls(page),
+                                "浏览器模式2 about-you 年龄/生日控件诊断: " + _summarize_about_you_controls(page),
                                 step="create_account",
                             )
-                            raise RuntimeError("浏览器模式2 在 about-you 页面填写生日失败")
+                            raise RuntimeError("浏览器模式2 在 about-you 页面填写年龄/生日失败")
+                        if not profile_ok and profile_mode == "checkbox":
+                            emitter.warn(
+                                "浏览器模式2 about-you 勾选控件诊断: " + _summarize_about_you_controls(page),
+                                step="create_account",
+                            )
+                            raise RuntimeError("浏览器模式2 在 about-you 页面勾选同意项失败")
                         previous_url = current_url
                         previous_body = body_text
-                        if not _click_primary_action(page, ["Continue", "Next", "Create account", "完成", "继续"]):
+                        if not _click_primary_action(page, ["完成帐户创建", "完成账户创建", "Continue", "Next", "Create account", "完成", "继续"]):
                             raise RuntimeError("浏览器模式2 提交 about-you 资料失败")
                         profile_submitted = True
                         _wait_for_page_stabilize(
@@ -4361,15 +4557,15 @@ def run_browser_registration(
                             _extend_manual_v2_deadline(1800)
                             manual_v2_contact_seen = False
                             manual_v2_wait_contact_logged = False
-                            manual_v2_waiting_phone_retry = True
-                            manual_v2_require_phone_resubmit = True
+                            manual_v2_waiting_phone_retry = False
+                            manual_v2_waiting_phone_retry_logged = False
+                            manual_v2_require_phone_resubmit = False
+                            manual_v2_wait_phone_logged = False
                             password_submitted = False
-                            if not manual_v2_waiting_phone_retry_logged:
-                                manual_v2_waiting_phone_retry_logged = True
-                                emitter.warn(
-                                    "浏览器模式2 检测到你已从短信验证码页回退到设置密码页。此时先暂停自动提交，若要换手机号请继续手动回退到手机号输入页；到达手机号页后程序会恢复等待。",
-                                    step="add_phone",
-                                )
+                            emitter.info(
+                                "浏览器模式2 检测到流程从短信验证码页回到了设置密码页，已恢复自动填密码流程...",
+                                step="create_password",
+                            )
                             _sleep_with_page(page, 800)
                             continue
                         if _is_manual_v2_phone_stage_page(current_url, body_text, page):
@@ -4714,6 +4910,15 @@ def run_browser_registration(
 
                     if manual_v2_require_phone_resubmit:
                         _extend_manual_v2_deadline(1800)
+                        if _is_create_account_password_page(current_url, body_text, page):
+                            manual_v2_require_phone_resubmit = False
+                            manual_v2_wait_phone_logged = False
+                            password_submitted = False
+                            emitter.info(
+                                "浏览器模式2 已重新回到设置密码页，恢复自动填写密码流程...",
+                                step="create_password",
+                            )
+                            continue
                         if _is_phone_input_page(current_url, body_text, page) or _is_phone_verification_page(current_url, body_text, page):
                             if not manual_v2_wait_phone_logged:
                                 manual_v2_wait_phone_logged = True
@@ -4723,10 +4928,6 @@ def run_browser_registration(
                                 )
                             _sleep_with_page(page, 800)
                             continue
-                        if _is_create_account_password_page(current_url, body_text, page):
-                            manual_v2_require_phone_resubmit = False
-                            manual_v2_wait_phone_logged = False
-                            password_submitted = False
 
                     if (
                         password_submitted
@@ -4959,37 +5160,35 @@ def run_browser_registration(
                     )
                     continue
 
-                need_profile = (not otp_route_locked) and (not is_manual_v2_mode) and _is_profile_page(current_url, body_text)
+                need_profile = (
+                    (not otp_route_locked)
+                    and _is_profile_page(current_url, body_text)
+                    and ((not is_manual_v2_mode) or manual_v2_login_flow_started)
+                )
                 if need_profile and not profile_submitted:
                     emitter.info("浏览器正在补充账户资料...", step="create_account")
                     emitter.info(
-                        f"浏览器本次资料: name={ctx.profile_name}, birthdate={ctx.profile_birthdate}",
+                        f"浏览器本次资料: name={ctx.profile_name}, birthdate={ctx.profile_birthdate}, age={_derive_profile_age(ctx.profile_birthdate)}",
                         step="create_account",
                     )
-                    if not (
-                        _fill_input_by_label(page, ["全名", "姓名", "full name", "name"], ctx.profile_name)
-                        or _fill_first(
-                            page,
-                            [
-                                'input[name="name"]',
-                                'input[autocomplete="name"]',
-                                'input[placeholder*="name" i]',
-                                'input[id*="name" i]',
-                                'input[type="text"]',
-                            ],
-                            ctx.profile_name,
-                        )
-                    ):
+                    profile_ok, profile_mode = _fill_about_you_profile(page, ctx)
+                    if not profile_ok and profile_mode == "name":
                         raise RuntimeError("浏览器模式填写姓名失败")
-                    if not _fill_birthdate(page, ctx.profile_birthdate):
+                    if not profile_ok and profile_mode in {"birthdate", "age"}:
                         emitter.warn(
-                            "浏览器生日控件诊断: " + _summarize_birthdate_controls(page),
+                            "浏览器 about-you 年龄/生日控件诊断: " + _summarize_about_you_controls(page),
                             step="create_account",
                         )
-                        raise RuntimeError("浏览器模式填写生日失败")
+                        raise RuntimeError("浏览器模式填写年龄/生日失败")
+                    if not profile_ok and profile_mode == "checkbox":
+                        emitter.warn(
+                            "浏览器 about-you 勾选控件诊断: " + _summarize_about_you_controls(page),
+                            step="create_account",
+                        )
+                        raise RuntimeError("浏览器模式勾选 about-you 同意项失败")
                     previous_url = current_url
                     previous_body = body_text
-                    if not _click_primary_action(page, ["Continue", "Next", "Create account", "完成", "继续"]):
+                    if not _click_primary_action(page, ["完成帐户创建", "完成账户创建", "Continue", "Next", "Create account", "完成", "继续"]):
                         raise RuntimeError("浏览器模式提交账户资料失败")
                     profile_submitted = True
                     _wait_for_page_stabilize(
