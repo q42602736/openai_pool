@@ -604,6 +604,7 @@ def _locator_metadata(locator: Any) -> Dict[str, str]:
                 if (closestLabel) {
                     labels.push((closestLabel.innerText || closestLabel.textContent || '').trim());
                 }
+                const nestedEditable = el.querySelector && el.querySelector('input, textarea, [contenteditable="true"]');
                 const parent = el.parentElement;
                 return {
                     tag: (el.tagName || '').toLowerCase(),
@@ -617,8 +618,12 @@ def _locator_metadata(locator: Any) -> Dict[str, str]:
                     aria_haspopup: (el.getAttribute('aria-haspopup') || '').toLowerCase(),
                     aria_valuemin: (el.getAttribute('aria-valuemin') || '').toLowerCase(),
                     aria_valuemax: (el.getAttribute('aria-valuemax') || '').toLowerCase(),
+                    aria_valuenow: (el.getAttribute('aria-valuenow') || '').toLowerCase(),
+                    aria_valuetext: (el.getAttribute('aria-valuetext') || '').toLowerCase(),
                     data_type: (el.getAttribute('data-type') || '').toLowerCase(),
                     contenteditable: (el.getAttribute('contenteditable') || '').toLowerCase(),
+                    value: (typeof el.value === 'string' ? el.value : '').trim().toLowerCase(),
+                    nested_value: nestedEditable ? (((typeof nestedEditable.value === 'string' ? nestedEditable.value : '') || nestedEditable.textContent || '')).trim().toLowerCase() : '',
                     text: ((el.innerText || el.textContent || '')).trim().toLowerCase(),
                     parent_text: parent ? ((parent.innerText || parent.textContent || '')).trim().toLowerCase() : '',
                     labels: labels.filter(Boolean).join(' ').toLowerCase(),
@@ -708,16 +713,26 @@ def _identify_birthdate_segment(locator: Any) -> str:
 
 def _birthdate_segment_contains(locator: Any, expected: str) -> bool:
     meta = _locator_metadata(locator)
-    current = str(meta.get("text", "") or "").strip().lower()
     want = str(expected or "").strip().lower()
-    if not current or not want:
+    if not meta or not want:
         return False
-    if want in current:
-        return True
-    current_digits = "".join(ch for ch in current if ch.isdigit())
     want_digits = "".join(ch for ch in want if ch.isdigit())
-    if want_digits and want_digits in current_digits:
-        return True
+    want_digits_norm = want_digits.lstrip("0") or ("0" if want_digits else "")
+    observed_values = [
+        str(meta.get(key, "") or "").strip().lower()
+        for key in ("text", "value", "nested_value", "aria_valuetext", "aria_valuenow")
+    ]
+    for current in observed_values:
+        if not current:
+            continue
+        if current == want or want in current:
+            return True
+        current_digits = "".join(ch for ch in current if ch.isdigit())
+        current_digits_norm = current_digits.lstrip("0") or ("0" if current_digits else "")
+        if want_digits and current_digits == want_digits:
+            return True
+        if want_digits_norm and current_digits_norm == want_digits_norm:
+            return True
     return False
 
 
@@ -725,9 +740,59 @@ def _write_birthdate_segment(locator: Any, value: str) -> bool:
     text = str(value or "").strip()
     if not text:
         return False
+    meta = _locator_metadata(locator)
+    if meta.get("role", "") == "spinbutton":
+        try:
+            locator.evaluate(
+                """(el) => {
+                    if (el && typeof el.focus === 'function') {
+                        el.focus();
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+        try:
+            locator.click(timeout=1200)
+        except Exception:
+            pass
+        for hotkey in ("Meta+A", "Control+A", "Backspace", "Delete"):
+            try:
+                locator.press(hotkey, timeout=1200)
+            except Exception:
+                pass
+        for writer in (
+            lambda: locator.type(text, delay=55, timeout=1200),
+            lambda: locator.press_sequentially(text, timeout=1200),
+            lambda: _write_text_to_locator(locator, text, timeout_ms=1200),
+        ):
+            try:
+                writer()
+            except Exception:
+                continue
+            try:
+                locator.press("Tab", timeout=1200)
+            except Exception:
+                pass
+            time.sleep(0.12)
+            if _birthdate_segment_contains(locator, text):
+                return True
+        return False
     if not _write_text_to_locator(locator, text):
         return False
     return _birthdate_segment_contains(locator, text)
+
+
+def _write_birthdate_segment_candidates(locator: Any, candidates: list[str]) -> bool:
+    seen: set[str] = set()
+    for value in candidates:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        if _write_birthdate_segment(locator, text):
+            return True
+    return False
 
 
 def _fill_birthdate_spinbuttons(page: Any, year: str, month: str, day: str) -> bool:
@@ -755,10 +820,12 @@ def _fill_birthdate_spinbuttons(page: Any, year: str, month: str, day: str) -> b
     if year_locator is None or month_locator is None or day_locator is None:
         return False
 
+    month_candidates = [month.zfill(2), str(int(month))]
+    day_candidates = [day.zfill(2), str(int(day))]
     return (
-        _write_birthdate_segment(year_locator, year)
-        and _write_birthdate_segment(month_locator, str(int(month)))
-        and _write_birthdate_segment(day_locator, str(int(day)))
+        _write_birthdate_segment_candidates(month_locator, month_candidates)
+        and _write_birthdate_segment_candidates(day_locator, day_candidates)
+        and _write_birthdate_segment_candidates(year_locator, [year])
     )
 
 
@@ -1973,6 +2040,8 @@ def _summarize_about_you_controls(page: Any) -> str:
                     checked,
                     f"label={_preview_text(meta.get('labels', ''), 40)}",
                     f"aria={_preview_text(meta.get('aria_label', ''), 40)}",
+                    f"aria_value={_preview_text(meta.get('aria_valuetext', '') or meta.get('aria_valuenow', ''), 40)}",
+                    f"value={_preview_text(meta.get('value', '') or meta.get('nested_value', ''), 40)}",
                     f"text={_preview_text(meta.get('text', ''), 40)}",
                     f"parent={_preview_text(meta.get('parent_text', ''), 40)}",
                 )
@@ -2054,6 +2123,8 @@ def _summarize_birthdate_controls(page: Any) -> str:
                     f"id={meta.get('id', '-')}",
                     f"label={_preview_text(meta.get('labels', ''), 40)}",
                     f"aria={_preview_text(meta.get('aria_label', ''), 40)}",
+                    f"aria_value={_preview_text(meta.get('aria_valuetext', '') or meta.get('aria_valuenow', ''), 40)}",
+                    f"value={_preview_text(meta.get('value', '') or meta.get('nested_value', ''), 40)}",
                     f"text={_preview_text(meta.get('text', ''), 40)}",
                     f"parent={_preview_text(meta.get('parent_text', ''), 40)}",
                 )
@@ -2159,6 +2230,43 @@ def _describe_page(page: Any) -> tuple[str, str]:
     except Exception:
         body_text = ""
     return current_url, body_text
+
+
+def _page_priority_from_url(url: str) -> int:
+    url_lower = str(url or "").strip().lower()
+    if not url_lower:
+        return 0
+    if "code=" in url_lower and "state=" in url_lower:
+        return 200
+    if "auth.openai.com" in url_lower:
+        if any(token in url_lower for token in ("consent", "workspace", "organization")):
+            return 190
+        if "email-verification" in url_lower:
+            return 185
+        if "add-email" in url_lower:
+            return 180
+        if "/log-in/password" in url_lower:
+            return 175
+        if "/create-account/password" in url_lower:
+            return 172
+        if "/reset-password/new-password" in url_lower:
+            return 170
+        if "contact-verification" in url_lower:
+            return 168
+        if "/reset-password" in url_lower:
+            return 166
+        if "about-you" in url_lower:
+            return 164
+        if "/log-in" in url_lower:
+            return 162
+        if "/create-account" in url_lower:
+            return 160
+        return 150
+    if "chatgpt.com/auth/login_with" in url_lower:
+        return 120
+    if "chatgpt.com" in url_lower:
+        return 40
+    return 10
 
 
 def _has_phone_input(page: Any) -> bool:
@@ -2287,6 +2395,13 @@ def _is_login_password_page(url: str, body_text: str, page: Any) -> bool:
         return False
     if _is_create_account_password_page(url, body_text, page):
         return False
+    body_lower = str(body_text or "").lower()
+    if (
+        "forgot password" in body_lower
+        or "enter your password" in body_lower
+        or "password" in body_lower
+    ):
+        return True
     return _first_visible_locator(
         page,
         [
@@ -3609,6 +3724,8 @@ def run_browser_registration(
                 context_pages = []
             candidates.extend(reversed(context_pages))
             seen_ids: set[int] = set()
+            selected_page = None
+            selected_rank: tuple[int, int] | None = None
             for candidate_page in candidates:
                 if candidate_page is None:
                     continue
@@ -3619,9 +3736,23 @@ def run_browser_registration(
                 if not _page_is_usable(candidate_page):
                     continue
                 _wire_page_once(candidate_page)
-                page = candidate_page
+                try:
+                    candidate_url = str(candidate_page.url or "").strip()
+                except Exception:
+                    candidate_url = ""
+                score = _page_priority_from_url(candidate_url)
+                if preferred_page is not None and candidate_page is preferred_page:
+                    score += 3
+                if page is not None and candidate_page is page:
+                    score += 2
+                rank = (score, -len(seen_ids))
+                if selected_page is None or selected_rank is None or rank > selected_rank:
+                    selected_page = candidate_page
+                    selected_rank = rank
+            if selected_page is not None:
+                page = selected_page
                 _scan_context_pages_for_callback()
-                return candidate_page
+                return selected_page
             if _scan_context_pages_for_callback() or time.time() >= deadline_local:
                 return None
             time.sleep(0.2)
@@ -4281,10 +4412,16 @@ def run_browser_registration(
                     _extend_manual_v2_deadline(1800)
                     is_create_password_page = _is_create_account_password_page(current_url, body_text, page)
                     is_reset_new_password_page = _is_reset_password_new_password_page(current_url, body_text, page)
+                    is_login_password_page = _is_login_password_page(current_url, body_text, page)
                     is_phone_stage_page = (
-                        "chatgpt.com" in current_url_lower
-                        or _is_phone_input_page(current_url, body_text, page)
-                        or _is_phone_verification_page(current_url, body_text, page)
+                        not is_create_password_page
+                        and not is_reset_new_password_page
+                        and not is_login_password_page
+                        and (
+                            "chatgpt.com" in current_url_lower
+                            or _is_phone_input_page(current_url, body_text, page)
+                            or _is_phone_verification_page(current_url, body_text, page)
+                        )
                     )
                     captured_phone = _extract_input_value_by_hints(
                         page,
@@ -4296,6 +4433,7 @@ def run_browser_registration(
                     if (
                         is_phone_stage_page
                         and not manual_v2_login_flow_started
+                        and not manual_v2_contact_seen
                         and password_submitted
                     ):
                         password_submitted = False
@@ -4303,6 +4441,8 @@ def run_browser_registration(
                         manual_v2_contact_seen = False
                         manual_v2_wait_contact_logged = False
                         manual_v2_password_page_logged = False
+                        manual_v2_reset_password_flow_started = False
+                        manual_v2_reset_password_continue_clicked = False
                         emitter.info(
                             "浏览器模式2 检测到已回到首页/手机号输入阶段，已清理上一轮密码提交状态，等待重新输入手机号。",
                             step="add_phone",
@@ -4312,6 +4452,8 @@ def run_browser_registration(
                         not manual_v2_login_flow_started
                         and not manual_v2_contact_seen
                         and not is_create_password_page
+                        and not is_reset_new_password_page
+                        and not is_login_password_page
                         and "chatgpt.com" in current_url_lower
                     ):
                         if not manual_v2_entry_bootstrap_logged:
@@ -4322,6 +4464,8 @@ def run_browser_registration(
                             current_url_lower = current_url.lower()
                             body_lower = body_text.lower()
                             is_create_password_page = _is_create_account_password_page(current_url, body_text, page)
+                            is_reset_new_password_page = _is_reset_password_new_password_page(current_url, body_text, page)
+                            is_login_password_page = _is_login_password_page(current_url, body_text, page)
                     else:
                         manual_v2_entry_bootstrap_logged = False
 
@@ -4342,9 +4486,13 @@ def run_browser_registration(
                         not manual_v2_login_flow_started
                         and not manual_v2_contact_seen
                         and not is_create_password_page
-                        and not _is_login_password_page(current_url, body_text, page)
+                        and not is_login_password_page
                         and _is_phone_input_page(current_url, body_text, page)
                     ):
+                        if manual_v2_reset_password_flow_started or manual_v2_reset_password_continue_clicked:
+                            manual_v2_reset_password_flow_started = False
+                            manual_v2_reset_password_continue_clicked = False
+                            manual_v2_password_page_logged = False
                         if _manual_phone_input_ready(page):
                             if not manual_v2_wait_phone_logged or manual_v2_wait_phone_last_url != current_url + "#ready":
                                 manual_v2_wait_phone_logged = True
@@ -4368,7 +4516,7 @@ def run_browser_registration(
                     if (
                         not manual_v2_login_flow_started
                         and not manual_v2_contact_seen
-                        and _is_login_password_page(current_url, body_text, page)
+                        and is_login_password_page
                         and not manual_v2_reset_password_flow_started
                     ):
                         if _click_first(
@@ -4555,7 +4703,6 @@ def run_browser_registration(
                     if manual_v2_contact_seen and not manual_v2_login_flow_started:
                         if _is_create_account_password_page(current_url, body_text, page):
                             _extend_manual_v2_deadline(1800)
-                            manual_v2_contact_seen = False
                             manual_v2_wait_contact_logged = False
                             manual_v2_waiting_phone_retry = False
                             manual_v2_waiting_phone_retry_logged = False
@@ -4576,6 +4723,9 @@ def run_browser_registration(
                             manual_v2_waiting_phone_retry = False
                             manual_v2_waiting_phone_retry_logged = False
                             manual_v2_require_phone_resubmit = True
+                            manual_v2_reset_password_flow_started = False
+                            manual_v2_reset_password_continue_clicked = False
+                            manual_v2_password_page_logged = False
                             password_submitted = False
                             emitter.warn(
                                 "浏览器模式2 检测到你已从短信验证码页回退，已恢复到手机号录入阶段；你可以重新输入别的手机号继续注册。",
@@ -4583,8 +4733,13 @@ def run_browser_registration(
                             )
                             _sleep_with_page(page, 800)
                             continue
-                        emitter.success("浏览器模式2 检测到 contact-verification 已完成，转入手机登录补邮箱流程...", step="phone_verification")
-                        _prepare_manual_v2_login_flow("浏览器模式2 正在清理注册残留状态，并重新打开手机登录流程...")
+                        emitter.info(
+                            "浏览器模式2 短信验证码提交后进入过渡页，继续观察后续跳转，不再仅凭离开 contact-verification 就判定完成。"
+                            + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
+                            + f", state={_classify_page_state(current_url, body_text, page)}",
+                            step="phone_verification",
+                        )
+                        _sleep_with_page(page, 800)
                         continue
 
                     if manual_v2_login_flow_started and not manual_v2_phone_entry_clicked and _is_phone_login_entry_page(current_url, body_text, page):
