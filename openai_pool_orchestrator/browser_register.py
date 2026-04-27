@@ -1801,6 +1801,100 @@ def _write_text_to_locator(locator: Any, value: str, *, timeout_ms: int = 1200) 
         return False
 
 
+def _submit_create_account_password_like_codex_registrar(
+    page: Any,
+    password: str,
+    *,
+    emitter: Any = None,
+    step: str = "create_password",
+) -> bool:
+    pwd = str(password or "").strip()
+    if page is None or not pwd:
+        return False
+    password_input = _first_visible_locator(
+        page,
+        [
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[name="new-password"]',
+            'input[autocomplete="new-password"]',
+            'input[id*="password" i]',
+        ],
+    )
+    if password_input is None:
+        return False
+    try:
+        password_input.click(timeout=1500, click_count=3)
+    except Exception:
+        try:
+            password_input.click(timeout=1500)
+        except Exception:
+            pass
+    try:
+        password_input.press("Backspace", timeout=1000)
+    except Exception:
+        pass
+    typed = False
+    try:
+        page.keyboard.type(pwd, delay=30)
+        typed = True
+    except Exception:
+        typed = False
+    if not typed and not _write_text_to_locator(password_input, pwd, timeout_ms=1500):
+        return False
+    _sleep_with_page(page, 500)
+    try:
+        page.keyboard.press("Enter")
+    except Exception:
+        pass
+    _sleep_with_page(page, 1000)
+    submit_position = None
+    try:
+        submit_position = page.evaluate(
+            """() => {
+                const preferredTexts = ['继续', 'Continue', 'Next', 'Verify', 'Submit', 'Create account', 'Sign up'];
+                const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                for (const button of buttons) {
+                    const text = String(button.innerText || '').trim();
+                    if (!isVisible(button) || button.disabled) continue;
+                    if (!preferredTexts.some((item) => text === item || text.includes(item))) continue;
+                    const rect = button.getBoundingClientRect();
+                    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text };
+                }
+                for (const button of buttons) {
+                    if (!isVisible(button) || button.disabled) continue;
+                    const rect = button.getBoundingClientRect();
+                    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: String(button.innerText || '').trim() || 'submit' };
+                }
+                return null;
+            }"""
+        )
+    except Exception:
+        submit_position = None
+    if isinstance(submit_position, dict):
+        try:
+            if emitter is not None:
+                emitter.info(
+                    "浏览器模式2 create-account/password 专用提交动作: 真实鼠标点击 "
+                    + str(submit_position.get("text") or "submit"),
+                    step=step,
+                )
+        except Exception:
+            pass
+        try:
+            page.mouse.click(float(submit_position.get("x") or 0), float(submit_position.get("y") or 0))
+        except Exception:
+            pass
+    _wait_for_load(page, timeout_ms=2500)
+    return True
+
+
 def _fill_otp(page: Any, code: str) -> bool:
     otp = str(code or "").strip()
     if not otp:
@@ -2611,6 +2705,156 @@ def _is_create_account_password_page(url: str, body_text: str, page: Any) -> boo
         return True
     body_lower = str(body_text or "").lower()
     return "create password" in body_lower or "创建密码" in body_text
+
+
+def _probe_create_account_password_page_state(page: Any) -> Dict[str, str]:
+    current_url, body_text = _describe_page(page, force_refresh=True)
+    info: Dict[str, str] = {
+        "url": str(current_url or "").strip(),
+        "state": _classify_page_state(current_url, body_text, page),
+        "password_visible": "false",
+        "password_disabled": "",
+        "password_readonly": "",
+        "submit_found": "false",
+        "submit_text": "",
+        "submit_disabled": "",
+        "submit_aria_disabled": "",
+        "submit_busy": "",
+        "submit_state": "",
+    }
+    password_input = _first_visible_locator(
+        page,
+        [
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[name="new-password"]',
+            'input[autocomplete="new-password"]',
+            'input[id*="password" i]',
+        ],
+    )
+    if password_input is not None:
+        info["password_visible"] = "true"
+        try:
+            info["password_disabled"] = str(password_input.get_attribute("disabled") or "").strip().lower()
+        except Exception:
+            info["password_disabled"] = ""
+        try:
+            info["password_readonly"] = str(password_input.get_attribute("readonly") or "").strip().lower()
+        except Exception:
+            info["password_readonly"] = ""
+    try:
+        submit_info = page.evaluate(
+            """() => {
+                const preferredTexts = ['继续', 'Continue', 'Next', 'Verify', 'Submit', 'Create account', 'Sign up', '下一步', '创建账户', '注册'];
+                const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, input[type="submit"], [role="button"]'));
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const pick = (el) => {
+                    const text = String(el.innerText || el.textContent || el.value || '').trim();
+                    return {
+                        submit_found: 'true',
+                        submit_text: text,
+                        submit_disabled: el.disabled ? 'true' : 'false',
+                        submit_aria_disabled: String(el.getAttribute('aria-disabled') || '').trim().toLowerCase(),
+                        submit_busy: String(el.getAttribute('aria-busy') || '').trim().toLowerCase(),
+                        submit_state: String(el.getAttribute('data-state') || '').trim().toLowerCase(),
+                    };
+                };
+                for (const button of buttons) {
+                    if (!isVisible(button)) continue;
+                    const text = String(button.innerText || button.textContent || button.value || '').trim();
+                    if (!preferredTexts.some((item) => text === item || text.includes(item))) continue;
+                    return pick(button);
+                }
+                for (const button of buttons) {
+                    if (!isVisible(button)) continue;
+                    return pick(button);
+                }
+                return null;
+            }"""
+        )
+        if isinstance(submit_info, dict):
+            for key, value in submit_info.items():
+                info[str(key)] = str(value or "").strip().lower() if key != "submit_text" else str(value or "").strip()
+    except Exception:
+        pass
+    return info
+
+
+def _summarize_create_account_password_probe(page: Any) -> str:
+    info = _probe_create_account_password_page_state(page)
+    parts = [
+        f"url={_mask_secret(info.get('url', ''), head=56, tail=12) if info.get('url') else '-'}",
+        f"page_state={info.get('state') or '-'}",
+        f"password_visible={info.get('password_visible') or '-'}",
+        f"password_disabled={info.get('password_disabled') or '-'}",
+        f"password_readonly={info.get('password_readonly') or '-'}",
+        f"submit_found={info.get('submit_found') or '-'}",
+        f"submit_text={_preview_text(info.get('submit_text', ''), 40) or '-'}",
+        f"submit_disabled={info.get('submit_disabled') or '-'}",
+        f"aria_disabled={info.get('submit_aria_disabled') or '-'}",
+        f"submit_busy={info.get('submit_busy') or '-'}",
+        f"submit_state={info.get('submit_state') or '-'}",
+    ]
+    return ", ".join(parts)
+
+
+def _wait_for_create_account_password_ready(page: Any, *, timeout_ms: int = 12000) -> bool:
+    deadline = time.time() + max(2.0, float(timeout_ms or 0) / 1000.0)
+    stable_rounds = 0
+    last_signature = ""
+    while time.time() < deadline:
+        _wait_for_load(page, timeout_ms=1200)
+        current_url, body_text = _describe_page(page)
+        if not _is_create_account_password_page(current_url, body_text, page):
+            _sleep_with_page(page, 350)
+            continue
+        probe = _probe_create_account_password_page_state(page)
+        if probe.get("password_visible") != "true":
+            _sleep_with_page(page, 350)
+            continue
+        disabled = str(probe.get("password_disabled") or "").strip().lower()
+        readonly = str(probe.get("password_readonly") or "").strip().lower()
+        submit_found = str(probe.get("submit_found") or "").strip().lower()
+        submit_disabled = str(probe.get("submit_disabled") or "").strip().lower()
+        submit_aria_disabled = str(probe.get("submit_aria_disabled") or "").strip().lower()
+        submit_busy = str(probe.get("submit_busy") or "").strip().lower()
+        submit_state = str(probe.get("submit_state") or "").strip().lower()
+        submit_ready = (
+            submit_found == "true"
+            and submit_disabled in {"", "false"}
+            and submit_aria_disabled in {"", "false"}
+            and submit_busy in {"", "false"}
+            and "loading" not in submit_state
+            and "pending" not in submit_state
+        )
+        signature = "|".join(
+            [
+                str(current_url or ""),
+                disabled,
+                readonly,
+                submit_found,
+                submit_disabled,
+                submit_aria_disabled,
+                submit_busy,
+                submit_state,
+                str(probe.get("submit_text") or ""),
+            ]
+        )
+        if disabled in {"", "false"} and readonly in {"", "false"} and submit_ready:
+            if signature == last_signature:
+                stable_rounds += 1
+            else:
+                last_signature = signature
+                stable_rounds = 1
+            if stable_rounds >= 2:
+                return True
+        _sleep_with_page(page, 350)
+    return False
 
 
 def _is_login_password_page(url: str, body_text: str, page: Any) -> bool:
@@ -4008,12 +4252,108 @@ def run_browser_registration(
                 return None
             time.sleep(0.2)
 
+    def _page_navigation_debug_summary(candidate_page: Any = None) -> str:
+        target_page = candidate_page if candidate_page is not None else page
+        try:
+            context_pages = list(getattr(context, "pages", []) or [])
+        except Exception:
+            context_pages = []
+        is_closed = False
+        if target_page is None:
+            is_closed = True
+        else:
+            try:
+                is_closed_fn = getattr(target_page, "is_closed", None)
+                if callable(is_closed_fn):
+                    is_closed = bool(is_closed_fn())
+            except Exception:
+                is_closed = True
+        try:
+            current_url = str(getattr(target_page, "url", "") or "").strip()
+        except Exception:
+            current_url = ""
+        return (
+            f"is_closed={'是' if is_closed else '否'}, "
+            + f"context_pages={len(context_pages)}, "
+            + f"current_url={_mask_secret(current_url, head=64, tail=16) if current_url else '-'}"
+        )
+
+    def _ensure_navigable_page(*, step: str, reason: str, timeout_ms: int = 1500) -> Any:
+        nonlocal page
+        active_page = _resolve_active_page(page, timeout_ms=timeout_ms)
+        if active_page is not None:
+            page = active_page
+            return active_page
+        emitter.warn(
+            f"{reason}；当前页面句柄不可用，准备创建新页面继续。{_page_navigation_debug_summary(page)}",
+            step=step,
+        )
+        try:
+            fresh_page = context.new_page()
+        except Exception as exc:
+            raise RuntimeError(f"{reason}；当前页面句柄不可用，且创建新页面失败: {exc}") from exc
+        _wire_page_once(fresh_page)
+        page = fresh_page
+        return fresh_page
+
+    def _goto_with_recovery(
+        target_url: str,
+        *,
+        step: str,
+        reason: str,
+        wait_until: str = "domcontentloaded",
+        timeout_ms: Optional[int] = None,
+        max_attempts: int = 2,
+    ) -> Any:
+        nonlocal page
+        url = str(target_url or "").strip()
+        if not url:
+            raise RuntimeError(f"{reason}；目标 URL 为空")
+        last_exc: Optional[Exception] = None
+        total_attempts = max(1, int(max_attempts or 1))
+        for attempt in range(1, total_attempts + 1):
+            nav_page = _ensure_navigable_page(step=step, reason=reason, timeout_ms=1500)
+            try:
+                nav_page.goto(
+                    url,
+                    wait_until=wait_until,
+                    timeout=int(timeout_ms or cfg["browser_timeout_ms"]),
+                )
+                page = nav_page
+                return nav_page
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc or "")
+                recoverable = (
+                    "Target page, context or browser has been closed" in message
+                    or "net::ERR_ABORTED" in message
+                )
+                if not recoverable or attempt >= total_attempts:
+                    raise
+                emitter.warn(
+                    f"{reason}；第 {attempt}/{total_attempts} 次导航异常，准备自动恢复后重试: {message}. "
+                    + _page_navigation_debug_summary(nav_page),
+                    step=step,
+                )
+                if "Target page, context or browser has been closed" in message:
+                    page = None
+                _sleep_with_page(None, 350)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"{reason}；导航失败且未返回具体异常")
+
     def _start_oauth_flow(page: Any, oauth_start: Any, phase: str) -> None:
         if phase == "login":
             emitter.info("浏览器注册阶段已结束，正在当前浏览器窗口重新拉起登录流程获取 Token...", step="oauth_init")
         else:
             emitter.info("正在当前浏览器窗口启动注册流程...", step="oauth_init")
-        page.goto(str(oauth_start.auth_url), wait_until="domcontentloaded", timeout=cfg["browser_timeout_ms"])
+        page = _goto_with_recovery(
+            str(oauth_start.auth_url),
+            step="oauth_init",
+            reason="浏览器 OAuth 导航失败",
+            wait_until="domcontentloaded",
+            timeout_ms=cfg["browser_timeout_ms"],
+        )
         _wait_for_load(page, timeout_ms=2500)
         emitter.info(
             f"浏览器{('登录' if phase == 'login' else '注册')}流程落点: {_mask_secret(page.url, head=48, tail=12)}",
@@ -4187,6 +4527,76 @@ def run_browser_registration(
             manual_v2_login_oauth = None
         deadline = time.time() + max(90, int(cfg["browser_timeout_ms"] / 1000) + 60)
         _start_oauth_flow(page, current_oauth, current_phase)
+
+    def _try_recover_timeout_error_page(
+        current_url: str,
+        body_text: str,
+        *,
+        step: str,
+        action_label: str,
+        timeout_ms: int = 15000,
+    ) -> bool:
+        nonlocal password_submitted, manual_v2_password_page_logged
+        if not _is_timeout_error_page(current_url, body_text):
+            return False
+        active_page = _resolve_active_page(page, timeout_ms=1500)
+        if active_page is None:
+            emitter.warn("检测到超时错误页，但当前没有可用活动页面，改走后续兜底恢复...", step=step)
+            return False
+        emitter.warn("检测到 Operation timed out，先在当前页面点击 Try again/Retry 原地恢复...", step=step)
+        previous_url = current_url
+        previous_body = body_text
+        if not _click_first(
+            page,
+            [
+                'button:has-text("Try again")',
+                '[role="button"]:has-text("Try again")',
+                'a:has-text("Try again")',
+                'button:has-text("Retry")',
+                '[role="button"]:has-text("Retry")',
+                'a:has-text("Retry")',
+                'button:has-text("重试")',
+                '[role="button"]:has-text("重试")',
+                'a:has-text("重试")',
+            ],
+            timeout_ms=1500,
+        ):
+            emitter.warn("超时错误页当前未找到 Try again/Retry/重试 按钮，改走后续兜底恢复...", step=step)
+            return False
+        _wait_for_load(page, timeout_ms=2500)
+        latest_url, latest_body = _wait_for_page_stabilize(
+            previous_url,
+            previous_body,
+            step=step,
+            action_label=action_label,
+            timeout_ms=timeout_ms,
+        )
+        latest_url_lower = str(latest_url or "").lower()
+        if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
+            emitter.info("超时错误页已在当前页面恢复并命中回调线索，继续推进流程...", step=step)
+            return True
+        if (
+            is_manual_v2_mode
+            and not manual_v2_login_flow_started
+            and not manual_v2_contact_seen
+            and _is_create_account_password_page(latest_url, latest_body, page)
+        ):
+            password_submitted = False
+            manual_v2_password_page_logged = False
+            emitter.info(
+                "超时页 Try again 后已回到创建密码页，恢复自动填密码流程并继续输入密码...",
+                step="create_password",
+            )
+            return True
+        if _is_timeout_error_page(latest_url, latest_body):
+            emitter.warn("超时错误页当前页重试后仍未恢复，准备走 OAuth 重拉兜底...", step=step)
+            return False
+        emitter.info(
+            "超时错误页已通过当前页面重试恢复，继续沿现有流程推进: "
+            + _mask_secret(latest_url, head=56, tail=12),
+            step=step,
+        )
+        return True
 
     def _wait_for_page_stabilize(
         previous_url: str,
@@ -4376,7 +4786,13 @@ def run_browser_registration(
         manual_v2_entry_bootstrap_logged = False
         deadline = time.time() + max(6 * 60 * 60, int(cfg["browser_timeout_ms"] / 1000) + 60)
         emitter.warn(reason, step="oauth_init")
-        page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=cfg["browser_timeout_ms"])
+        _goto_with_recovery(
+            "https://chatgpt.com/",
+            step="oauth_init",
+            reason="浏览器模式2 返回 ChatGPT 首页失败",
+            wait_until="domcontentloaded",
+            timeout_ms=cfg["browser_timeout_ms"],
+        )
         _wait_for_load(page, timeout_ms=2500)
         emitter.info(
             f"浏览器模式2 已回到步骤1首页落点: {_mask_secret(page.url, head=48, tail=12)}",
@@ -4568,7 +4984,13 @@ def run_browser_registration(
         try:
             if is_manual_v2_mode:
                 emitter.info("浏览器模式2 已恢复为完整注册流程：先打开 ChatGPT 首页执行步骤1，再衔接步骤2手机登录与补邮箱流程...", step="oauth_init")
-                page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=cfg["browser_timeout_ms"])
+                _goto_with_recovery(
+                    "https://chatgpt.com/",
+                    step="oauth_init",
+                    reason="浏览器模式2 打开 ChatGPT 首页失败",
+                    wait_until="domcontentloaded",
+                    timeout_ms=cfg["browser_timeout_ms"],
+                )
                 _wait_for_load(page, timeout_ms=2500)
                 emitter.info(
                     f"浏览器模式2 步骤1首页落点: {_mask_secret(page.url, head=48, tail=12)}",
@@ -4873,6 +5295,46 @@ def run_browser_registration(
                             )
                     else:
                         manual_v2_password_page_logged = False
+
+                    if (
+                        is_create_password_page
+                        and not manual_v2_login_flow_started
+                        and not manual_v2_contact_seen
+                        and not password_submitted
+                    ):
+                        previous_url = current_url
+                        previous_body = body_text
+                        emitter.info(
+                            "浏览器模式2 首轮 create-account/password 命中专用提交流程，按 codex-registrar 方式提交密码...",
+                            step="create_password",
+                        )
+                        if not _wait_for_create_account_password_ready(page, timeout_ms=12000):
+                            emitter.warn(
+                                "浏览器模式2 create-account/password ready 探针诊断: "
+                                + _summarize_create_account_password_probe(page),
+                                step="create_password",
+                            )
+                            raise RuntimeError("浏览器模式2 create-account/password 页面未稳定就绪")
+                        if not _submit_create_account_password_like_codex_registrar(
+                            page,
+                            ctx.account_password,
+                            emitter=emitter,
+                            step="create_password",
+                        ):
+                            raise RuntimeError("浏览器模式2 create-account/password 专用提交流程失败")
+                        password_submitted = True
+                        emitter.info(
+                            "浏览器模式2 首轮注册密码已提交，等待站点自然跳转后续页面...",
+                            step="create_password",
+                        )
+                        _wait_for_page_stabilize(
+                            previous_url,
+                            previous_body,
+                            step="create_password",
+                            action_label="create-account/password 已提交",
+                            timeout_ms=20000,
+                        )
+                        continue
 
                     if (
                         not manual_v2_login_flow_started
@@ -6214,6 +6676,19 @@ def run_browser_registration(
                             "浏览器注册页面连续出现超时错误页: "
                             + _preview_text(body_text, 180)
                         )
+                    timeout_step = "create_password" if (
+                        password_submitted
+                        or _is_create_account_password_page(current_url, body_text, page)
+                        or _is_reset_password_new_password_page(current_url, body_text, page)
+                    ) else "oauth_init"
+                    if _try_recover_timeout_error_page(
+                        current_url,
+                        body_text,
+                        step=timeout_step,
+                        action_label="超时错误页已触发当前页重试",
+                        timeout_ms=15000,
+                    ):
+                        continue
                     _restart_current_page_oauth_flow(
                         target_phase=("login" if current_phase != "login" else current_phase),
                         reason="浏览器注册页面出现超时错误页，准备在当前页面重新打开并重新登录...",
