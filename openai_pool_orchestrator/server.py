@@ -818,6 +818,7 @@ class TaskState:
         self.completion_semantics: str = "registration_only"
         self._focus_worker_id: Optional[int] = None
         self._worker_runtime: Dict[int, Dict[str, Any]] = {}
+        self._manual_input_submissions: Dict[str, str] = {}
 
     def _now_iso(self) -> str:
         return datetime.now().isoformat(timespec="seconds")
@@ -845,7 +846,152 @@ class TaskState:
             "message": "",
             "updated_at": self._now_iso(),
             "steps": [],
+            "manual_input": {},
         }
+
+    def _manual_input_submission_key(self, worker_id: int, request_id: str) -> str:
+        return f"{int(worker_id)}:{str(request_id or '').strip()}"
+
+    def _mask_manual_input_value(self, kind: str, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        normalized_kind = str(kind or "").strip().lower()
+        if normalized_kind == "phone_number":
+            digits = "".join(ch for ch in text if ch.isdigit())
+            if len(digits) >= 7:
+                return f"{digits[:3]}...{digits[-4:]}"
+            if len(text) > 6:
+                return f"{text[:2]}...{text[-2:]}"
+        if normalized_kind in {"sms_code", "phone_otp"}:
+            digits = "".join(ch for ch in text if ch.isdigit())
+            if len(digits) >= 4:
+                return f"{digits[:2]}***{digits[-2:]}"
+            return "***"
+        return text[:2] + "***" if len(text) > 3 else text
+
+    def _emit_worker_runtime_locked(self, worker_id: int, *, bump_revision: bool = True) -> None:
+        runtime = copy.deepcopy(self._worker_runtime.get(int(worker_id)) or {})
+        if not runtime:
+            return
+        self._emit_event_locked("worker.updated", {"worker": runtime}, bump_revision=bump_revision)
+        self._emit_event_locked("snapshot", {"snapshot": self._status_snapshot_locked()})
+
+    def wait_for_worker_manual_input(
+        self,
+        worker_id: int,
+        *,
+        kind: str,
+        prompt: str,
+        step: str,
+        timeout_seconds: int = 3600,
+        placeholder: str = "",
+        button_text: str = "提交",
+        helper_text: str = "",
+        stop_event: Optional[threading.Event] = None,
+    ) -> str:
+        normalized_kind = str(kind or "").strip().lower()
+        normalized_step = str(step or "").strip().lower()
+        request_id = uuid.uuid4().hex[:10]
+        deadline = time.time() + max(5, int(timeout_seconds or 0))
+        with self._task_lock:
+            runtime = self._worker_runtime.get(int(worker_id))
+            if runtime is None:
+                runtime = self._empty_worker_runtime_locked(int(worker_id))
+                self._worker_runtime[int(worker_id)] = runtime
+            runtime["manual_input"] = {
+                "pending": True,
+                "kind": normalized_kind,
+                "prompt": str(prompt or "").strip(),
+                "step": normalized_step,
+                "placeholder": str(placeholder or "").strip(),
+                "button_text": str(button_text or "提交").strip() or "提交",
+                "helper_text": str(helper_text or "").strip(),
+                "request_id": request_id,
+                "updated_at": self._now_iso(),
+            }
+            runtime["updated_at"] = self._now_iso()
+            self._emit_worker_runtime_locked(int(worker_id), bump_revision=True)
+
+        stop_signal = stop_event or self.stop_event
+        request_key = self._manual_input_submission_key(int(worker_id), request_id)
+        while time.time() < deadline:
+            if stop_signal and stop_signal.is_set():
+                with self._task_lock:
+                    self._manual_input_submissions.pop(request_key, None)
+                    runtime = self._worker_runtime.get(int(worker_id))
+                    if runtime is not None:
+                        current_manual = runtime.get("manual_input") or {}
+                        if str(current_manual.get("request_id") or "").strip() == request_id:
+                            runtime["manual_input"] = {}
+                            runtime["updated_at"] = self._now_iso()
+                            self._emit_worker_runtime_locked(int(worker_id), bump_revision=True)
+                raise RuntimeError("任务已停止，已取消等待人工输入")
+            with self._task_lock:
+                if request_key in self._manual_input_submissions:
+                    value = str(self._manual_input_submissions.pop(request_key) or "").strip()
+                    runtime = self._worker_runtime.get(int(worker_id))
+                    if runtime is not None:
+                        current_manual = runtime.get("manual_input") or {}
+                        if str(current_manual.get("request_id") or "").strip() == request_id:
+                            runtime["manual_input"] = {}
+                            runtime["updated_at"] = self._now_iso()
+                            self._emit_worker_runtime_locked(int(worker_id), bump_revision=True)
+                    return value
+            time.sleep(0.25)
+
+        with self._task_lock:
+            self._manual_input_submissions.pop(request_key, None)
+            runtime = self._worker_runtime.get(int(worker_id))
+            if runtime is not None:
+                current_manual = runtime.get("manual_input") or {}
+                if str(current_manual.get("request_id") or "").strip() == request_id:
+                    runtime["manual_input"] = {}
+                    runtime["updated_at"] = self._now_iso()
+                    self._emit_worker_runtime_locked(int(worker_id), bump_revision=True)
+        timeout_label = "手机号" if normalized_kind == "phone_number" else "短信验证码"
+        raise RuntimeError(f"等待人工输入{timeout_label}超时")
+
+    def submit_worker_manual_input(
+        self,
+        worker_id: int,
+        *,
+        kind: str,
+        value: str,
+        request_id: str = "",
+    ) -> Dict[str, Any]:
+        normalized_kind = str(kind or "").strip().lower()
+        text = str(value or "").strip()
+        if not text:
+            raise RuntimeError("输入内容不能为空")
+        with self._task_lock:
+            runtime = self._worker_runtime.get(int(worker_id))
+            if runtime is None:
+                raise RuntimeError("目标 Worker 不存在")
+            manual_input = runtime.get("manual_input") or {}
+            if not manual_input or not bool(manual_input.get("pending")):
+                raise RuntimeError("当前 Worker 没有待处理的人工输入请求")
+            active_request_id = str(manual_input.get("request_id") or "").strip()
+            expected_kind = str(manual_input.get("kind") or "").strip().lower()
+            if request_id and active_request_id and request_id != active_request_id:
+                raise RuntimeError("人工输入请求已过期，请刷新页面后重试")
+            if expected_kind and normalized_kind and normalized_kind != expected_kind:
+                raise RuntimeError("人工输入类型不匹配，请刷新页面后重试")
+            request_key = self._manual_input_submission_key(int(worker_id), active_request_id)
+            self._manual_input_submissions[request_key] = text
+            runtime["manual_input"] = {
+                **manual_input,
+                "pending": False,
+                "accepted": True,
+                "masked_value": self._mask_manual_input_value(expected_kind or normalized_kind, text),
+                "updated_at": self._now_iso(),
+            }
+            runtime["updated_at"] = self._now_iso()
+            self._emit_worker_runtime_locked(int(worker_id), bump_revision=True)
+            return {
+                "status": "accepted",
+                "worker": copy.deepcopy(runtime),
+            }
 
     def _empty_runtime_snapshot_locked(self) -> Dict[str, Any]:
         workers = [
@@ -988,6 +1134,7 @@ class TaskState:
                     step["status"] = "done"
                     step["finished_at"] = updated_at
                     step["updated_at"] = updated_at
+            runtime["manual_input"] = {}
             runtime["status"] = "stopped"
             runtime["phase"] = "finish"
             runtime["current_step"] = step_id
@@ -1134,8 +1281,10 @@ class TaskState:
             if step == "start":
                 runtime["steps"] = [step_patch]
             if step in {"stopped", "auto_stop"}:
+                runtime["manual_input"] = {}
                 runtime["status"] = "stopped"
             elif step == "runtime" or (level == "error" and step not in {"retry", "wait"}):
+                runtime["manual_input"] = {}
                 runtime["status"] = "failed"
         else:
             runtime["status"] = "running" if self.status not in {"stopping", "stopped"} else self.status
@@ -1304,6 +1453,7 @@ class TaskState:
                 wid: self._empty_worker_runtime_locked(wid)
                 for wid in range(1, n + 1)
             }
+            self._manual_input_submissions = {}
             self._focus_worker_id = 1 if n > 0 else None
             self.created_at = now
             self.started_at = now
@@ -1734,6 +1884,18 @@ class TaskState:
                             "browser_realistic_profile": bool(config_snapshot.get("browser_realistic_profile", True)),
                             "browser_clear_runtime_state": bool(config_snapshot.get("browser_clear_runtime_state", False)),
                         },
+                        browser_manual_phone_input_func=lambda **kwargs: self.wait_for_worker_manual_input(
+                            worker_id,
+                            kind="phone_number",
+                            stop_event=self.stop_event,
+                            **kwargs,
+                        ),
+                        browser_manual_sms_code_input_func=lambda **kwargs: self.wait_for_worker_manual_input(
+                            worker_id,
+                            kind="sms_code",
+                            stop_event=self.stop_event,
+                            **kwargs,
+                        ),
                     )
 
                     if self.stop_event.is_set() and not token_json:
@@ -2148,6 +2310,13 @@ class BrowserConfigRequest(BaseModel):
     browser_clear_runtime_state: bool = True
 
 
+class WorkerManualInputRequest(BaseModel):
+    worker_id: int
+    kind: str
+    value: str
+    request_id: str = ""
+
+
 class ExtensionV2OtpRequest(BaseModel):
     timeout_seconds: int = 20
 
@@ -2217,6 +2386,20 @@ async def api_get_proxy() -> Dict[str, Any]:
 @app.get("/api/status")
 async def api_status() -> Dict[str, Any]:
     return _state.get_status_snapshot()
+
+
+@app.post("/api/runtime/manual-input")
+async def api_submit_worker_manual_input(req: WorkerManualInputRequest) -> Dict[str, Any]:
+    try:
+        result = _state.submit_worker_manual_input(
+            int(req.worker_id),
+            kind=req.kind,
+            value=req.value,
+            request_id=req.request_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return result
 
 
 @app.get("/api/tokens")

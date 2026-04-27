@@ -137,6 +137,7 @@
               停止
             </button>
           </div>
+          <div id="manualInputPanel" class="manual-input-panel" hidden></div>
         </div>
 
         <!-- 注册步骤追踪 -->
@@ -518,7 +519,7 @@
             <label>浏览器可执行文件路径（可选）</label>
             <input type="text" id="browserExecutablePath" value="" autocomplete="off" spellcheck="false" placeholder="/path/to/chrome 或留空自动探测本机 Chrome" />
             <div class="config-hint" style="margin-top:0;">
-              开启“显示浏览器窗口”后会以可见模式启动，方便你观察卡在哪一步；关闭时默认使用无头模式后台运行。这里可以单独保存，不会触发平台账号校验。
+              开启“显示浏览器窗口”后会以可见模式启动，方便你观察卡在哪一步；关闭时默认使用无头模式后台运行。模式2（手机注册）在关闭窗口后，可改为在 Worker 详情面板里手动提交手机号和短信验证码。
             </div>
           </div>
           <div class="config-actions" style="margin-top:12px;">

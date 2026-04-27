@@ -2098,6 +2098,8 @@ def run(
     mail_provider=None,
     proxy_pool_config: Optional[Dict[str, Any]] = None,
     browser_config: Optional[Dict[str, Any]] = None,
+    browser_manual_phone_input_func: Optional[Callable[..., str]] = None,
+    browser_manual_sms_code_input_func: Optional[Callable[..., str]] = None,
 ) -> Optional[str]:
     try:
         from .sentinel_runtime import SentinelRuntime
@@ -4121,6 +4123,8 @@ def run(
                         source_label="浏览器 session fast path",
                     ),
                     fallback_wait_for_otp_func=get_oai_code,
+                    wait_manual_phone_input_func=browser_manual_phone_input_func,
+                    wait_manual_sms_code_input_func=browser_manual_sms_code_input_func,
                     random_password_func=_random_password,
                     random_profile_name_func=_random_profile_name,
                     random_profile_birthdate_func=_random_profile_birthdate,

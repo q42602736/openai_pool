@@ -38,6 +38,8 @@ DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
     "browser_clear_runtime_state": True,
 }
 
+MANUAL_V2_RESTART_PHONE_SENTINEL = "__manual_v2_restart_phone__"
+
 
 _PRESERVED_BROWSER_RESOURCES: list[BrowserLaunchResources] = []
 _PRESERVED_BROWSER_RESOURCES_LOCK = threading.Lock()
@@ -280,7 +282,7 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
 
     return {
         "register_mode": register_mode,
-        "browser_headless": False if register_mode in {"browser_manual", "browser_manual_v2"} else bool(source.get("browser_headless", True)),
+        "browser_headless": False if register_mode == "browser_manual" else bool(source.get("browser_headless", True)),
         "browser_timeout_ms": timeout_ms,
         "browser_slow_mo_ms": slow_mo_ms,
         "browser_executable_path": executable_path,
@@ -3072,6 +3074,118 @@ def _manual_contact_verification_ready(page: Any) -> bool:
     return False
 
 
+def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "add_phone") -> bool:
+    phone_text = str(phone_number or "").strip()
+    if page is None or not phone_text:
+        return False
+    phone_input = _first_visible_locator(
+        page,
+        [
+            'input[name="phoneNumberInput"]',
+            'input[type="tel"]',
+            'input[inputmode="tel"]',
+            'input[name*="phone" i]',
+            'input[autocomplete="tel"]',
+            'input[placeholder*="phone" i]',
+            'input[aria-label*="phone" i]',
+            'input[placeholder*="手机号"]',
+            'input[aria-label*="手机号"]',
+        ],
+    )
+    if phone_input is None:
+        return False
+    if not _write_text_to_locator(phone_input, phone_text):
+        return False
+    try:
+        phone_input.click(timeout=1200)
+    except Exception:
+        pass
+    phone_form_submitted = False
+    try:
+        phone_form_submitted = bool(
+            phone_input.evaluate(
+                """(el) => {
+                    const isVisible = (node) => {
+                        if (!node) return false;
+                        const rect = node.getBoundingClientRect();
+                        const style = window.getComputedStyle(node);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const safeTexts = new Set(['继续', 'Continue', 'Next', '下一步']);
+                    const rejectTokens = ['google', 'apple', 'microsoft', 'email', '邮箱'];
+                    const clickButton = (button) => {
+                        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+                            button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                        });
+                    };
+                    const normalizedText = (node) => String(
+                        node?.innerText
+                        || node?.textContent
+                        || node?.value
+                        || node?.getAttribute?.('aria-label')
+                        || ''
+                    ).replace(/\\s+/g, ' ').trim();
+                    const isSafeSubmitButton = (button) => {
+                        const text = normalizedText(button);
+                        if (!text || !safeTexts.has(text)) return false;
+                        const lower = text.toLowerCase();
+                        if (rejectTokens.some(token => lower.includes(token))) return false;
+                        if (!isVisible(button) || button.disabled) return false;
+                        const ariaDisabled = String(button.getAttribute?.('aria-disabled') || '').trim().toLowerCase();
+                        return ariaDisabled !== 'true';
+                    };
+                    const scopes = [];
+                    const seen = new Set();
+                    const pushScope = (node) => {
+                        if (!node || seen.has(node)) return;
+                        seen.add(node);
+                        scopes.push(node);
+                    };
+                    pushScope(el.closest('form'));
+                    pushScope(el.closest('[role="dialog"]'));
+                    let current = el.parentElement;
+                    let depth = 0;
+                    while (current && depth < 8) {
+                        pushScope(current);
+                        current = current.parentElement;
+                        depth += 1;
+                    }
+                    for (const scope of scopes) {
+                        const strictButtons = Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"]'));
+                        for (const button of strictButtons) {
+                            if (!isSafeSubmitButton(button)) continue;
+                            clickButton(button);
+                            return true;
+                        }
+                        const fallbackButtons = Array.from(scope.querySelectorAll('button, [role="button"]'));
+                        for (const button of fallbackButtons) {
+                            if (!isSafeSubmitButton(button)) continue;
+                            clickButton(button);
+                            return true;
+                        }
+                    }
+                    const form = el.closest('form');
+                    if (form && typeof form.requestSubmit === 'function') {
+                        form.requestSubmit();
+                        return true;
+                    }
+                    if (form && typeof form.submit === 'function') {
+                        form.submit();
+                        return true;
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        phone_form_submitted = False
+    if phone_form_submitted:
+        _sleep_with_page(page, 800)
+    if not phone_form_submitted:
+        phone_form_submitted = _request_submit_with_button(phone_input)
+    return phone_form_submitted
+
+
 def _is_phone_input_page(url: str, body_text: str, page: Any) -> bool:
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
@@ -3940,6 +4054,8 @@ def run_browser_registration(
     build_token_result_func: Optional[Callable[..., str]] = None,
     build_browser_session_token_func: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
     fallback_wait_for_otp_func: Optional[Callable[..., str]] = None,
+    wait_manual_phone_input_func: Optional[Callable[..., str]] = None,
+    wait_manual_sms_code_input_func: Optional[Callable[..., str]] = None,
     random_password_func: Optional[Callable[[int], str]] = None,
     random_profile_name_func: Optional[Callable[[], str]] = None,
     random_profile_birthdate_func: Optional[Callable[[], str]] = None,
@@ -4002,6 +4118,9 @@ def run_browser_registration(
     register_mode = str(cfg.get("register_mode") or "browser").strip().lower()
     is_manual_mode = register_mode == "browser_manual"
     is_manual_v2_mode = register_mode == "browser_manual_v2"
+    manual_v2_hidden_input_mode = is_manual_v2_mode and bool(cfg.get("browser_headless", False))
+    manual_v2_phone_panel_input_mode = is_manual_v2_mode and callable(wait_manual_phone_input_func)
+    manual_v2_sms_panel_input_mode = is_manual_v2_mode and callable(wait_manual_sms_code_input_func)
     use_plain_browser_env = False
     otp_wait_timeout_seconds = 20
     otp_max_resend_attempts = 20
@@ -4363,67 +4482,128 @@ def run_browser_registration(
             emitter.info("当前为可见浏览器模式，可直接观察页面流程用于排查", step="oauth_init")
 
     def _bootstrap_manual_v2_phone_entry(current_url: str, body_text: str) -> bool:
+        nonlocal manual_v2_entry_bootstrap_signature, manual_v2_entry_bootstrap_seen_at
+        nonlocal manual_v2_entry_bootstrap_wait_logged
+        signup_selectors = [
+            'a:has-text("Sign up")',
+            'button:has-text("Sign up")',
+            '[role="button"]:has-text("Sign up")',
+            'a:has-text("免费注册")',
+            'button:has-text("免费注册")',
+            '[role="button"]:has-text("免费注册")',
+            'a:has-text("注册")',
+            'button:has-text("注册")',
+            '[role="button"]:has-text("注册")',
+        ]
+        phone_entry_selectors = [
+            'button:has-text("Continue with phone")',
+            '[role="button"]:has-text("Continue with phone")',
+            'button:has-text("Use phone instead")',
+            '[role="button"]:has-text("Use phone instead")',
+            'button:has-text("Phone")',
+            '[role="button"]:has-text("Phone")',
+            'button:has-text("手机号")',
+            '[role="button"]:has-text("手机号")',
+            'button:has-text("使用手机")',
+            '[role="button"]:has-text("使用手机")',
+            'button:has-text("手机登录")',
+            '[role="button"]:has-text("手机登录")',
+        ]
+
+        def _entry_flow_ready(url_text: str, body_value: str) -> bool:
+            if _has_phone_input(page):
+                return True
+            return bool(
+                _is_phone_input_page(url_text, body_value, page)
+                or _is_phone_verification_page(url_text, body_value, page)
+                or _is_create_account_password_page(url_text, body_value, page)
+            )
+
+        def _wait_signup_transition(previous_url: str, previous_body: str, *, action_label: str) -> tuple[str, str]:
+            quick_deadline = time.time() + 1.8
+            latest_url = previous_url
+            latest_body = previous_body
+            while time.time() < quick_deadline:
+                latest_url, latest_body = _describe_page(page, force_refresh=True)
+                if _entry_flow_ready(latest_url, latest_body):
+                    return latest_url, latest_body
+                if _first_visible_locator(page, phone_entry_selectors) is not None:
+                    return latest_url, latest_body
+                _sleep_with_page(page, 120)
+            latest_url, latest_body = _wait_for_page_stabilize(
+                previous_url,
+                previous_body,
+                step="oauth_init",
+                action_label=action_label,
+                timeout_ms=7000,
+            )
+            settle_deadline = time.time() + 2.5
+            while time.time() < settle_deadline:
+                _wait_for_load(page, timeout_ms=1200)
+                latest_url, latest_body = _describe_page(page, force_refresh=True)
+                if _entry_flow_ready(latest_url, latest_body):
+                    return latest_url, latest_body
+                if _first_visible_locator(page, phone_entry_selectors) is not None:
+                    return latest_url, latest_body
+                _sleep_with_page(page, 250)
+            return latest_url, latest_body
+
         url_lower = str(current_url or "").lower()
-        body_lower = str(body_text or "").lower()
         if "chatgpt.com" not in url_lower:
             return False
-        if _has_phone_input(page):
+        if _entry_flow_ready(current_url, body_text):
+            manual_v2_entry_bootstrap_signature = ""
+            manual_v2_entry_bootstrap_seen_at = 0.0
+            manual_v2_entry_bootstrap_wait_logged = False
             return False
+
         clicked = False
-        if _click_first(
-            page,
-            [
-                'a:has-text("Sign up")',
-                'button:has-text("Sign up")',
-                '[role="button"]:has-text("Sign up")',
-                'a:has-text("免费注册")',
-                'button:has-text("免费注册")',
-                '[role="button"]:has-text("免费注册")',
-                'a:has-text("注册")',
-                'button:has-text("注册")',
-                '[role="button"]:has-text("注册")',
-            ],
-            timeout_ms=1200,
-        ):
+        signup_visible = _first_visible_locator(page, signup_selectors) is not None
+        phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
+        entry_signature = _page_snapshot_signature(current_url, body_text)
+        if signup_visible and not phone_entry_visible:
+            if entry_signature != manual_v2_entry_bootstrap_signature:
+                manual_v2_entry_bootstrap_signature = entry_signature
+                manual_v2_entry_bootstrap_seen_at = time.time()
+                manual_v2_entry_bootstrap_wait_logged = False
+            if time.time() - manual_v2_entry_bootstrap_seen_at < 1.6:
+                if not manual_v2_entry_bootstrap_wait_logged:
+                    manual_v2_entry_bootstrap_wait_logged = True
+                    emitter.info("浏览器模式2 首页注册入口已出现，先等待页面稳定再点击，避免误点空白弹层...", step="oauth_init")
+                return False
+        else:
+            manual_v2_entry_bootstrap_signature = ""
+            manual_v2_entry_bootstrap_seen_at = 0.0
+            manual_v2_entry_bootstrap_wait_logged = False
+
+        if not phone_entry_visible and signup_visible and _click_first(page, signup_selectors, timeout_ms=1200):
             emitter.info("浏览器模式2 已自动点击首页注册入口，准备拉起手机号注册界面...", step="oauth_init")
-            _wait_for_load(page, timeout_ms=2000)
             clicked = True
-        if _has_phone_input(page):
-            return True
-        if _click_first(
-            page,
-            [
-                'button:has-text("Continue with phone")',
-                '[role="button"]:has-text("Continue with phone")',
-                'button:has-text("Use phone instead")',
-                '[role="button"]:has-text("Use phone instead")',
-                'button:has-text("Phone")',
-                '[role="button"]:has-text("Phone")',
-                'button:has-text("手机号")',
-                '[role="button"]:has-text("手机号")',
-                'button:has-text("使用手机")',
-                '[role="button"]:has-text("使用手机")',
-                'button:has-text("手机登录")',
-                '[role="button"]:has-text("手机登录")',
-            ],
-            timeout_ms=1200,
-        ):
+            current_url, body_text = _wait_signup_transition(current_url, body_text, action_label="首页注册入口已点击")
+            if _entry_flow_ready(current_url, body_text):
+                return True
+            phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
+
+        if phone_entry_visible and _click_first(page, phone_entry_selectors, timeout_ms=1200):
             emitter.info("浏览器模式2 已自动切换到手机号注册入口，等待你输入手机号...", step="oauth_init")
-            _wait_for_load(page, timeout_ms=2000)
             clicked = True
-        if _has_phone_input(page):
+            current_url, body_text = _wait_signup_transition(current_url, body_text, action_label="手机号注册入口已点击")
+            if _entry_flow_ready(current_url, body_text):
+                return True
+
+        if _entry_flow_ready(current_url, body_text):
             return True
         if clicked:
-            return True
-        if (
-            "sign up" in body_lower
-            or "免费注册" in body_text
-            or "注册" in body_text
-            or "continue with phone" in body_lower
-            or "use phone instead" in body_lower
-            or "使用手机" in body_text
-        ):
-            return True
+            emitter.warn(
+                "浏览器模式2 首页入口点击后尚未真正进入手机号页，本轮按未成功处理，下一轮继续等待页面稳定后再试。"
+                + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
+                + f", state={_classify_page_state(current_url, body_text, page)}",
+                step="oauth_init",
+            )
+            emitter.info(
+                "首页入口点击后诊断: actions=" + _summarize_primary_actions(page),
+                step="oauth_init",
+            )
         return False
 
     def _bootstrap_manual_v2_login_entry(current_url: str, body_text: str) -> bool:
@@ -4748,6 +4928,8 @@ def run_browser_registration(
         nonlocal manual_v2_waiting_phone_retry, manual_v2_waiting_phone_retry_logged
         nonlocal manual_v2_require_phone_resubmit, manual_v2_reset_password_flow_started
         nonlocal manual_v2_reset_password_continue_clicked, manual_v2_entry_bootstrap_logged
+        nonlocal manual_v2_entry_bootstrap_signature, manual_v2_entry_bootstrap_seen_at
+        nonlocal manual_v2_entry_bootstrap_wait_logged
         nonlocal deadline, page
         callback_state["url"] = ""
         _reset_browser_phase_state(clear_profile=True)
@@ -4784,6 +4966,9 @@ def run_browser_registration(
         manual_v2_reset_password_flow_started = False
         manual_v2_reset_password_continue_clicked = False
         manual_v2_entry_bootstrap_logged = False
+        manual_v2_entry_bootstrap_signature = ""
+        manual_v2_entry_bootstrap_seen_at = 0.0
+        manual_v2_entry_bootstrap_wait_logged = False
         deadline = time.time() + max(6 * 60 * 60, int(cfg["browser_timeout_ms"] / 1000) + 60)
         emitter.warn(reason, step="oauth_init")
         _goto_with_recovery(
@@ -4800,6 +4985,43 @@ def run_browser_registration(
         )
         if not cfg["browser_headless"]:
             emitter.info("当前为可见浏览器模式，可直接观察 ChatGPT 首页到手机注册入口的切换过程", step="oauth_init")
+    manual_v2_require_phone_resubmit = False
+    manual_v2_reset_password_flow_started = False
+    manual_v2_reset_password_continue_clicked = False
+    manual_v2_entry_bootstrap_logged = False
+    manual_v2_entry_bootstrap_signature = ""
+    manual_v2_entry_bootstrap_seen_at = 0.0
+    manual_v2_entry_bootstrap_wait_logged = False
+
+    def _wait_manual_v2_phone_input(*, step: str, prompt: str, timeout_seconds: int = 3600) -> str:
+        if not callable(wait_manual_phone_input_func):
+            raise RuntimeError("浏览器模式2 当前未配置手机号人工输入通道")
+        return str(
+            wait_manual_phone_input_func(
+                prompt=prompt,
+                step=step,
+                timeout_seconds=timeout_seconds,
+                placeholder="请输入手机号，支持 +44 或本地格式",
+                button_text="提交手机号",
+                helper_text="当前为无头模式2，浏览器窗口不会显示；提交后程序会自动继续。",
+            )
+            or ""
+        ).strip()
+
+    def _wait_manual_v2_sms_code(*, step: str, prompt: str, timeout_seconds: int = 3600) -> str:
+        if not callable(wait_manual_sms_code_input_func):
+            raise RuntimeError("浏览器模式2 当前未配置短信验证码人工输入通道")
+        return str(
+            wait_manual_sms_code_input_func(
+                prompt=prompt,
+                step=step,
+                timeout_seconds=timeout_seconds,
+                placeholder="请输入 6 位短信验证码",
+                button_text="提交验证码",
+                helper_text="当前为无头模式2，提交验证码后程序会自动填入并继续；如果一直收不到码，可点“换手机号重来”。",
+            )
+            or ""
+        ).strip()
 
     def _restart_manual_v2_login_oauth(reason: str) -> bool:
         nonlocal current_phase, current_oauth, deadline, email_submitted, password_submitted
@@ -4927,6 +5149,16 @@ def run_browser_registration(
         + f"error_keep_open={'是' if cfg.get('browser_keep_open_on_error') else '否'}",
         step="oauth_init",
     )
+    if manual_v2_hidden_input_mode:
+        emitter.info(
+            "浏览器模式2 当前启用无头人工输入模式：浏览器窗口不会显示；手机号与短信验证码将在 Worker 详情面板中提交。",
+            step="oauth_init",
+        )
+    elif manual_v2_phone_panel_input_mode or manual_v2_sms_panel_input_mode:
+        emitter.info(
+            "浏览器模式2 当前启用页面运行面板人工输入模式：手机号与短信验证码优先在任务控制卡片中提交；可见浏览器仅用于观察流程。",
+            step="oauth_init",
+        )
     emitter.info(f"本次浏览器指纹: {describe_fingerprint(ctx.fingerprint_profile)}", step="oauth_init")
 
     playwright = sync_playwright().start()
@@ -5282,6 +5514,9 @@ def run_browser_registration(
                             is_login_password_page = _is_login_password_page(current_url, body_text, page)
                     else:
                         manual_v2_entry_bootstrap_logged = False
+                        manual_v2_entry_bootstrap_signature = ""
+                        manual_v2_entry_bootstrap_seen_at = 0.0
+                        manual_v2_entry_bootstrap_wait_logged = False
 
                     if is_create_password_page:
                         manual_v2_wait_phone_logged = False
@@ -5347,21 +5582,84 @@ def run_browser_registration(
                             manual_v2_reset_password_flow_started = False
                             manual_v2_reset_password_continue_clicked = False
                             manual_v2_password_page_logged = False
-                        if _manual_phone_input_ready(page):
-                            if not manual_v2_wait_phone_logged or manual_v2_wait_phone_last_url != current_url + "#ready":
-                                manual_v2_wait_phone_logged = True
-                                manual_v2_wait_phone_last_url = current_url + "#ready"
-                                emitter.info(
-                                    "浏览器模式2 检测到你已输入步骤1手机号，请你手动点击继续；提交后程序会自动接管后续流程...",
+                        if manual_v2_phone_panel_input_mode:
+                            previous_url = current_url
+                            previous_body = body_text
+                            if not manual_v2_phone_number:
+                                if not manual_v2_wait_phone_logged or manual_v2_wait_phone_last_url != current_url:
+                                    manual_v2_wait_phone_logged = True
+                                    manual_v2_wait_phone_last_url = current_url
+                                    emitter.info(
+                                        "浏览器模式2 已进入步骤1手机号页，请在任务控制卡片中输入手机号并提交；程序会自动继续注册...",
+                                        step="add_phone",
+                                    )
+                                manual_v2_phone_number = _wait_manual_v2_phone_input(
+                                    step="add_phone",
+                                    prompt="模式2步骤1需要手机号，请输入本次注册使用的手机号。",
+                                )
+                            manual_v2_wait_phone_logged = False
+                            manual_v2_wait_phone_last_url = current_url
+                            if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="add_phone"):
+                                raise RuntimeError("浏览器模式2 无头模式提交步骤1手机号失败")
+                            emitter.info("浏览器模式2 已自动提交步骤1手机号，等待进入创建密码页...", step="add_phone")
+                            current_url, body_text = _wait_for_page_stabilize(
+                                previous_url,
+                                previous_body,
+                                step="add_phone",
+                                action_label="步骤1手机号已提交",
+                                timeout_ms=18000,
+                            )
+                            if _is_phone_input_page(current_url, body_text, page):
+                                emitter.warn(
+                                    "浏览器模式2 步骤1手机号提交后仍停留在手机号页，继续观察下一轮页面变化..."
+                                    + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
+                                    + f", state={_classify_page_state(current_url, body_text, page)}",
                                     step="add_phone",
                                 )
-                            _sleep_with_page(page, 800)
+                                emitter.info(
+                                    "步骤1手机号页停留诊断: actions=" + _summarize_primary_actions(page),
+                                    step="add_phone",
+                                )
+                            continue
+                        if _manual_phone_input_ready(page):
+                            previous_url = current_url
+                            previous_body = body_text
+                            manual_v2_phone_number = _extract_input_value_by_hints(
+                                page,
+                                ["phone", "mobile", "手机号", "电话", "tel"],
+                            ) or manual_v2_phone_number
+                            manual_v2_wait_phone_logged = False
+                            manual_v2_wait_phone_last_url = current_url + "#ready"
+                            emitter.info(
+                                "浏览器模式2 已检测到你填好的手机号，准备自动提交并等待进入创建密码页...",
+                                step="add_phone",
+                            )
+                            if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="add_phone"):
+                                raise RuntimeError("浏览器模式2 步骤1手机号自动提交失败")
+                            current_url, body_text = _wait_for_page_stabilize(
+                                previous_url,
+                                previous_body,
+                                step="add_phone",
+                                action_label="步骤1手机号已提交",
+                                timeout_ms=18000,
+                            )
+                            if _is_phone_input_page(current_url, body_text, page):
+                                emitter.warn(
+                                    "浏览器模式2 步骤1手机号提交后仍停留在手机号页，继续观察下一轮页面变化..."
+                                    + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
+                                    + f", state={_classify_page_state(current_url, body_text, page)}",
+                                    step="add_phone",
+                                )
+                                emitter.info(
+                                    "步骤1手机号页停留诊断: actions=" + _summarize_primary_actions(page),
+                                    step="add_phone",
+                                )
                             continue
                         if not manual_v2_wait_phone_logged or manual_v2_wait_phone_last_url != current_url:
                             manual_v2_wait_phone_logged = True
                             manual_v2_wait_phone_last_url = current_url
                             emitter.info(
-                                "浏览器模式2 已进入步骤1手机号输入页，请先手动输入手机号；输完后请你手动点击继续...",
+                                "浏览器模式2 已进入步骤1手机号输入页，请先输入手机号；填好后程序会自动提交并继续...",
                                 step="add_phone",
                             )
                         _sleep_with_page(page, 800)
@@ -5409,6 +5707,44 @@ def run_browser_registration(
                         manual_v2_waiting_phone_retry = False
                         manual_v2_waiting_phone_retry_logged = False
                         manual_v2_require_phone_resubmit = False
+                        if manual_v2_sms_panel_input_mode:
+                            if not manual_v2_wait_contact_logged:
+                                manual_v2_wait_contact_logged = True
+                                emitter.info(
+                                    "浏览器模式2 已进入短信验证码页，请在任务控制卡片中输入短信验证码并提交...",
+                                    step="phone_verification",
+                                )
+                            sms_code = _wait_manual_v2_sms_code(
+                                step="phone_verification",
+                                prompt="模式2当前需要短信验证码，请输入本次收到的 6 位短信码。",
+                            )
+                            if sms_code == MANUAL_V2_RESTART_PHONE_SENTINEL:
+                                manual_v2_wait_contact_logged = False
+                                manual_v2_phone_number = ""
+                                manual_v2_contact_seen = False
+                                manual_v2_wait_phone_logged = False
+                                manual_v2_wait_phone_last_url = ""
+                                manual_v2_waiting_phone_retry = False
+                                manual_v2_waiting_phone_retry_logged = False
+                                manual_v2_require_phone_resubmit = False
+                                manual_v2_reset_password_flow_started = False
+                                manual_v2_reset_password_continue_clicked = False
+                                password_submitted = False
+                                _prepare_manual_v2_signup_flow(
+                                    "浏览器模式2 无头人工输入模式收到“换手机号重来”指令，"
+                                    + "准备回到步骤1重新输入新的手机号..."
+                                )
+                                continue
+                            if not _wait_and_fill_otp(page, sms_code, timeout_seconds=12.0):
+                                raise RuntimeError("浏览器模式2 无头模式填写短信验证码失败")
+                            if not _otp_controls_match_code(page, sms_code):
+                                raise RuntimeError("浏览器模式2 无头模式短信验证码回填校验失败")
+                            if not _click_primary_action(page, ["Continue", "Verify", "Submit", "继续", "下一步"], allow_generic_fallback=True):
+                                raise RuntimeError("浏览器模式2 无头模式提交短信验证码失败")
+                            manual_v2_wait_contact_logged = False
+                            emitter.info("浏览器模式2 已自动提交短信验证码，等待后续跳转...", step="phone_verification")
+                            _wait_for_load(page, timeout_ms=2000)
+                            continue
                         if _manual_contact_verification_ready(page):
                             if _click_primary_action(page, ["Continue", "Verify", "Submit", "继续", "下一步"], allow_generic_fallback=True):
                                 emitter.info("浏览器模式2 检测到你已填好手机验证码，已自动点击继续...", step="phone_verification")
@@ -5827,39 +6163,24 @@ def run_browser_registration(
                                     manual_v2_wait_phone_logged = True
                                     manual_v2_wait_phone_last_url = current_url
                                     emitter.info(
-                                        "浏览器模式2 当前位于手机号输入页，正等待读取你已输入的手机号，再自动提交登录...",
+                                        (
+                                            "浏览器模式2 当前位于第二步手机号输入页，请在任务控制卡片中提交手机号，程序会自动继续登录..."
+                                            if manual_v2_phone_panel_input_mode
+                                            else "浏览器模式2 当前位于手机号输入页，正等待读取你已输入的手机号，再自动提交登录..."
+                                        ),
                                         step="create_email",
                                     )
-                                _sleep_with_page(page, 800)
-                                continue
+                                if manual_v2_phone_panel_input_mode:
+                                    manual_v2_phone_number = _wait_manual_v2_phone_input(
+                                        step="create_email",
+                                        prompt="模式2第二步登录需要手机号，请输入与注册相同的手机号。",
+                                    )
+                                else:
+                                    _sleep_with_page(page, 800)
+                                    continue
                             manual_v2_wait_phone_logged = False
                             manual_v2_wait_phone_last_url = current_url
-                            if not _write_text_to_locator(phone_input, manual_v2_phone_number):
-                                raise RuntimeError("浏览器模式2 填写手机号失败")
-                            # 精确提交手机号表单：优先用手机号输入框所在 form 的 submit，
-                            # 避免误点 "Continue with Google" 等第三方登录按钮
-                            _phone_form_submitted = _request_submit_with_button(phone_input)
-                            if not _phone_form_submitted:
-                                # form.requestSubmit 失败时，尝试精确点击排除第三方按钮的 Continue
-                                _phone_form_submitted = _click_first(
-                                    page,
-                                    [
-                                        'button[type="submit"]:not(:has-text("Google")):not(:has-text("Microsoft")):not(:has-text("Apple"))',
-                                        'form button:not([disabled]):not(:has-text("Google")):not(:has-text("Microsoft")):not(:has-text("Apple"))',
-                                    ],
-                                    timeout_ms=1500,
-                                )
-                            if not _phone_form_submitted:
-                                _phone_form_submitted = _click_primary_action(
-                                    page, ["Continue", "Next", "\u7ee7\u7eed", "\u4e0b\u4e00\u6b65"], allow_generic_fallback=False
-                                )
-                            if not _phone_form_submitted:
-                                try:
-                                    page.keyboard.press("Enter")
-                                    _phone_form_submitted = True
-                                except Exception:
-                                    pass
-                            if not _phone_form_submitted:
+                            if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="create_email"):
                                 raise RuntimeError("浏览器模式2 提交手机号失败")
                             manual_v2_login_phone_submitted = True
                             manual_v2_post_login_pending_email = False

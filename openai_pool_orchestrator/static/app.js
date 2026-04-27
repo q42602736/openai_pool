@@ -56,6 +56,8 @@ const state = {
     snapshotRequested: false,
     forceStopEnabled: false,
     dataPanelTab: 'dataPanelSub2Api',
+    manualInputDrafts: {},
+    manualInputSubmitting: {},
   },
 };
 
@@ -170,6 +172,7 @@ document.addEventListener('DOMContentLoaded', () => {
     taskOverview: $('taskOverview'),
     workerList: $('workerList'),
     workerDetail: $('workerDetail'),
+    manualInputPanel: $('manualInputPanel'),
     unlockFocusBtn: $('unlockFocusBtn'),
     segmentIndicator: $('segmentIndicator'),
     autoScrollCheck: $('autoScrollCheck'),
@@ -323,7 +326,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (DOM.browserConfigSaveBtn) DOM.browserConfigSaveBtn.addEventListener('click', saveBrowserConfig);
   if (DOM.registerMode) {
     DOM.registerMode.addEventListener('change', () => {
-      if (DOM.registerMode.value === 'browser_manual' || DOM.registerMode.value === 'browser_manual_v2') {
+      if (DOM.registerMode.value === 'browser_manual') {
         if (DOM.browserVisible) { DOM.browserVisible.checked = true; DOM.browserVisible.disabled = true; }
       } else {
         if (DOM.browserVisible) { DOM.browserVisible.disabled = false; }
@@ -800,6 +803,24 @@ function normalizeWorkerSteps(steps) {
     .slice(-MAX_WORKER_STEP_ITEMS);
 }
 
+function normalizeWorkerManualInput(manualInput) {
+  const source = manualInput && typeof manualInput === 'object' ? manualInput : {};
+  return {
+    ...source,
+    pending: !!source.pending,
+    accepted: !!source.accepted,
+    kind: source.kind || '',
+    prompt: source.prompt || '',
+    step: source.step || '',
+    placeholder: source.placeholder || '',
+    button_text: source.button_text || '提交',
+    helper_text: source.helper_text || '',
+    request_id: source.request_id || '',
+    masked_value: source.masked_value || '',
+    updated_at: source.updated_at || '',
+  };
+}
+
 function normalizeWorker(worker, fallbackId = null) {
   const source = worker && typeof worker === 'object' ? worker : {};
   const workerId = normalizeWorkerId(source.worker_id ?? fallbackId);
@@ -818,6 +839,7 @@ function normalizeWorker(worker, fallbackId = null) {
     mail_provider: source.mail_provider || '',
     updated_at: source.updated_at || source.ts || '',
     steps: normalizeWorkerSteps(source.steps),
+    manual_input: normalizeWorkerManualInput(source.manual_input),
   };
 }
 
@@ -1328,6 +1350,160 @@ function renderWorkerList(workers, focusWorkerId) {
   });
 }
 
+function getManualInputDraftKey(workerId, requestId, kind) {
+  return [normalizeWorkerId(workerId) || '', String(requestId || '').trim(), String(kind || '').trim()].join(':');
+}
+
+async function submitWorkerManualInput(workerId, manualInput, overrideValue = null) {
+  const normalizedWorkerId = normalizeWorkerId(workerId);
+  const normalizedInput = normalizeWorkerManualInput(manualInput);
+  if (!normalizedWorkerId || !normalizedInput.request_id || !normalizedInput.kind) return;
+  const draftKey = getManualInputDraftKey(normalizedWorkerId, normalizedInput.request_id, normalizedInput.kind);
+  const isRestartPhone = overrideValue === '__manual_v2_restart_phone__';
+  const value = overrideValue === null
+    ? String(state.ui.manualInputDrafts[draftKey] || '').trim()
+    : String(overrideValue || '').trim();
+  if (!value) {
+    showToast('请输入内容后再提交', 'error');
+    return;
+  }
+  state.ui.manualInputSubmitting[draftKey] = true;
+  renderRuntimePanels();
+  try {
+    const res = await fetch('/api/runtime/manual-input', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        worker_id: Number(normalizedWorkerId),
+        kind: normalizedInput.kind,
+        value,
+        request_id: normalizedInput.request_id,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || '提交失败');
+    delete state.ui.manualInputDrafts[draftKey];
+    showToast(
+      isRestartPhone
+        ? '已请求回到手机号步骤'
+        : (normalizedInput.kind === 'phone_number' ? '手机号已提交' : '验证码已提交'),
+      'success',
+    );
+    if (data.worker) mergeWorkerIntoRuntime(data.worker);
+    else requestStatusSnapshot();
+  } catch (e) {
+    showToast(`提交失败: ${e.message}`, 'error');
+  } finally {
+    delete state.ui.manualInputSubmitting[draftKey];
+    renderRuntimePanels();
+  }
+}
+
+function buildWorkerManualInputCardHtml(focusWorker) {
+  const manualInput = normalizeWorkerManualInput(focusWorker?.manual_input);
+  if (!manualInput.pending) return '';
+  const manualInputDraftKey = getManualInputDraftKey(focusWorker.worker_id, manualInput.request_id, manualInput.kind);
+  const manualInputDraftValue = state.ui.manualInputDrafts[manualInputDraftKey] || '';
+  const manualInputSubmitting = !!state.ui.manualInputSubmitting[manualInputDraftKey];
+  const manualInputTitleMap = {
+    phone_number: '人工手机号输入',
+    sms_code: '人工短信验证码输入',
+  };
+  const canRestartPhone = manualInput.kind === 'sms_code';
+  return `
+    <div class="worker-manual-input-card">
+      <div class="worker-manual-input-head">
+        <span class="worker-manual-input-title">${escapeHtml(manualInputTitleMap[manualInput.kind] || '人工输入')}</span>
+        <span class="worker-manual-input-step">${escapeHtml(getStepDisplayLabel(manualInput.step || focusWorker.current_step || ''))}</span>
+      </div>
+      <div class="worker-manual-input-prompt">${escapeHtml(manualInput.prompt || '请完成当前人工输入')}</div>
+      ${manualInput.helper_text ? `<div class="worker-manual-input-helper">${escapeHtml(manualInput.helper_text)}</div>` : ''}
+      <div class="worker-manual-input-row">
+        <input
+          class="worker-manual-input-field"
+          type="${manualInput.kind === 'phone_number' ? 'tel' : 'text'}"
+          inputmode="${manualInput.kind === 'phone_number' ? 'tel' : 'numeric'}"
+          data-manual-input-key="${escapeHtml(manualInputDraftKey)}"
+          data-manual-input-worker="${escapeHtml(focusWorker.worker_id)}"
+          data-manual-input-kind="${escapeHtml(manualInput.kind)}"
+          data-manual-input-request="${escapeHtml(manualInput.request_id)}"
+          placeholder="${escapeHtml(manualInput.placeholder || '请输入')}"
+          value="${escapeHtml(manualInputDraftValue)}"
+          ${manualInputSubmitting ? 'disabled' : ''}
+        />
+        <button
+          class="btn btn-primary btn-sm worker-manual-input-submit"
+          type="button"
+          data-manual-submit-worker="${escapeHtml(focusWorker.worker_id)}"
+          data-manual-submit-kind="${escapeHtml(manualInput.kind)}"
+          data-manual-submit-request="${escapeHtml(manualInput.request_id)}"
+          ${manualInputSubmitting ? 'disabled' : ''}
+        >${escapeHtml(manualInputSubmitting ? '提交中...' : (manualInput.button_text || '提交'))}</button>
+        ${canRestartPhone ? `
+          <button
+            class="btn btn-ghost btn-sm worker-manual-input-restart"
+            type="button"
+            data-manual-restart-worker="${escapeHtml(focusWorker.worker_id)}"
+            data-manual-restart-kind="${escapeHtml(manualInput.kind)}"
+            data-manual-restart-request="${escapeHtml(manualInput.request_id)}"
+            ${manualInputSubmitting ? 'disabled' : ''}
+          >换手机号重来</button>
+        ` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function wireWorkerManualInputInteractions(container) {
+  if (!container) return;
+  container.querySelectorAll('[data-manual-input-key]').forEach((input) => {
+    input.addEventListener('input', (event) => {
+      const key = event.currentTarget.getAttribute('data-manual-input-key') || '';
+      state.ui.manualInputDrafts[key] = event.currentTarget.value || '';
+    });
+    input.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      submitWorkerManualInput(
+        event.currentTarget.getAttribute('data-manual-input-worker'),
+        {
+          kind: event.currentTarget.getAttribute('data-manual-input-kind'),
+          request_id: event.currentTarget.getAttribute('data-manual-input-request'),
+        },
+      );
+    });
+  });
+  container.querySelectorAll('[data-manual-submit-request]').forEach((button) => {
+    button.addEventListener('click', () => {
+      submitWorkerManualInput(button.getAttribute('data-manual-submit-worker'), {
+        kind: button.getAttribute('data-manual-submit-kind'),
+        request_id: button.getAttribute('data-manual-submit-request'),
+      });
+    });
+  });
+  container.querySelectorAll('[data-manual-restart-request]').forEach((button) => {
+    button.addEventListener('click', () => {
+      submitWorkerManualInput(button.getAttribute('data-manual-restart-worker'), {
+        kind: button.getAttribute('data-manual-restart-kind'),
+        request_id: button.getAttribute('data-manual-restart-request'),
+      }, '__manual_v2_restart_phone__');
+    });
+  });
+}
+
+function renderManualInputPanel(focusWorker) {
+  if (!DOM.manualInputPanel) return;
+  const manualInput = normalizeWorkerManualInput(focusWorker?.manual_input);
+  if (!focusWorker || !manualInput.pending) {
+    DOM.manualInputPanel.hidden = true;
+    DOM.manualInputPanel.innerHTML = '';
+    return;
+  }
+  DOM.manualInputPanel.hidden = false;
+  DOM.manualInputPanel.innerHTML = buildWorkerManualInputCardHtml(focusWorker);
+  wireWorkerManualInputInteractions(DOM.manualInputPanel);
+}
+
 function renderWorkerDetail(focusWorker) {
   if (!DOM.workerDetail) return;
   if (!focusWorker) {
@@ -1384,6 +1560,7 @@ function renderWorkerDetail(focusWorker) {
 }
 
 function renderRuntimePanels() {
+  renderManualInputPanel(getFocusWorker());
   renderTaskOverview(state.task, state.runtime, state.stats);
   renderWorkerList(state.runtime.workers, state.ui.focusWorkerId);
   renderWorkerDetail(getFocusWorker());
@@ -2080,7 +2257,7 @@ function applyBrowserConfig(cfg) {
   if (!cfg) return;
   if (DOM.registerMode) DOM.registerMode.value = cfg.register_mode || 'browser';
   if (DOM.browserVisible) DOM.browserVisible.checked = !cfg.browser_headless;
-  if ((cfg.register_mode === 'browser_manual' || cfg.register_mode === 'browser_manual_v2') && DOM.browserVisible) {
+  if (cfg.register_mode === 'browser_manual' && DOM.browserVisible) {
     DOM.browserVisible.checked = true;
     DOM.browserVisible.disabled = true;
   } else if (DOM.browserVisible) {
