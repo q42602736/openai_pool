@@ -1,0 +1,16 @@
+# 敏感配置
+config.json
+
+# 账号数据
+accounts.json
+
+# OAuth Token
+tokens/
+
+# 依赖
+node_modules/
+
+# 日志 & 临时文件
+*.log
+.env
+.env.*
