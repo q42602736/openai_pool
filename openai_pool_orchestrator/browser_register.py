@@ -4443,9 +4443,17 @@ def run_browser_registration(
             except Exception as exc:
                 last_exc = exc
                 message = str(exc or "")
+                tls_like_recoverable = (
+                    "net::ERR_SSL_PROTOCOL_ERROR" in message
+                    or "net::ERR_HTTP2_PROTOCOL_ERROR" in message
+                    or "net::ERR_QUIC_PROTOCOL_ERROR" in message
+                    or "net::ERR_CONNECTION_RESET" in message
+                    or "net::ERR_CONNECTION_CLOSED" in message
+                )
                 recoverable = (
                     "Target page, context or browser has been closed" in message
                     or "net::ERR_ABORTED" in message
+                    or tls_like_recoverable
                 )
                 if not recoverable or attempt >= total_attempts:
                     raise
@@ -4454,9 +4462,9 @@ def run_browser_registration(
                     + _page_navigation_debug_summary(nav_page),
                     step=step,
                 )
-                if "Target page, context or browser has been closed" in message:
+                if "Target page, context or browser has been closed" in message or tls_like_recoverable:
                     page = None
-                _sleep_with_page(None, 350)
+                _sleep_with_page(None, 700 if tls_like_recoverable else 350)
         if last_exc is not None:
             raise last_exc
         raise RuntimeError(f"{reason}；导航失败且未返回具体异常")
@@ -4560,7 +4568,7 @@ def run_browser_registration(
         clicked = False
         signup_visible = _first_visible_locator(page, signup_selectors) is not None
         phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
-        entry_signature = _page_snapshot_signature(current_url, body_text)
+        entry_signature = f"{url_lower}|signup:{1 if signup_visible else 0}|phone_entry:{1 if phone_entry_visible else 0}"
         if signup_visible and not phone_entry_visible:
             if entry_signature != manual_v2_entry_bootstrap_signature:
                 manual_v2_entry_bootstrap_signature = entry_signature
@@ -4977,6 +4985,7 @@ def run_browser_registration(
             reason="浏览器模式2 返回 ChatGPT 首页失败",
             wait_until="domcontentloaded",
             timeout_ms=cfg["browser_timeout_ms"],
+            max_attempts=3,
         )
         _wait_for_load(page, timeout_ms=2500)
         emitter.info(
@@ -5222,6 +5231,7 @@ def run_browser_registration(
                     reason="浏览器模式2 打开 ChatGPT 首页失败",
                     wait_until="domcontentloaded",
                     timeout_ms=cfg["browser_timeout_ms"],
+                    max_attempts=3,
                 )
                 _wait_for_load(page, timeout_ms=2500)
                 emitter.info(
@@ -7009,6 +7019,12 @@ def run_browser_registration(
                         action_label="超时错误页已触发当前页重试",
                         timeout_ms=15000,
                     ):
+                        continue
+                    if is_manual_v2_mode and not manual_v2_login_flow_started:
+                        timeout_recover_attempts = 0
+                        _prepare_manual_v2_signup_flow(
+                            "浏览器模式2 第一步注册流程出现超时错误页，准备回到步骤1重新输入手机号并重新注册..."
+                        )
                         continue
                     _restart_current_page_oauth_flow(
                         target_phase=("login" if current_phase != "login" else current_phase),
