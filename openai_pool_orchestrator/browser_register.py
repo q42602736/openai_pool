@@ -4838,6 +4838,58 @@ def run_browser_registration(
             _sleep_with_page(page, 450)
         return _describe_page(page, force_refresh=True)
 
+    def _wait_for_manual_v2_phone_submit_transition(
+        previous_url: str,
+        previous_body: str,
+        *,
+        step: str = "add_phone",
+        timeout_ms: int = 18000,
+    ) -> tuple[str, str]:
+        previous_url_lower = str(previous_url or "").lower()
+        previous_state = _classify_page_state(previous_url, previous_body, page)
+        deadline_local = time.time() + max(2.0, float(timeout_ms) / 1000.0)
+        wait_logged = False
+        latest_url = previous_url
+        latest_body = previous_body
+        while time.time() < deadline_local:
+            if stop_event is not None and stop_event.is_set():
+                return latest_url, latest_body
+            active_page = _resolve_active_page(page, timeout_ms=300)
+            if active_page is None:
+                if callback_state["url"]:
+                    return latest_url, latest_body
+                if not wait_logged:
+                    wait_logged = True
+                    emitter.info("步骤1手机号已提交，等待页面稳定并切换到下一阶段...", step=step)
+                _sleep_with_page(None, 200)
+                continue
+            if not callback_state["url"]:
+                _consume_loopback_callback()
+            latest_url, latest_body = _describe_page(page, force_refresh=True)
+            latest_url_lower = latest_url.lower()
+            latest_state = _classify_page_state(latest_url, latest_body, page)
+            if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
+                return latest_url, latest_body
+            if _is_create_account_password_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if _is_contact_verification_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if latest_state != previous_state:
+                return latest_url, latest_body
+            if latest_url_lower and latest_url_lower != previous_url_lower:
+                return latest_url, latest_body
+            if not wait_logged:
+                wait_logged = True
+                emitter.info("步骤1手机号已提交，等待页面稳定并切换到下一阶段...", step=step)
+            _sleep_with_page(page, 250)
+        emitter.warn(
+            "浏览器模式2 步骤1手机号提交后的短轮询观察超时，先返回当前页面继续主循环诊断..."
+            + f" current_url={_mask_secret(latest_url, head=56, tail=12)}"
+            + f", state={_classify_page_state(latest_url, latest_body, page)}",
+            step=step,
+        )
+        return _describe_page(page, force_refresh=True)
+
     def _prepare_manual_v2_login_flow(reason: str) -> None:
         nonlocal current_phase, email_submitted, password_submitted, profile_submitted
         nonlocal current_oauth, manual_v2_login_oauth
@@ -5612,11 +5664,9 @@ def run_browser_registration(
                             if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="add_phone"):
                                 raise RuntimeError("浏览器模式2 无头模式提交步骤1手机号失败")
                             emitter.info("浏览器模式2 已自动提交步骤1手机号，等待进入创建密码页...", step="add_phone")
-                            current_url, body_text = _wait_for_page_stabilize(
+                            current_url, body_text = _wait_for_manual_v2_phone_submit_transition(
                                 previous_url,
                                 previous_body,
-                                step="add_phone",
-                                action_label="步骤1手机号已提交",
                                 timeout_ms=18000,
                             )
                             if _is_phone_input_page(current_url, body_text, page):
@@ -5646,11 +5696,9 @@ def run_browser_registration(
                             )
                             if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="add_phone"):
                                 raise RuntimeError("浏览器模式2 步骤1手机号自动提交失败")
-                            current_url, body_text = _wait_for_page_stabilize(
+                            current_url, body_text = _wait_for_manual_v2_phone_submit_transition(
                                 previous_url,
                                 previous_body,
-                                step="add_phone",
-                                action_label="步骤1手机号已提交",
                                 timeout_ms=18000,
                             )
                             if _is_phone_input_page(current_url, body_text, page):
