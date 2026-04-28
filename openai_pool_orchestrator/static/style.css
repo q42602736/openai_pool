@@ -1180,13 +1180,32 @@ input::placeholder { color: var(--text-muted); }
 }
 
 .worker-manual-input-row {
-  display: flex;
+  display: grid;
   gap: 8px;
 }
 
 .worker-manual-input-field {
-  flex: 1 1 auto;
   min-width: 0;
+  width: 100%;
+}
+
+.worker-manual-input-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.worker-manual-input-actions .btn {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.worker-manual-input-submit,
+.worker-manual-input-restart {
+  white-space: normal;
+  text-align: center;
+  line-height: 1.25;
+  min-height: 36px;
 }
 
 .worker-detail-steps-title {
@@ -1280,6 +1299,10 @@ input::placeholder { color: var(--text-muted); }
   }
 
   .worker-manual-input-row {
+    grid-template-columns: 1fr;
+  }
+
+  .worker-manual-input-actions {
     flex-direction: column;
   }
 

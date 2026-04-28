@@ -1431,24 +1431,26 @@ function buildWorkerManualInputCardHtml(focusWorker) {
           value="${escapeHtml(manualInputDraftValue)}"
           ${manualInputSubmitting ? 'disabled' : ''}
         />
-        <button
-          class="btn btn-primary btn-sm worker-manual-input-submit"
-          type="button"
-          data-manual-submit-worker="${escapeHtml(focusWorker.worker_id)}"
-          data-manual-submit-kind="${escapeHtml(manualInput.kind)}"
-          data-manual-submit-request="${escapeHtml(manualInput.request_id)}"
-          ${manualInputSubmitting ? 'disabled' : ''}
-        >${escapeHtml(manualInputSubmitting ? '提交中...' : (manualInput.button_text || '提交'))}</button>
-        ${canRestartPhone ? `
+        <div class="worker-manual-input-actions">
           <button
-            class="btn btn-ghost btn-sm worker-manual-input-restart"
+            class="btn btn-primary btn-sm worker-manual-input-submit"
             type="button"
-            data-manual-restart-worker="${escapeHtml(focusWorker.worker_id)}"
-            data-manual-restart-kind="${escapeHtml(manualInput.kind)}"
-            data-manual-restart-request="${escapeHtml(manualInput.request_id)}"
+            data-manual-submit-worker="${escapeHtml(focusWorker.worker_id)}"
+            data-manual-submit-kind="${escapeHtml(manualInput.kind)}"
+            data-manual-submit-request="${escapeHtml(manualInput.request_id)}"
             ${manualInputSubmitting ? 'disabled' : ''}
-          >换手机号重来</button>
-        ` : ''}
+          >${escapeHtml(manualInputSubmitting ? '提交中...' : (manualInput.button_text || '提交'))}</button>
+          ${canRestartPhone ? `
+            <button
+              class="btn btn-ghost btn-sm worker-manual-input-restart"
+              type="button"
+              data-manual-restart-worker="${escapeHtml(focusWorker.worker_id)}"
+              data-manual-restart-kind="${escapeHtml(manualInput.kind)}"
+              data-manual-restart-request="${escapeHtml(manualInput.request_id)}"
+              ${manualInputSubmitting ? 'disabled' : ''}
+            >换手机号重来</button>
+          ` : ''}
+        </div>
       </div>
     </div>
   `;

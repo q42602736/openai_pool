@@ -1220,6 +1220,68 @@ def _is_timeout_error_page(url: str, body_text: str) -> bool:
     )
 
 
+def _is_phone_sms_send_failed_error(url: str, body_text: str, page: Any = None) -> bool:
+    url_lower = str(url or "").lower()
+    text = str(body_text or "")
+    text_lower = text.lower()
+    english_hints = (
+        "unable to send a text message to this phone number",
+        "unable to send a text message",
+        "unable to send text message to this phone number",
+        "we couldn't send a text message to this phone number",
+        "we couldn't send a text to this phone number",
+        "couldn't send a text message to this phone number",
+        "could not send a text message to this phone number",
+        "cannot send a text message to this phone number",
+        "this phone number is not supported",
+    )
+    chinese_hints = (
+        "无法向此电话号码发送短信",
+        "无法向该手机号发送短信",
+        "无法向这个手机号发送短信",
+        "不能向此电话号码发送短信",
+        "不能向该手机号发送短信",
+        "无法发送短信到此号码",
+    )
+    if any(hint in text_lower for hint in english_hints):
+        return True
+    if any(hint in text for hint in chinese_hints):
+        return True
+    if page is None:
+        return False
+    raw_text = _get_body_raw_text(page)
+    raw_lower = str(raw_text or "").lower()
+    if any(hint in raw_lower for hint in english_hints):
+        return True
+    if any(hint in str(raw_text or "") for hint in chinese_hints):
+        return True
+    if "auth.openai.com" not in url_lower and "/reset-password" not in url_lower:
+        return False
+    try:
+        alert_text = str(
+            page.evaluate(
+                """() => {
+                    const nodes = Array.from(document.querySelectorAll('[role="alert"], [aria-live="assertive"], [aria-live="polite"]'));
+                    const parts = [];
+                    for (const node of nodes) {
+                        const text = String(node.innerText || node.textContent || '').trim();
+                        if (text) parts.push(text);
+                    }
+                    return parts.join('\\n');
+                }"""
+            )
+            or ""
+        )
+    except Exception:
+        alert_text = ""
+    alert_lower = alert_text.lower()
+    if any(hint in alert_lower for hint in english_hints):
+        return True
+    if any(hint in alert_text for hint in chinese_hints):
+        return True
+    return False
+
+
 def _extract_browser_context_session_token(context: Any) -> str:
     cookie_names = (
         "__Secure-next-auth.session-token",
@@ -1842,7 +1904,35 @@ def _submit_create_account_password_like_codex_registrar(
         typed = True
     except Exception:
         typed = False
-    if not typed and not _write_text_to_locator(password_input, pwd, timeout_ms=1500):
+    typed_value = _locator_value(password_input, timeout_ms=500)
+    if (not typed or typed_value != pwd) and not _write_text_to_locator(password_input, pwd, timeout_ms=1500):
+        return False
+    typed_value = _locator_value(password_input, timeout_ms=500)
+    if typed_value != pwd:
+        try:
+            password_input.evaluate(
+                """(el, newValue) => {
+                    if (!el) return false;
+                    el.focus();
+                    if ('value' in el) {
+                        el.value = newValue;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.blur();
+                    return true;
+                }""",
+                pwd,
+            )
+        except Exception:
+            pass
+    typed_value = _locator_value(password_input, timeout_ms=500)
+    if typed_value != pwd:
+        if emitter is not None:
+            try:
+                emitter.warn("浏览器模式2 create-account/password 密码输入值校验失败，当前页不会继续提交。", step=step)
+            except Exception:
+                pass
         return False
     _sleep_with_page(page, 500)
     try:
@@ -1891,6 +1981,82 @@ def _submit_create_account_password_like_codex_registrar(
             pass
         try:
             page.mouse.click(float(submit_position.get("x") or 0), float(submit_position.get("y") or 0))
+        except Exception:
+            pass
+    _sleep_with_page(page, 1200)
+    latest_url, latest_body = _describe_page(page, force_refresh=True)
+    if _is_create_account_password_page(latest_url, latest_body, page):
+        submit_result = None
+        try:
+            submit_result = page.evaluate(
+                """() => {
+                    const preferredTexts = ['继续', 'Continue', 'Next', 'Verify', 'Submit', 'Create account', 'Sign up'];
+                    const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, input[type="submit"], [role="button"]'));
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const pickButton = () => {
+                        for (const button of buttons) {
+                            const text = String(button.innerText || button.textContent || button.value || '').trim();
+                            if (!isVisible(button) || button.disabled) continue;
+                            if (!preferredTexts.some((item) => text === item || text.includes(item))) continue;
+                            return button;
+                        }
+                        for (const button of buttons) {
+                            if (!isVisible(button) || button.disabled) continue;
+                            return button;
+                        }
+                        return null;
+                    };
+                    const button = pickButton();
+                    if (!button) return { ok: false, method: 'none', text: '' };
+                    const text = String(button.innerText || button.textContent || button.value || '').trim() || 'submit';
+                    const form = button.closest('form');
+                    try { button.focus(); } catch (e) {}
+                    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+                        try {
+                            button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                        } catch (e) {}
+                    });
+                    try {
+                        if (form && typeof form.requestSubmit === 'function') {
+                            form.requestSubmit(button);
+                            return { ok: true, method: 'requestSubmit', text };
+                        }
+                    } catch (e) {}
+                    try {
+                        if (typeof button.click === 'function') {
+                            button.click();
+                            return { ok: true, method: 'button.click', text };
+                        }
+                    } catch (e) {}
+                    try {
+                        if (form && typeof form.submit === 'function') {
+                            form.submit();
+                            return { ok: true, method: 'form.submit', text };
+                        }
+                    } catch (e) {}
+                    return { ok: true, method: 'event-dispatch', text };
+                }"""
+            )
+        except Exception:
+            submit_result = None
+        if isinstance(submit_result, dict) and emitter is not None:
+            try:
+                emitter.info(
+                    "浏览器模式2 create-account/password 二次提交兜底动作: "
+                    + str(submit_result.get("method") or "unknown")
+                    + " -> "
+                    + str(submit_result.get("text") or "submit"),
+                    step=step,
+                )
+            except Exception:
+                pass
+        try:
+            page.keyboard.press("Enter")
         except Exception:
             pass
     _wait_for_load(page, timeout_ms=2500)
@@ -3074,10 +3240,195 @@ def _manual_contact_verification_ready(page: Any) -> bool:
     return False
 
 
+def _normalize_manual_v2_phone_number(raw_phone: str) -> Dict[str, str]:
+    text = str(raw_phone or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    info: Dict[str, str] = {
+        "raw": text,
+        "digits": digits,
+        "canonical_phone": text,
+        "country_dial_code": "",
+        "country_iso": "",
+        "country_hint": "",
+        "local_number": text,
+    }
+    if not digits:
+        return info
+    if text.startswith("+44") or (digits.startswith("44") and len(digits) >= 11):
+        local_number = digits[2:]
+        info.update(
+            {
+                "canonical_phone": f"+{digits}" if digits else text,
+                "country_dial_code": "44",
+                "country_iso": "GB",
+                "country_hint": "United Kingdom",
+                "local_number": local_number or text,
+            }
+        )
+        return info
+    if digits.startswith("07") and len(digits) >= 10:
+        info.update(
+            {
+                "canonical_phone": digits,
+                "country_dial_code": "44",
+                "country_iso": "GB",
+                "country_hint": "United Kingdom",
+                "local_number": digits,
+            }
+        )
+        return info
+    if text.startswith("+"):
+        info["canonical_phone"] = "+" + digits if digits else text
+        return info
+    if digits and not digits.startswith("0"):
+        info["canonical_phone"] = f"+{digits}"
+    return info
+
+
+def _ensure_manual_v2_phone_country(
+    page: Any,
+    *,
+    dial_code: str,
+    country_iso: str = "",
+    country_hint: str = "",
+) -> bool:
+    if page is None or not str(dial_code or "").strip():
+        return False
+    dial = str(dial_code or "").strip().lstrip("+")
+    iso = str(country_iso or "").strip().upper()
+    hint = str(country_hint or "").strip()
+    hint_candidates = [item for item in [hint, "United Kingdom" if iso == "GB" else "", "英国" if iso == "GB" else "", f"+{dial}", f"({dial})"] if item]
+    try:
+        result = page.evaluate(
+            """({ dialCode, isoCode, hintCandidates }) => {
+                const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const hints = (hintCandidates || []).map(normalize).filter(Boolean);
+                const visible = (node) => {
+                    if (!node) return false;
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const textOf = (node) => normalize(
+                    node?.innerText
+                    || node?.textContent
+                    || node?.value
+                    || node?.getAttribute?.('aria-label')
+                    || ''
+                );
+                const matches = (value) => {
+                    const text = normalize(value);
+                    if (!text) return false;
+                    return hints.some((hint) => text.includes(hint));
+                };
+                const currentMatches = () => {
+                    for (const select of Array.from(document.querySelectorAll('select'))) {
+                        try {
+                            if (isoCode && normalize(select.value) === normalize(isoCode)) return true;
+                        } catch (e) {}
+                        const selected = select.options?.[select.selectedIndex];
+                        if (selected && matches(selected.text || selected.label || selected.value || '')) return true;
+                    }
+                    for (const node of Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"]'))) {
+                        if (!visible(node)) continue;
+                        if (matches(textOf(node))) return true;
+                    }
+                    return false;
+                };
+                if (currentMatches()) return 'already';
+                for (const select of Array.from(document.querySelectorAll('select'))) {
+                    const options = Array.from(select.options || []);
+                    const matched = options.find((option) => {
+                        const optionValue = normalize(option.value || '');
+                        const optionText = option.text || option.label || option.value || '';
+                        return (isoCode && optionValue === normalize(isoCode)) || matches(optionText);
+                    });
+                    if (!matched) continue;
+                    try {
+                        select.value = matched.value;
+                        select.dispatchEvent(new Event('input', { bubbles: true }));
+                        select.dispatchEvent(new Event('change', { bubbles: true }));
+                    } catch (e) {}
+                    if (currentMatches()) return 'select';
+                }
+                const clickNode = (node) => {
+                    try { node.focus?.(); } catch (e) {}
+                    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+                        try {
+                            node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                        } catch (e) {}
+                    });
+                };
+                const openers = Array.from(document.querySelectorAll('button[aria-haspopup="listbox"], [role="combobox"], button, [role="button"]'));
+                for (const opener of openers) {
+                    if (!visible(opener)) continue;
+                    const text = textOf(opener);
+                    if (!(text.includes('+') || text.includes('country') || text.includes('region') || text.includes('国家') || text.includes('区号') || matches(text))) continue;
+                    clickNode(opener);
+                    break;
+                }
+                const options = Array.from(document.querySelectorAll('[role="option"], [role="listbox"] *, [data-key], li, button, [role="button"]'));
+                for (const option of options) {
+                    if (!visible(option)) continue;
+                    const optionText = textOf(option);
+                    const dataKey = normalize(option.getAttribute?.('data-key') || '');
+                    if ((isoCode && dataKey === normalize(isoCode)) || matches(optionText)) {
+                        clickNode(option);
+                        if (currentMatches()) return 'option';
+                    }
+                }
+                return currentMatches() ? 'matched' : '';
+            }""",
+            {"dialCode": dial, "isoCode": iso, "hintCandidates": hint_candidates},
+        )
+        return bool(str(result or "").strip())
+    except Exception:
+        pass
+
+    visible_selects = _collect_visible_locators(
+        page,
+        [
+            'select',
+            '[role="combobox"]',
+            'button[aria-haspopup="listbox"]',
+        ],
+        limit=6,
+    )
+    candidates = [item for item in [iso, hint, "英国" if iso == "GB" else "", f"+{dial}", f"({dial})"] if item]
+    for locator in visible_selects:
+        if _choose_first_supported_option(page, locator, candidates, timeout_ms=1200):
+            return True
+    option_selectors = [f'[role="option"]:has-text("+{dial}")', f'[role="listbox"] *:has-text("+{dial}")', f'li:has-text("+{dial}")']
+    if iso:
+        option_selectors.insert(0, f'[data-key="{iso}"]')
+    if hint:
+        option_selectors.insert(1, f'[role="option"]:has-text("{hint}")')
+    if iso == "GB":
+        option_selectors.insert(2, '[role="option"]:has-text("英国")')
+    option = _first_visible_locator(page, option_selectors)
+    if option is not None:
+        try:
+            option.click(timeout=1200)
+            return True
+        except Exception:
+            return False
+    return False
+
+
 def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "add_phone") -> bool:
     phone_text = str(phone_number or "").strip()
     if page is None or not phone_text:
         return False
+    phone_meta = _normalize_manual_v2_phone_number(phone_text)
+    normalized_phone_text = str(phone_meta.get("canonical_phone") or phone_text).strip()
+    dial_code = str(phone_meta.get("country_dial_code") or "").strip()
+    if dial_code:
+        _ensure_manual_v2_phone_country(
+            page,
+            dial_code=dial_code,
+            country_iso=str(phone_meta.get("country_iso") or "").strip(),
+            country_hint=str(phone_meta.get("country_hint") or "").strip(),
+        )
     phone_input = _first_visible_locator(
         page,
         [
@@ -3094,7 +3445,7 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
     )
     if phone_input is None:
         return False
-    if not _write_text_to_locator(phone_input, phone_text):
+    if not _write_text_to_locator(phone_input, normalized_phone_text):
         return False
     try:
         phone_input.click(timeout=1200)
@@ -4134,6 +4485,7 @@ def run_browser_registration(
     manual_v2_wait_contact_logged = False
     manual_v2_contact_transition_last_key = ""
     manual_v2_contact_seen = False
+    manual_v2_sms_code_submitted = False
     manual_v2_login_flow_started = False
     manual_v2_phone_entry_clicked = False
     manual_v2_login_phone_prefilled = False
@@ -4890,10 +5242,183 @@ def run_browser_registration(
         )
         return _describe_page(page, force_refresh=True)
 
+    def _wait_for_manual_v2_create_password_transition(
+        previous_url: str,
+        previous_body: str,
+        *,
+        step: str = "create_password",
+        timeout_ms: int = 20000,
+    ) -> tuple[str, str]:
+        previous_url_lower = str(previous_url or "").lower()
+        previous_state = _classify_page_state(previous_url, previous_body, page)
+        deadline_local = time.time() + max(2.0, float(timeout_ms) / 1000.0)
+        wait_logged = False
+        latest_url = previous_url
+        latest_body = previous_body
+        while time.time() < deadline_local:
+            if stop_event is not None and stop_event.is_set():
+                return latest_url, latest_body
+            active_page = _resolve_active_page(page, timeout_ms=300)
+            if active_page is None:
+                if callback_state["url"]:
+                    return latest_url, latest_body
+                if not wait_logged:
+                    wait_logged = True
+                    emitter.info("create-account/password 已提交，等待页面稳定并切换到下一阶段...", step=step)
+                _sleep_with_page(None, 200)
+                continue
+            if not callback_state["url"]:
+                _consume_loopback_callback()
+            latest_url, latest_body = _describe_page(page, force_refresh=True)
+            latest_url_lower = latest_url.lower()
+            latest_state = _classify_page_state(latest_url, latest_body, page)
+            if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
+                return latest_url, latest_body
+            if _is_contact_verification_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if _is_timeout_error_page(latest_url, latest_body):
+                return latest_url, latest_body
+            if _is_profile_page(latest_url, latest_body):
+                return latest_url, latest_body
+            if latest_state != previous_state:
+                return latest_url, latest_body
+            if latest_url_lower and latest_url_lower != previous_url_lower:
+                return latest_url, latest_body
+            if not wait_logged:
+                wait_logged = True
+                emitter.info("create-account/password 已提交，等待页面稳定并切换到下一阶段...", step=step)
+            _sleep_with_page(page, 250)
+        emitter.warn(
+            "浏览器模式2 create-account/password 提交后的短轮询观察超时，先返回当前页面继续主循环诊断..."
+            + f" current_url={_mask_secret(latest_url, head=56, tail=12)}"
+            + f", state={_classify_page_state(latest_url, latest_body, page)}",
+            step=step,
+        )
+        return _describe_page(page, force_refresh=True)
+
+    def _wait_for_manual_v2_contact_submit_transition(
+        previous_url: str,
+        previous_body: str,
+        *,
+        step: str = "phone_verification",
+        timeout_ms: int = 12000,
+    ) -> tuple[str, str]:
+        previous_url_lower = str(previous_url or "").lower()
+        previous_state = _classify_page_state(previous_url, previous_body, page)
+        deadline_local = time.time() + max(2.0, float(timeout_ms) / 1000.0)
+        wait_logged = False
+        latest_url = previous_url
+        latest_body = previous_body
+        invalid_code_hints = (
+            "invalid code",
+            "incorrect code",
+            "expired code",
+            "wrong code",
+            "verification failed",
+            "验证码无效",
+            "验证码错误",
+            "验证码已过期",
+            "验证失败",
+        )
+        while time.time() < deadline_local:
+            if stop_event is not None and stop_event.is_set():
+                return latest_url, latest_body
+            active_page = _resolve_active_page(page, timeout_ms=300)
+            if active_page is None:
+                if callback_state["url"]:
+                    return latest_url, latest_body
+                if not wait_logged:
+                    wait_logged = True
+                    emitter.info("短信验证码已提交，等待页面跳转并确认后续状态...", step=step)
+                _sleep_with_page(None, 200)
+                continue
+            if not callback_state["url"]:
+                _consume_loopback_callback()
+            latest_url, latest_body = _describe_page(page, force_refresh=True)
+            latest_url_lower = latest_url.lower()
+            latest_state = _classify_page_state(latest_url, latest_body, page)
+            latest_body_lower = str(latest_body or "").lower()
+            if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
+                return latest_url, latest_body
+            if latest_state != previous_state:
+                return latest_url, latest_body
+            if latest_url_lower and latest_url_lower != previous_url_lower:
+                return latest_url, latest_body
+            if any(hint in latest_body_lower for hint in invalid_code_hints):
+                return latest_url, latest_body
+            if not wait_logged:
+                wait_logged = True
+                emitter.info("短信验证码已提交，等待页面跳转并确认后续状态...", step=step)
+            _sleep_with_page(page, 250)
+        emitter.warn(
+            "浏览器模式2 短信验证码提交后的短轮询观察超时，先返回当前页面继续主循环诊断..."
+            + f" current_url={_mask_secret(latest_url, head=56, tail=12)}"
+            + f", state={_classify_page_state(latest_url, latest_body, page)}",
+            step=step,
+        )
+        return _describe_page(page, force_refresh=True)
+
+    def _wait_for_manual_v2_reset_password_continue_transition(
+        previous_url: str,
+        previous_body: str,
+        *,
+        step: str = "create_password",
+        timeout_ms: int = 10000,
+    ) -> tuple[str, str]:
+        previous_url_lower = str(previous_url or "").lower()
+        previous_state = _classify_page_state(previous_url, previous_body, page)
+        deadline_local = time.time() + max(2.0, float(timeout_ms) / 1000.0)
+        wait_logged = False
+        latest_url = previous_url
+        latest_body = previous_body
+        while time.time() < deadline_local:
+            if stop_event is not None and stop_event.is_set():
+                return latest_url, latest_body
+            active_page = _resolve_active_page(page, timeout_ms=300)
+            if active_page is None:
+                if callback_state["url"]:
+                    return latest_url, latest_body
+                if not wait_logged:
+                    wait_logged = True
+                    emitter.info("reset-password 已点击继续，等待短信验证码页或发码结果...", step=step)
+                _sleep_with_page(None, 200)
+                continue
+            if not callback_state["url"]:
+                _consume_loopback_callback()
+            latest_url, latest_body = _describe_page(page, force_refresh=True)
+            latest_url_lower = latest_url.lower()
+            latest_state = _classify_page_state(latest_url, latest_body, page)
+            if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
+                return latest_url, latest_body
+            if _is_phone_sms_send_failed_error(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if _is_contact_verification_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if _is_reset_password_new_password_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if _is_timeout_error_page(latest_url, latest_body):
+                return latest_url, latest_body
+            if latest_state != previous_state:
+                return latest_url, latest_body
+            if latest_url_lower and latest_url_lower != previous_url_lower:
+                return latest_url, latest_body
+            if not wait_logged:
+                wait_logged = True
+                emitter.info("reset-password 已点击继续，等待短信验证码页或发码结果...", step=step)
+            _sleep_with_page(page, 250)
+        emitter.warn(
+            "浏览器模式2 reset-password 点击继续后的短轮询观察超时，先返回当前页面继续主循环诊断..."
+            + f" current_url={_mask_secret(latest_url, head=56, tail=12)}"
+            + f", state={_classify_page_state(latest_url, latest_body, page)}",
+            step=step,
+        )
+        return _describe_page(page, force_refresh=True)
+
     def _prepare_manual_v2_login_flow(reason: str) -> None:
         nonlocal current_phase, email_submitted, password_submitted, profile_submitted
         nonlocal current_oauth, manual_v2_login_oauth
         nonlocal manual_v2_contact_seen, manual_v2_wait_contact_logged, manual_v2_contact_transition_last_key
+        nonlocal manual_v2_sms_code_submitted
         nonlocal manual_v2_login_flow_started, manual_v2_phone_entry_clicked
         nonlocal manual_v2_login_phone_prefilled, manual_v2_login_password_prefilled
         nonlocal manual_v2_login_phone_submitted, manual_v2_post_login_pending_email
@@ -4916,6 +5441,7 @@ def run_browser_registration(
         manual_v2_contact_seen = False
         manual_v2_wait_contact_logged = False
         manual_v2_contact_transition_last_key = ""
+        manual_v2_sms_code_submitted = False
         manual_v2_login_flow_started = True
         manual_v2_phone_entry_clicked = False
         manual_v2_login_phone_prefilled = False
@@ -4976,6 +5502,7 @@ def run_browser_registration(
         nonlocal current_phase, email_submitted, password_submitted, profile_submitted
         nonlocal current_oauth, manual_v2_login_oauth
         nonlocal manual_v2_contact_seen, manual_v2_wait_contact_logged, manual_v2_contact_transition_last_key
+        nonlocal manual_v2_sms_code_submitted
         nonlocal manual_v2_login_flow_started, manual_v2_phone_entry_clicked
         nonlocal manual_v2_login_phone_prefilled, manual_v2_login_password_prefilled
         nonlocal manual_v2_login_phone_submitted, manual_v2_post_login_pending_email
@@ -5002,6 +5529,7 @@ def run_browser_registration(
         manual_v2_contact_seen = False
         manual_v2_wait_contact_logged = False
         manual_v2_contact_transition_last_key = ""
+        manual_v2_sms_code_submitted = False
         manual_v2_login_flow_started = False
         manual_v2_phone_entry_clicked = False
         manual_v2_login_phone_prefilled = False
@@ -5624,13 +6152,27 @@ def run_browser_registration(
                             "浏览器模式2 首轮注册密码已提交，等待站点自然跳转后续页面...",
                             step="create_password",
                         )
-                        _wait_for_page_stabilize(
+                        current_url, body_text = _wait_for_manual_v2_create_password_transition(
                             previous_url,
                             previous_body,
-                            step="create_password",
-                            action_label="create-account/password 已提交",
                             timeout_ms=20000,
                         )
+                        current_url, body_text = _describe_page(page, force_refresh=True)
+                        if _is_create_account_password_page(current_url, body_text, page):
+                            password_submitted = False
+                            manual_v2_password_page_logged = False
+                            emitter.warn(
+                                "浏览器模式2 create-account/password 提交后仍停留在密码页，准备自动重试一次提交流程..."
+                                + f" current_url={_mask_secret(current_url, head=56, tail=12)}",
+                                step="create_password",
+                            )
+                            emitter.info(
+                                "create-account/password 停留诊断: "
+                                + _summarize_create_account_password_probe(page)
+                                + ", actions="
+                                + _summarize_primary_actions(page),
+                                step="create_password",
+                            )
                         continue
 
                     if (
@@ -5752,11 +6294,35 @@ def run_browser_registration(
                         and _is_reset_password_page(current_url, body_text, page)
                         and not manual_v2_reset_password_continue_clicked
                     ):
+                        previous_url = current_url
+                        previous_body = body_text
                         if _click_primary_action(page, ["Continue", "Next", "继续", "下一步"], allow_generic_fallback=True):
                             manual_v2_reset_password_continue_clicked = True
-                            emitter.info("浏览器模式2 已进入 reset-password 页面，已自动点击继续，等待短信验证码...", step="create_password")
-                            _wait_for_load(page, timeout_ms=2500)
+                            emitter.info("浏览器模式2 已进入 reset-password 页面，已自动点击继续，等待短信验证码页或发码结果...", step="create_password")
+                            current_url, body_text = _wait_for_manual_v2_reset_password_continue_transition(
+                                previous_url,
+                                previous_body,
+                                timeout_ms=10000,
+                            )
+                            if _is_phone_sms_send_failed_error(current_url, body_text, page):
+                                _prepare_manual_v2_signup_flow(
+                                    "浏览器模式2 reset-password 点击继续后，站点提示当前手机号无法发送短信，"
+                                    + "回到步骤1重新输入手机号..."
+                                )
+                                continue
                             continue
+
+                    if (
+                        not manual_v2_login_flow_started
+                        and manual_v2_reset_password_flow_started
+                        and manual_v2_reset_password_continue_clicked
+                        and _is_phone_sms_send_failed_error(current_url, body_text, page)
+                    ):
+                        _prepare_manual_v2_signup_flow(
+                            "浏览器模式2 reset-password 当前手机号无法发送短信验证码，"
+                            + "回到步骤1重新输入手机号..."
+                        )
+                        continue
 
                     if _is_contact_verification_page(current_url, body_text, page):
                         _extend_manual_v2_deadline(3600)
@@ -5765,6 +6331,19 @@ def run_browser_registration(
                         manual_v2_waiting_phone_retry = False
                         manual_v2_waiting_phone_retry_logged = False
                         manual_v2_require_phone_resubmit = False
+                        if manual_v2_sms_code_submitted:
+                            current_url, body_text = _wait_for_manual_v2_contact_submit_transition(
+                                current_url,
+                                body_text,
+                                timeout_ms=12000,
+                            )
+                            current_url_lower = current_url.lower()
+                            body_lower = body_text.lower()
+                            if _is_contact_verification_page(current_url, body_text, page):
+                                manual_v2_sms_code_submitted = False
+                            else:
+                                manual_v2_wait_contact_logged = False
+                                continue
                         if manual_v2_sms_panel_input_mode:
                             if not manual_v2_wait_contact_logged:
                                 manual_v2_wait_contact_logged = True
@@ -5787,6 +6366,7 @@ def run_browser_registration(
                                 manual_v2_require_phone_resubmit = False
                                 manual_v2_reset_password_flow_started = False
                                 manual_v2_reset_password_continue_clicked = False
+                                manual_v2_sms_code_submitted = False
                                 password_submitted = False
                                 _prepare_manual_v2_signup_flow(
                                     "浏览器模式2 无头人工输入模式收到“换手机号重来”指令，"
@@ -5800,12 +6380,20 @@ def run_browser_registration(
                             if not _click_primary_action(page, ["Continue", "Verify", "Submit", "继续", "下一步"], allow_generic_fallback=True):
                                 raise RuntimeError("浏览器模式2 无头模式提交短信验证码失败")
                             manual_v2_wait_contact_logged = False
+                            manual_v2_sms_code_submitted = True
                             emitter.info("浏览器模式2 已自动提交短信验证码，等待后续跳转...", step="phone_verification")
-                            _wait_for_load(page, timeout_ms=2000)
+                            current_url, body_text = _wait_for_manual_v2_contact_submit_transition(
+                                current_url,
+                                body_text,
+                                timeout_ms=12000,
+                            )
+                            if _is_contact_verification_page(current_url, body_text, page):
+                                manual_v2_sms_code_submitted = False
                             continue
                         if _manual_contact_verification_ready(page):
                             if _click_primary_action(page, ["Continue", "Verify", "Submit", "继续", "下一步"], allow_generic_fallback=True):
                                 emitter.info("浏览器模式2 检测到你已填好手机验证码，已自动点击继续...", step="phone_verification")
+                                manual_v2_sms_code_submitted = True
                                 _wait_for_load(page, timeout_ms=2000)
                                 continue
                         if not manual_v2_wait_contact_logged:
@@ -5946,9 +6534,9 @@ def run_browser_registration(
                             timeout_ms=20000,
                         )
                         if _is_about_you_missing_email_error(current_url, body_text):
-                            _prepare_manual_v2_signup_flow(
+                            _prepare_manual_v2_login_flow(
                                 "浏览器模式2 about-you 提交后命中 authentication missing_email，"
-                                + "重新回到步骤1完整注册流程..."
+                                + "直接复用已有手机号与密码，重新进入第二步登录补邮箱链路..."
                             )
                             continue
                         emitter.success("浏览器模式2 已完成 about-you，转入手机登录补邮箱流程...", step="create_account")
@@ -5960,6 +6548,7 @@ def run_browser_registration(
                             _extend_manual_v2_deadline(1800)
                             manual_v2_wait_contact_logged = False
                             manual_v2_contact_transition_last_key = ""
+                            manual_v2_sms_code_submitted = False
                             manual_v2_waiting_phone_retry = False
                             manual_v2_waiting_phone_retry_logged = False
                             manual_v2_require_phone_resubmit = False
@@ -5976,6 +6565,7 @@ def run_browser_registration(
                             manual_v2_contact_seen = False
                             manual_v2_wait_contact_logged = False
                             manual_v2_contact_transition_last_key = ""
+                            manual_v2_sms_code_submitted = False
                             manual_v2_wait_phone_logged = False
                             manual_v2_waiting_phone_retry = False
                             manual_v2_waiting_phone_retry_logged = False
@@ -6611,9 +7201,9 @@ def run_browser_registration(
                         timeout_ms=20000,
                     )
                     if is_manual_v2_mode and _is_about_you_missing_email_error(current_url, body_text):
-                        _prepare_manual_v2_signup_flow(
+                        _prepare_manual_v2_login_flow(
                             "浏览器模式2 about-you 提交后命中 authentication missing_email，"
-                            + "重新回到步骤1完整注册流程..."
+                            + "直接复用已有手机号与密码，重新进入第二步登录补邮箱链路..."
                         )
                         continue
                     continue
