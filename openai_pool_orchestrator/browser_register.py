@@ -408,6 +408,39 @@ def _sleep_with_page(page: Any, milliseconds: int) -> None:
     time.sleep(wait_seconds)
 
 
+def _safe_page_title(page: Any) -> str:
+    if page is None:
+        return ""
+    try:
+        return str(page.title() or "").strip()
+    except Exception:
+        return ""
+
+
+def _detect_cloudflare_blocker(page: Any, url_text: str, body_value: str) -> str:
+    title = _safe_page_title(page)
+    title_lower = title.lower()
+    body_lower = str(body_value or "").lower()
+    if any(token in title_lower for token in ("just a moment", "checking your browser", "checking if the site connection is secure", "稍候")):
+        return title or "Cloudflare 校验页"
+    if any(
+        token in body_lower
+        for token in (
+            "checking if the site connection is secure",
+            "verify you are human",
+            "enable javascript and cookies to continue",
+            "cf-browser-verification",
+            "cf-chl",
+            "cloudflare",
+            "ray id",
+            "captcha",
+            "just a moment",
+        )
+    ):
+        return title or "Cloudflare 校验页"
+    return ""
+
+
 def _wait_for_load(page: Any, timeout_ms: int = 2500) -> None:
     try:
         page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
@@ -1220,6 +1253,22 @@ def _is_timeout_error_page(url: str, body_text: str) -> bool:
     )
 
 
+def _is_retryable_error_page(url: str, body_text: str) -> bool:
+    url_lower = str(url or "").lower()
+    body_lower = str(body_text or "").lower()
+    if _is_timeout_error_page(url, body_text):
+        return True
+    return bool(
+        "something went wrong" in body_lower
+        or "oops" in body_lower
+        or "an error occurred" in body_lower
+        or "please try again" in body_lower
+        or ("error" in url_lower and "auth.openai.com" in url_lower)
+        or "出错了" in body_text
+        or "请重试" in body_text
+    )
+
+
 def _is_phone_sms_send_failed_error(url: str, body_text: str, page: Any = None) -> bool:
     url_lower = str(url or "").lower()
     text = str(body_text or "")
@@ -1622,6 +1671,36 @@ def _is_profile_page(url: str, body_text: str) -> bool:
         or "生日" in body_text
         or "出生日期" in body_text
     )
+
+
+def _is_logged_in_chatgpt_home(url: str, body_text: str) -> bool:
+    url_lower = str(url or "").lower()
+    body_lower = str(body_text or "").lower()
+    if "chatgpt.com" not in url_lower:
+        return False
+    if "auth.openai.com" in url_lower or "chatgpt.com/auth/login_with" in url_lower:
+        return False
+    if _is_profile_page(url, body_text):
+        return False
+    if _is_session_ended_page(url, body_text):
+        return False
+    if any(
+        token in body_lower
+        for token in (
+            "continue with phone",
+            "continue with email",
+            "log in",
+            "sign up",
+            "login or sign up",
+            "continue with google",
+            "continue with apple",
+            "继续使用手机登录",
+            "继续使用邮箱",
+            "登录或注册",
+        )
+    ):
+        return False
+    return True
 
 
 def _is_birthdate_segment(locator: Any) -> bool:
@@ -2419,6 +2498,43 @@ def _fill_age(page: Any, birthdate: str) -> bool:
     return False
 
 
+def _has_about_you_birthdate_controls(page: Any) -> bool:
+    controls = _collect_visible_locators(
+        page,
+        [
+            'input[type="date"]',
+            'input[name*="birth" i]',
+            'input[name*="date" i]',
+            'input[name*="month" i]',
+            'input[name*="day" i]',
+            'input[name*="year" i]',
+            'input[aria-label*="birth" i]',
+            'input[aria-label*="month" i]',
+            'input[aria-label*="day" i]',
+            'input[aria-label*="year" i]',
+            'select',
+            '[role="combobox"]',
+            '[role="spinbutton"][contenteditable="true"]',
+            '[role="spinbutton"]',
+            'button[aria-haspopup="listbox"]',
+        ],
+        limit=12,
+    )
+    if not controls:
+        return False
+    segments: set[str] = set()
+    for item in controls:
+        segment = _identify_birthdate_segment(item)
+        if segment:
+            segments.add(segment)
+    if len(segments) >= 3:
+        return True
+    month_like = any(_locator_matches_hints(item, ["month", "mm", "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec", "月"]) for item in controls)
+    day_like = any(_locator_matches_hints(item, ["day", "dd", "日"]) for item in controls)
+    year_like = any(_locator_matches_hints(item, ["year", "yyyy", "yy", "年"]) for item in controls)
+    return month_like and day_like and year_like
+
+
 def _is_locator_checked(locator: Any) -> bool:
     if locator is None:
         return False
@@ -2547,15 +2663,19 @@ def _fill_about_you_profile(page: Any, ctx: Any) -> tuple[bool, str]:
 
     body_text = _get_body_text(page)
     body_lower = str(body_text or "").lower()
+    has_birthdate_controls = _has_about_you_birthdate_controls(page)
     prefers_age = (
         "confirm your age" in body_lower
         or "your age" in body_lower
         or " age " in f" {body_lower} "
         or "年龄" in body_text
     )
+    if has_birthdate_controls:
+        prefers_age = False
     if prefers_age:
         if not _fill_age(page, ctx.profile_birthdate):
-            return False, "age"
+            if not _fill_birthdate(page, ctx.profile_birthdate):
+                return False, "age"
     else:
         if not _fill_birthdate(page, ctx.profile_birthdate):
             if not _fill_age(page, ctx.profile_birthdate):
@@ -2731,18 +2851,18 @@ def _page_priority_from_url(url: str) -> int:
             return 185
         if "add-email" in url_lower:
             return 180
+        if "contact-verification" in url_lower:
+            return 178
         if "/log-in/password" in url_lower:
             return 175
+        if "/reset-password/new-password" in url_lower:
+            return 174
+        if "about-you" in url_lower:
+            return 173
         if "/create-account/password" in url_lower:
             return 172
-        if "/reset-password/new-password" in url_lower:
-            return 170
-        if "contact-verification" in url_lower:
-            return 168
         if "/reset-password" in url_lower:
             return 166
-        if "about-you" in url_lower:
-            return 164
         if "/log-in" in url_lower:
             return 162
         if "/create-account" in url_lower:
@@ -2759,6 +2879,8 @@ def _has_phone_input(page: Any) -> bool:
     return _first_visible_locator(
         page,
         [
+            'input[id="phoneNumberInput"]',
+            'input[name="phoneNumberInput"]',
             'input[type="tel"]',
             'input[inputmode="tel"]',
             'input[name*="phone" i]',
@@ -2841,6 +2963,76 @@ def _is_phone_login_entry_page(url: str, body_text: str, page: Any) -> bool:
             '[role="button"]:has-text("继续使用手机登录")',
         ],
     ) is not None
+
+
+def _is_choose_account_page(url: str, body_text: str, page: Any) -> bool:
+    url_lower = str(url or "").lower()
+    body_lower = str(body_text or "").lower()
+    if "choose-an-account" in url_lower:
+        return True
+    if "choose an account" not in body_lower:
+        return False
+    return _first_visible_locator(
+        page,
+        [
+            'button:has-text("Use another account")',
+            '[role="button"]:has-text("Use another account")',
+            'button:has-text("使用其他账号")',
+            '[role="button"]:has-text("使用其他账号")',
+            '[role="listitem"]',
+            '[data-testid*="account" i]',
+        ],
+    ) is not None
+
+
+def _click_choose_account_phone_card(page: Any, phone_number: str) -> bool:
+    phone_text = str(phone_number or "").strip()
+    if page is None or not phone_text:
+        return False
+    digits = "".join(ch for ch in phone_text if ch.isdigit())
+    tail_digits = digits[-8:] if len(digits) >= 8 else digits
+    if not tail_digits:
+        return False
+    try:
+        matched = bool(
+            page.evaluate(
+                """(tailDigits) => {
+                    const normalizeDigits = (value) => String(value || '').replace(/\\D+/g, '');
+                    const isVisible = (node) => {
+                        if (!node) return false;
+                        const rect = node.getBoundingClientRect();
+                        const style = window.getComputedStyle(node);
+                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const clickNode = (node) => {
+                        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+                            node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                        });
+                    };
+                    const nodes = Array.from(document.querySelectorAll('span, div, p, button, [role="button"], [role="listitem"]'));
+                    for (const node of nodes) {
+                        const text = String(node.innerText || node.textContent || '').trim();
+                        if (!text) continue;
+                        const nodeDigits = normalizeDigits(text);
+                        if (!nodeDigits || !nodeDigits.endsWith(tailDigits)) continue;
+                        let clickable = node.closest('button, [role="button"], [role="listitem"], a');
+                        if (!clickable && node.parentElement) {
+                            clickable = node.parentElement.closest('button, [role="button"], [role="listitem"], a, div');
+                        }
+                        if (!clickable || !isVisible(clickable)) continue;
+                        clickNode(clickable);
+                        return true;
+                    }
+                    return false;
+                }""",
+                tail_digits,
+            )
+        )
+    except Exception:
+        matched = False
+    if matched:
+        _sleep_with_page(page, 600)
+    return matched
 
 
 def _is_create_account_password_page(url: str, body_text: str, page: Any) -> bool:
@@ -3180,6 +3372,8 @@ def _manual_phone_input_ready(page: Any) -> bool:
     locator = _first_visible_locator(
         page,
         [
+            'input[id="phoneNumberInput"]',
+            'input[name="phoneNumberInput"]',
             'input[type="tel"]',
             'input[inputmode="tel"]',
             'input[name*="phone" i]',
@@ -3549,6 +3743,8 @@ def _is_phone_input_page(url: str, body_text: str, page: Any) -> bool:
     phone_input = _first_visible_locator(
         page,
         [
+            'input[id="phoneNumberInput"]',
+            'input[name="phoneNumberInput"]',
             'input[type="tel"]',
             'input[inputmode="tel"]',
             'input[name*="phone" i]',
@@ -3561,10 +3757,7 @@ def _is_phone_input_page(url: str, body_text: str, page: Any) -> bool:
     )
     if phone_input is not None:
         return True
-    return bool(
-        ("continue with phone" in body_lower or "继续使用手机登录" in body_text)
-        and phone_input is not None
-    )
+    return False
 
 
 def _is_add_email_page(url: str, body_text: str, page: Any) -> bool:
@@ -3593,6 +3786,57 @@ def _is_add_email_page(url: str, body_text: str, page: Any) -> bool:
         or "电子邮件地址" in body_text
         or "绑定邮箱" in body_text
     )
+
+
+def _wait_for_add_email_ready(page: Any, *, timeout_ms: int = 12000) -> bool:
+    deadline = time.time() + max(2.0, float(timeout_ms or 0) / 1000.0)
+    stable_rounds = 0
+    last_signature = ""
+    while time.time() < deadline:
+        _wait_for_load(page, timeout_ms=1200)
+        current_url, body_text = _describe_page(page)
+        if not _is_add_email_page(current_url, body_text, page):
+            _sleep_with_page(page, 300)
+            continue
+        probe_locator = _first_visible_locator(
+            page,
+            [
+                'input[type="email"]',
+                'input[name="email"]',
+                'input[autocomplete="email"]',
+                'input[id*="-email" i]',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="电子邮件" i]',
+                'input[type="text"]',
+            ],
+        )
+        if probe_locator is None:
+            _sleep_with_page(page, 300)
+            continue
+        try:
+            disabled = str(probe_locator.get_attribute("aria-disabled") or "").strip().lower()
+        except Exception:
+            disabled = ""
+        readonly = "false"
+        try:
+            readonly = str(probe_locator.get_attribute("readonly") or "").strip().lower() or "false"
+        except Exception:
+            readonly = "false"
+        try:
+            native_disabled = str(probe_locator.get_attribute("disabled") or "").strip().lower()
+        except Exception:
+            native_disabled = ""
+        signature = _page_snapshot_signature(current_url, body_text) + "|" + native_disabled + "|" + readonly + "|" + disabled
+        if native_disabled in {"", "false"} and readonly in {"", "false"} and disabled in {"", "false"}:
+            if signature == last_signature:
+                stable_rounds += 1
+            else:
+                last_signature = signature
+                stable_rounds = 1
+            if stable_rounds >= 2:
+                return True
+        _sleep_with_page(page, 300)
+    return False
 
 
 def _is_login_with_bridge_page(url: str, body_text: str) -> bool:
@@ -4495,16 +4739,20 @@ def run_browser_registration(
     manual_v2_bridge_entered_at = 0.0
     manual_v2_bridge_logged = False
     manual_v2_post_login_recover_attempts = 0
+    manual_v2_post_login_retryable_error_attempts = 0
     manual_v2_post_login_oauth_retry_attempts = 0
     manual_v2_post_login_oauth_retry_limit = 2
     manual_v2_email_verification_recover_attempts = 0
     manual_v2_email_verification_logged = False
     manual_v2_email_otp_completed = False
     manual_v2_oauth_resumed = False
+    manual_v2_workspace_logged = False
+    manual_v2_profile_completion_mode = False
     manual_v2_waiting_phone_retry = False
     manual_v2_waiting_phone_retry_logged = False
     manual_v2_require_phone_resubmit = False
     manual_v2_password_page_logged = False
+    manual_v2_create_password_submit_attempts = 0
     manual_v2_wait_phone_last_url = ""
     manual_v2_entry_bootstrap_logged = False
     manual_v2_reset_password_flow_started = False
@@ -4707,10 +4955,21 @@ def run_browser_registration(
                 except Exception:
                     candidate_url = ""
                 score = _page_priority_from_url(candidate_url)
+                candidate_url_lower = candidate_url.lower()
+                try:
+                    candidate_state = _classify_page_state(candidate_url, _describe_page(candidate_page)[1], candidate_page)
+                except Exception:
+                    candidate_state = ""
                 if preferred_page is not None and candidate_page is preferred_page:
                     score += 3
                 if page is not None and candidate_page is page:
                     score += 2
+                if "auth.openai.com" in candidate_url_lower:
+                    score += 2
+                if candidate_state == "password" or candidate_state == "auth":
+                    score += 1
+                if candidate_state == "login_with_bridge":
+                    score -= 2
                 rank = (score, -len(seen_ids))
                 if selected_page is None or selected_rank is None or rank > selected_rank:
                     selected_page = candidate_page
@@ -4869,6 +5128,30 @@ def run_browser_registration(
             'button:has-text("手机登录")',
             '[role="button"]:has-text("手机登录")',
         ]
+        more_menu_selectors = [
+            'button:has-text("More")',
+            '[role="button"]:has-text("More")',
+            'button:has-text("更多")',
+            '[role="button"]:has-text("更多")',
+            'button[aria-label*="more" i]',
+            '[role="button"][aria-label*="more" i]',
+            'button[aria-label*="menu" i]',
+            '[role="button"][aria-label*="menu" i]',
+        ]
+
+        def _detect_homepage_blocker(url_text: str, body_value: str) -> str:
+            global_blocker = _detect_cloudflare_blocker(page, url_text, body_value)
+            if global_blocker:
+                return global_blocker
+            body_lower = str(body_value or "").lower()
+            if (
+                "chatgpt.com" in str(url_text or "").lower()
+                and "log in" in body_lower
+                and "sign up" not in body_lower
+                and not _has_phone_input(page)
+            ):
+                return "首页壳页尚未完成渲染"
+            return ""
 
         def _entry_flow_ready(url_text: str, body_value: str) -> bool:
             if _has_phone_input(page):
@@ -4920,7 +5203,43 @@ def run_browser_registration(
         clicked = False
         signup_visible = _first_visible_locator(page, signup_selectors) is not None
         phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
+        blocker_reason = _detect_homepage_blocker(current_url, body_text)
+        if blocker_reason:
+            blocker_signature = f"blocker:{url_lower}:{blocker_reason}"
+            now = time.time()
+            if blocker_signature != manual_v2_entry_bootstrap_signature or now - manual_v2_entry_bootstrap_seen_at >= 15:
+                manual_v2_entry_bootstrap_signature = blocker_signature
+                manual_v2_entry_bootstrap_seen_at = now
+                manual_v2_entry_bootstrap_wait_logged = False
+                emitter.info(
+                    "浏览器模式2 首页仍在等待前置状态完成，暂未出现注册入口: "
+                    + _preview_text(blocker_reason, 120),
+                    step="oauth_init",
+                )
+            return False
+        if not signup_visible and not phone_entry_visible:
+            if _click_first(page, more_menu_selectors, timeout_ms=800):
+                emitter.info("浏览器模式2 首页未直接看到注册入口，已尝试点击 More/菜单 展开更多入口...", step="oauth_init")
+                _wait_for_load(page, timeout_ms=1200)
+                current_url, body_text = _describe_page(page, force_refresh=True)
+                url_lower = str(current_url or "").lower()
+                signup_visible = _first_visible_locator(page, signup_selectors) is not None
+                phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
         entry_signature = f"{url_lower}|signup:{1 if signup_visible else 0}|phone_entry:{1 if phone_entry_visible else 0}"
+        if not signup_visible and not phone_entry_visible:
+            now = time.time()
+            wait_signature = f"pending:{url_lower}"
+            if wait_signature != manual_v2_entry_bootstrap_signature or now - manual_v2_entry_bootstrap_seen_at >= 15:
+                manual_v2_entry_bootstrap_signature = wait_signature
+                manual_v2_entry_bootstrap_seen_at = now
+                manual_v2_entry_bootstrap_wait_logged = False
+                emitter.info(
+                    "浏览器模式2 首页暂未识别到注册入口，继续等待页面渲染..."
+                    + " actions="
+                    + _summarize_primary_actions(page),
+                    step="oauth_init",
+                )
+            return False
         if signup_visible and not phone_entry_visible:
             if entry_signature != manual_v2_entry_bootstrap_signature:
                 manual_v2_entry_bootstrap_signature = entry_signature
@@ -4954,6 +5273,11 @@ def run_browser_registration(
         if _entry_flow_ready(current_url, body_text):
             return True
         if clicked:
+            if _is_login_with_bridge_page(current_url, body_text):
+                emitter.info(
+                    "浏览器模式2 首页入口点击后已进入登录弹层桥接页，正在等待站点真正渲染手机号输入控件...",
+                    step="oauth_init",
+                )
             emitter.warn(
                 "浏览器模式2 首页入口点击后尚未真正进入手机号页，本轮按未成功处理，下一轮继续等待页面稳定后再试。"
                 + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
@@ -4969,7 +5293,7 @@ def run_browser_registration(
     def _bootstrap_manual_v2_login_entry(current_url: str, body_text: str) -> bool:
         url_lower = str(current_url or "").lower()
         body_lower = str(body_text or "").lower()
-        if "auth.openai.com/log-in" not in url_lower:
+        if "auth.openai.com/log-in" not in url_lower and not _is_login_with_bridge_page(current_url, body_text):
             return False
         if _is_phone_input_page(current_url, body_text, page):
             return True
@@ -4993,7 +5317,13 @@ def run_browser_registration(
             ],
             timeout_ms=1200,
         ):
-            emitter.info("浏览器模式2 已在 auth.openai.com/log-in 页面切换到手机号登录入口，等待你输入手机号...", step="oauth_init")
+            if manual_v2_profile_completion_mode and manual_v2_phone_number:
+                emitter.info(
+                    "浏览器模式2 已在 auth.openai.com/log-in 页面切换到手机号登录入口，准备自动复用已保存手机号...",
+                    step="oauth_init",
+                )
+            else:
+                emitter.info("浏览器模式2 已在 auth.openai.com/log-in 页面切换到手机号登录入口，等待你输入手机号...", step="oauth_init")
             _wait_for_load(page, timeout_ms=2000)
             return True
         return bool("continue with phone" in body_lower or "use phone instead" in body_lower or "继续使用手机登录" in body_text)
@@ -5077,13 +5407,20 @@ def run_browser_registration(
         timeout_ms: int = 15000,
     ) -> bool:
         nonlocal password_submitted, manual_v2_password_page_logged
-        if not _is_timeout_error_page(current_url, body_text):
+        if not _is_retryable_error_page(current_url, body_text):
             return False
         active_page = _resolve_active_page(page, timeout_ms=1500)
         if active_page is None:
             emitter.warn("检测到超时错误页，但当前没有可用活动页面，改走后续兜底恢复...", step=step)
             return False
-        emitter.warn("检测到 Operation timed out，先在当前页面点击 Try again/Retry 原地恢复...", step=step)
+        if _is_timeout_error_page(current_url, body_text):
+            emitter.warn("检测到 Operation timed out，先在当前页面点击 Try again/Retry 原地恢复...", step=step)
+        else:
+            emitter.warn(
+                "检测到可重试错误页（Oops / something went wrong / please try again），"
+                + "先在当前页面点击 Try again/Retry 原地恢复...",
+                step=step,
+            )
         previous_url = current_url
         previous_body = body_text
         if not _click_first(
@@ -5098,6 +5435,10 @@ def run_browser_registration(
                 'button:has-text("重试")',
                 '[role="button"]:has-text("重试")',
                 'a:has-text("重试")',
+                'button:has-text("Try again")',
+                '[role="button"]:has-text("Try again")',
+                'button:has-text("Continue")',
+                '[role="button"]:has-text("Continue")',
             ],
             timeout_ms=1500,
         ):
@@ -5128,11 +5469,27 @@ def run_browser_registration(
                 step="create_password",
             )
             return True
+        if (
+            is_manual_v2_mode
+            and manual_v2_login_flow_started
+            and current_phase == "login"
+            and _is_login_password_page(latest_url, latest_body, page)
+        ):
+            password_submitted = False
+            manual_v2_password_page_logged = False
+            emitter.info(
+                "可重试错误页恢复后已回到登录密码页，恢复自动填密码流程并继续输入密码...",
+                step="create_password",
+            )
+            return True
         if _is_timeout_error_page(latest_url, latest_body):
             emitter.warn("超时错误页当前页重试后仍未恢复，准备走 OAuth 重拉兜底...", step=step)
             return False
+        if _is_retryable_error_page(latest_url, latest_body):
+            emitter.warn("可重试错误页当前页重试后仍未恢复，准备走后续 OAuth 兜底恢复...", step=step)
+            return False
         emitter.info(
-            "超时错误页已通过当前页面重试恢复，继续沿现有流程推进: "
+            "可重试错误页已通过当前页面重试恢复，继续沿现有流程推进: "
             + _mask_secret(latest_url, head=56, tail=12),
             step=step,
         )
@@ -5224,6 +5581,8 @@ def run_browser_registration(
                 return latest_url, latest_body
             if _is_create_account_password_page(latest_url, latest_body, page):
                 return latest_url, latest_body
+            if _is_login_password_page(latest_url, latest_body, page):
+                return latest_url, latest_body
             if _is_contact_verification_page(latest_url, latest_body, page):
                 return latest_url, latest_body
             if latest_state != previous_state:
@@ -5267,12 +5626,15 @@ def run_browser_registration(
                     emitter.info("create-account/password 已提交，等待页面稳定并切换到下一阶段...", step=step)
                 _sleep_with_page(None, 200)
                 continue
+            page = active_page
             if not callback_state["url"]:
                 _consume_loopback_callback()
             latest_url, latest_body = _describe_page(page, force_refresh=True)
             latest_url_lower = latest_url.lower()
             latest_state = _classify_page_state(latest_url, latest_body, page)
             if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
+                return latest_url, latest_body
+            if _is_phone_sms_send_failed_error(latest_url, latest_body, page):
                 return latest_url, latest_body
             if _is_contact_verification_page(latest_url, latest_body, page):
                 return latest_url, latest_body
@@ -5414,7 +5776,7 @@ def run_browser_registration(
         )
         return _describe_page(page, force_refresh=True)
 
-    def _prepare_manual_v2_login_flow(reason: str) -> None:
+    def _prepare_manual_v2_login_flow(reason: str, *, profile_completion_only: bool = False) -> None:
         nonlocal current_phase, email_submitted, password_submitted, profile_submitted
         nonlocal current_oauth, manual_v2_login_oauth
         nonlocal manual_v2_contact_seen, manual_v2_wait_contact_logged, manual_v2_contact_transition_last_key
@@ -5424,11 +5786,14 @@ def run_browser_registration(
         nonlocal manual_v2_login_phone_submitted, manual_v2_post_login_pending_email
         nonlocal manual_v2_bridge_entered_at, manual_v2_bridge_logged
         nonlocal manual_v2_post_login_recover_attempts
+        nonlocal manual_v2_post_login_retryable_error_attempts
         nonlocal manual_v2_email_verification_recover_attempts
         nonlocal manual_v2_email_verification_logged
         nonlocal manual_v2_email_otp_completed
-        nonlocal manual_v2_oauth_resumed, manual_v2_wait_phone_logged
+        nonlocal manual_v2_oauth_resumed, manual_v2_workspace_logged, manual_v2_wait_phone_logged
+        nonlocal manual_v2_profile_completion_mode
         nonlocal manual_v2_wait_phone_last_url, manual_v2_password_page_logged, manual_v2_phone_number
+        nonlocal manual_v2_create_password_submit_attempts
         nonlocal manual_v2_waiting_phone_retry, manual_v2_waiting_phone_retry_logged
         nonlocal manual_v2_require_phone_resubmit, manual_v2_reset_password_flow_started
         nonlocal manual_v2_reset_password_continue_clicked, manual_v2_post_login_oauth_retry_attempts
@@ -5451,35 +5816,55 @@ def run_browser_registration(
         manual_v2_bridge_entered_at = 0.0
         manual_v2_bridge_logged = False
         manual_v2_post_login_recover_attempts = 0
+        manual_v2_post_login_retryable_error_attempts = 0
         manual_v2_post_login_oauth_retry_attempts = 0
         manual_v2_email_verification_recover_attempts = 0
         manual_v2_email_verification_logged = False
         manual_v2_email_otp_completed = False
         manual_v2_oauth_resumed = False
+        manual_v2_workspace_logged = False
+        manual_v2_profile_completion_mode = bool(profile_completion_only)
         manual_v2_wait_phone_logged = False
         manual_v2_wait_phone_last_url = ""
         manual_v2_password_page_logged = False
+        manual_v2_create_password_submit_attempts = 0
         manual_v2_waiting_phone_retry = False
         manual_v2_waiting_phone_retry_logged = False
         manual_v2_require_phone_resubmit = False
         manual_v2_reset_password_flow_started = False
         manual_v2_reset_password_continue_clicked = False
         emitter.info(reason, step="oauth_init")
-        current_oauth = generate_login_oauth_url_func()
-        manual_v2_login_oauth = current_oauth
-        emitter.info(
-            "浏览器模式2 正在打开标准 OAuth 授权地址，进入第二步手机登录链路...",
-            step="oauth_init",
-        )
-        try:
+        if profile_completion_only:
+            current_oauth = generate_oauth_url_func()
+            manual_v2_login_oauth = None
             emitter.info(
-                "浏览器模式2 第二步登录 OAuth 授权地址: "
-                + _mask_secret(str(getattr(current_oauth, "auth_url", "") or ""), head=160, tail=24),
+                "浏览器模式2 正在打开 ChatGPT 首页登录流程，先使用已保存手机号与密码完成资料补充...",
                 step="oauth_init",
             )
-        except Exception:
-            pass
-        _start_oauth_flow(page, current_oauth, "login")
+            _goto_with_recovery(
+                "https://chatgpt.com/",
+                step="oauth_init",
+                reason="浏览器模式2 打开 ChatGPT 首页登录流程失败",
+                wait_until="domcontentloaded",
+                timeout_ms=cfg["browser_timeout_ms"],
+                max_attempts=3,
+            )
+        else:
+            current_oauth = generate_login_oauth_url_func()
+            manual_v2_login_oauth = current_oauth
+            emitter.info(
+                "浏览器模式2 正在打开标准 OAuth 授权地址，进入第二步手机登录链路...",
+                step="oauth_init",
+            )
+            try:
+                emitter.info(
+                    "浏览器模式2 第二步登录 OAuth 授权地址: "
+                    + _mask_secret(str(getattr(current_oauth, "auth_url", "") or ""), head=160, tail=24),
+                    step="oauth_init",
+                )
+            except Exception:
+                pass
+            _start_oauth_flow(page, current_oauth, "login")
         _wait_for_load(page, timeout_ms=2500)
         current_url, body_text = _describe_page(page)
         if _is_session_ended_login_shell_page(current_url, body_text, page):
@@ -5509,9 +5894,10 @@ def run_browser_registration(
         nonlocal manual_v2_bridge_entered_at, manual_v2_bridge_logged
         nonlocal manual_v2_post_login_recover_attempts, manual_v2_post_login_oauth_retry_attempts
         nonlocal manual_v2_email_verification_recover_attempts, manual_v2_email_verification_logged
-        nonlocal manual_v2_email_otp_completed, manual_v2_oauth_resumed
+        nonlocal manual_v2_email_otp_completed, manual_v2_oauth_resumed, manual_v2_workspace_logged
         nonlocal manual_v2_wait_phone_logged, manual_v2_wait_phone_last_url
         nonlocal manual_v2_password_page_logged, manual_v2_phone_number
+        nonlocal manual_v2_create_password_submit_attempts
         nonlocal manual_v2_waiting_phone_retry, manual_v2_waiting_phone_retry_logged
         nonlocal manual_v2_require_phone_resubmit, manual_v2_reset_password_flow_started
         nonlocal manual_v2_reset_password_continue_clicked, manual_v2_entry_bootstrap_logged
@@ -5544,9 +5930,11 @@ def run_browser_registration(
         manual_v2_email_verification_logged = False
         manual_v2_email_otp_completed = False
         manual_v2_oauth_resumed = False
+        manual_v2_workspace_logged = False
         manual_v2_wait_phone_logged = False
         manual_v2_wait_phone_last_url = ""
         manual_v2_password_page_logged = False
+        manual_v2_create_password_submit_attempts = 0
         manual_v2_phone_number = ""
         manual_v2_waiting_phone_retry = False
         manual_v2_waiting_phone_retry_logged = False
@@ -5617,9 +6005,9 @@ def run_browser_registration(
         nonlocal manual_v2_login_oauth, manual_v2_login_flow_started, manual_v2_phone_entry_clicked, manual_v2_login_phone_prefilled
         nonlocal manual_v2_login_phone_submitted, manual_v2_login_password_prefilled
         nonlocal manual_v2_post_login_pending_email, manual_v2_bridge_entered_at, manual_v2_bridge_logged
-        nonlocal manual_v2_post_login_recover_attempts, manual_v2_email_verification_recover_attempts
+        nonlocal manual_v2_post_login_recover_attempts, manual_v2_post_login_retryable_error_attempts, manual_v2_email_verification_recover_attempts
         nonlocal manual_v2_email_verification_logged, manual_v2_email_otp_completed
-        nonlocal manual_v2_oauth_resumed, manual_v2_wait_phone_logged, manual_v2_wait_phone_last_url
+        nonlocal manual_v2_oauth_resumed, manual_v2_workspace_logged, manual_v2_wait_phone_logged, manual_v2_wait_phone_last_url
         nonlocal manual_v2_password_page_logged, manual_v2_waiting_phone_retry
         nonlocal manual_v2_waiting_phone_retry_logged, manual_v2_require_phone_resubmit
         nonlocal manual_v2_post_login_oauth_retry_attempts, manual_v2_contact_transition_last_key
@@ -5645,10 +6033,12 @@ def run_browser_registration(
         manual_v2_bridge_logged = False
         manual_v2_contact_transition_last_key = ""
         manual_v2_post_login_recover_attempts = 0
+        manual_v2_post_login_retryable_error_attempts = 0
         manual_v2_email_verification_recover_attempts = 0
         manual_v2_email_verification_logged = False
         manual_v2_email_otp_completed = False
         manual_v2_oauth_resumed = False
+        manual_v2_workspace_logged = False
         manual_v2_wait_phone_logged = False
         manual_v2_wait_phone_last_url = ""
         manual_v2_password_page_logged = False
@@ -5684,6 +6074,57 @@ def run_browser_registration(
             ):
                 emitter.info("浏览器模式2 第二步 OAuth 重试后命中“你的会话已结束”壳页，已自动点击登录继续...", step="oauth_init")
                 _wait_for_load(page, timeout_ms=2500)
+        return True
+
+    def _restart_manual_v2_login_page(reason: str) -> bool:
+        nonlocal current_phase, deadline, email_submitted, password_submitted
+        nonlocal manual_v2_login_flow_started, manual_v2_phone_entry_clicked, manual_v2_login_phone_prefilled
+        nonlocal manual_v2_login_phone_submitted, manual_v2_login_password_prefilled
+        nonlocal manual_v2_post_login_pending_email, manual_v2_bridge_entered_at, manual_v2_bridge_logged
+        nonlocal manual_v2_post_login_recover_attempts, manual_v2_post_login_retryable_error_attempts
+        nonlocal manual_v2_email_verification_recover_attempts, manual_v2_email_verification_logged
+        nonlocal manual_v2_email_otp_completed, manual_v2_oauth_resumed, manual_v2_workspace_logged
+        nonlocal manual_v2_wait_phone_logged, manual_v2_wait_phone_last_url
+        nonlocal manual_v2_password_page_logged, manual_v2_waiting_phone_retry
+        nonlocal manual_v2_waiting_phone_retry_logged, manual_v2_require_phone_resubmit
+        nonlocal manual_v2_contact_transition_last_key
+        emitter.warn(str(reason or "").strip() or "浏览器模式2 第二步登录链路准备重新打开 auth.openai.com/log-in 页面", step="oauth_init")
+        _reset_browser_phase_state(clear_profile=False)
+        current_phase = "login"
+        email_submitted = False
+        password_submitted = False
+        manual_v2_login_flow_started = True
+        manual_v2_phone_entry_clicked = False
+        manual_v2_login_phone_prefilled = False
+        manual_v2_login_phone_submitted = False
+        manual_v2_login_password_prefilled = False
+        manual_v2_post_login_pending_email = False
+        manual_v2_bridge_entered_at = 0.0
+        manual_v2_bridge_logged = False
+        manual_v2_contact_transition_last_key = ""
+        manual_v2_post_login_recover_attempts = 0
+        manual_v2_post_login_retryable_error_attempts = 0
+        manual_v2_email_verification_recover_attempts = 0
+        manual_v2_email_verification_logged = False
+        manual_v2_email_otp_completed = False
+        manual_v2_oauth_resumed = False
+        manual_v2_workspace_logged = False
+        manual_v2_wait_phone_logged = False
+        manual_v2_wait_phone_last_url = ""
+        manual_v2_password_page_logged = False
+        manual_v2_waiting_phone_retry = False
+        manual_v2_waiting_phone_retry_logged = False
+        manual_v2_require_phone_resubmit = False
+        deadline = time.time() + max(90, int(cfg["browser_timeout_ms"] / 1000) + 60)
+        _goto_with_recovery(
+            "https://auth.openai.com/log-in",
+            step="oauth_init",
+            reason="浏览器模式2 重新打开 auth.openai.com/log-in 页面失败",
+            wait_until="domcontentloaded",
+            timeout_ms=cfg["browser_timeout_ms"],
+            max_attempts=2,
+        )
+        _wait_for_load(page, timeout_ms=2500)
         return True
 
     def _goto_manual_v2_add_email(reason: str) -> bool:
@@ -5840,7 +6281,15 @@ def run_browser_registration(
                     callback_url_value = str(callback_state["url"] or "").strip()
                     callback_is_real = ("code=" in callback_url_value and "state=" in callback_url_value)
                     oauth_for_exchange = _active_oauth_start()
-                    if is_manual_v2_mode and not manual_v2_oauth_resumed and not callback_is_real:
+                    if is_manual_v2_mode and manual_v2_profile_completion_mode and callback_is_real:
+                        emitter.info(
+                            "浏览器模式2 当前仍处于 reset-password 后的登录后分流阶段；"
+                            + "此时还在判定是否需要补资料，即使捕获到真实 callback 也先忽略，"
+                            + "等待分流结束后再进入真正的步骤2 OAuth。",
+                            step="get_token",
+                        )
+                        callback_state["url"] = ""
+                    elif is_manual_v2_mode and not manual_v2_oauth_resumed and not callback_is_real:
                         emitter.info("浏览器模式2 当前仍处于注册前半段，忽略提前出现的 callback 线索，等待进入后续授权流程...", step="get_token")
                         callback_state["url"] = ""
                     else:
@@ -5981,11 +6430,31 @@ def run_browser_registration(
                 current_url, body_text = _describe_page(page)
                 current_url_lower = current_url.lower()
                 body_lower = body_text.lower()
+                cloudflare_blocker = _detect_cloudflare_blocker(page, current_url, body_text)
+                if cloudflare_blocker:
+                    blocker_key = f"cf:{current_url_lower}:{cloudflare_blocker}"
+                    if blocker_key != manual_v2_entry_bootstrap_signature:
+                        manual_v2_entry_bootstrap_signature = blocker_key
+                        manual_v2_entry_bootstrap_seen_at = time.time()
+                        emitter.info(
+                            "浏览器当前命中 Cloudflare / Just a moment 校验，先暂停后续自动点击并等待页面自行通过: "
+                            + _preview_text(cloudflare_blocker, 120),
+                            step="oauth_init",
+                        )
+                    _wait_for_load(page, timeout_ms=1200)
+                    _sleep_with_page(page, 1800)
+                    continue
                 otp_route_locked = ("email-verification" in current_url_lower or "email-otp" in current_url_lower)
                 callback_candidate = _extract_callback_url_from_page(current_url, body_text)
                 if callback_candidate and not callback_state["url"]:
                     callback_is_real = ("code=" in callback_candidate and "state=" in callback_candidate)
-                    if is_manual_v2_mode and not manual_v2_oauth_resumed and not callback_is_real:
+                    if is_manual_v2_mode and manual_v2_profile_completion_mode and callback_is_real:
+                        emitter.info(
+                            "浏览器模式2 当前仍处于 reset-password 后的登录后分流阶段；"
+                            + "页面里即使出现真实 callback 也先忽略，等待判定完是否需要补资料后再进入真正的步骤2 OAuth。",
+                            step="get_token",
+                        )
+                    elif is_manual_v2_mode and not manual_v2_oauth_resumed and not callback_is_real:
                         emitter.info("浏览器模式2 注册前半段检测到 callback 线索，暂不处理，等待后续授权流程重新拉起...", step="get_token")
                     else:
                         if is_manual_v2_mode and not manual_v2_oauth_resumed and callback_is_real:
@@ -6054,8 +6523,7 @@ def run_browser_registration(
                         and not is_reset_new_password_page
                         and not is_login_password_page
                         and (
-                            "chatgpt.com" in current_url_lower
-                            or _is_phone_input_page(current_url, body_text, page)
+                            _is_phone_input_page(current_url, body_text, page)
                             or _is_phone_verification_page(current_url, body_text, page)
                         )
                     )
@@ -6091,6 +6559,7 @@ def run_browser_registration(
                         and not is_reset_new_password_page
                         and not is_login_password_page
                         and "chatgpt.com" in current_url_lower
+                        and not _is_login_with_bridge_page(current_url, body_text)
                     ):
                         if not manual_v2_entry_bootstrap_logged:
                             manual_v2_entry_bootstrap_logged = True
@@ -6120,6 +6589,7 @@ def run_browser_registration(
                             )
                     else:
                         manual_v2_password_page_logged = False
+                        manual_v2_create_password_submit_attempts = 0
 
                     if (
                         is_create_password_page
@@ -6127,10 +6597,35 @@ def run_browser_registration(
                         and not manual_v2_contact_seen
                         and not password_submitted
                     ):
+                        if _is_retryable_error_page(current_url, body_text):
+                            if _try_recover_timeout_error_page(
+                                current_url,
+                                body_text,
+                                step="create_password",
+                                action_label="create-account/password 错误页已触发当前页重试",
+                                timeout_ms=12000,
+                            ):
+                                current_url, body_text = _describe_page(page, force_refresh=True)
+                                if _is_create_account_password_page(current_url, body_text, page):
+                                    password_submitted = False
+                                    manual_v2_password_page_logged = False
+                                    emitter.info(
+                                        "浏览器模式2 create-account/password 当前页重试后已恢复到可继续提交密码的状态，准备重新走密码提交流程...",
+                                        step="create_password",
+                                    )
+                                    continue
+                                continue
+                        manual_v2_create_password_submit_attempts += 1
                         previous_url = current_url
                         previous_body = body_text
                         emitter.info(
-                            "浏览器模式2 首轮 create-account/password 命中专用提交流程，按 codex-registrar 方式提交密码...",
+                            (
+                                "浏览器模式2 首轮 create-account/password 命中专用提交流程，按 codex-registrar 方式提交密码..."
+                                if manual_v2_create_password_submit_attempts == 1
+                                else "浏览器模式2 create-account/password 仍停留在密码页，开始第 "
+                                + str(manual_v2_create_password_submit_attempts)
+                                + " 次提交流程重试..."
+                            ),
                             step="create_password",
                         )
                         if not _wait_for_create_account_password_ready(page, timeout_ms=12000):
@@ -6158,6 +6653,20 @@ def run_browser_registration(
                             timeout_ms=20000,
                         )
                         current_url, body_text = _describe_page(page, force_refresh=True)
+                        if _is_contact_verification_page(current_url, body_text, page):
+                            emitter.info(
+                                "浏览器模式2 create-account/password 提交后已进入短信验证码页，准备立即切换到验证码输入阶段...",
+                                step="phone_verification",
+                            )
+                        if _is_phone_sms_send_failed_error(current_url, body_text, page):
+                            password_submitted = False
+                            manual_v2_password_page_logged = False
+                            manual_v2_create_password_submit_attempts = 0
+                            _prepare_manual_v2_signup_flow(
+                                "浏览器模式2 create-account/password 提交后，站点提示当前手机号无法发送短信，"
+                                + "回到步骤1重新输入手机号..."
+                            )
+                            continue
                         if _is_create_account_password_page(current_url, body_text, page):
                             password_submitted = False
                             manual_v2_password_page_logged = False
@@ -6169,10 +6678,21 @@ def run_browser_registration(
                             emitter.info(
                                 "create-account/password 停留诊断: "
                                 + _summarize_create_account_password_probe(page)
+                                + ", body="
+                                + (_preview_text(body_text, 220) or "-")
                                 + ", actions="
-                                + _summarize_primary_actions(page),
+                                + _summarize_primary_actions(page)
+                                + ", network="
+                                + _summarize_recent_network_events(recent_network_events, limit=10),
                                 step="create_password",
                             )
+                            if manual_v2_create_password_submit_attempts >= 2:
+                                raise RuntimeError(
+                                    "浏览器模式2 create-account/password 连续两次提交后仍停留在密码页，"
+                                    + "已停止无限重试；请结合上面的 body/network 诊断排查站点真实报错"
+                                )
+                        else:
+                            manual_v2_create_password_submit_attempts = 0
                         continue
 
                     if (
@@ -6211,7 +6731,22 @@ def run_browser_registration(
                                 previous_body,
                                 timeout_ms=18000,
                             )
-                            if _is_phone_input_page(current_url, body_text, page):
+                            if _is_login_with_bridge_page(current_url, body_text):
+                                emitter.warn(
+                                    "浏览器模式2 步骤1手机号提交后仍停留在首页登录弹层桥接页，继续等待站点真正切换到密码页/验证码页...",
+                                    step="add_phone",
+                                )
+                                emitter.info(
+                                    "步骤1手机号桥接页停留诊断: actions=" + _summarize_primary_actions(page),
+                                    step="add_phone",
+                                )
+                                continue
+                            if _is_login_password_page(current_url, body_text, page):
+                                emitter.info(
+                                    "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
+                                    step="create_password",
+                                )
+                            elif _is_phone_input_page(current_url, body_text, page):
                                 emitter.warn(
                                     "浏览器模式2 步骤1手机号提交后仍停留在手机号页，继续观察下一轮页面变化..."
                                     + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
@@ -6243,7 +6778,22 @@ def run_browser_registration(
                                 previous_body,
                                 timeout_ms=18000,
                             )
-                            if _is_phone_input_page(current_url, body_text, page):
+                            if _is_login_with_bridge_page(current_url, body_text):
+                                emitter.warn(
+                                    "浏览器模式2 步骤1手机号提交后仍停留在首页登录弹层桥接页，继续等待站点真正切换到密码页/验证码页...",
+                                    step="add_phone",
+                                )
+                                emitter.info(
+                                    "步骤1手机号桥接页停留诊断: actions=" + _summarize_primary_actions(page),
+                                    step="add_phone",
+                                )
+                                continue
+                            if _is_login_password_page(current_url, body_text, page):
+                                emitter.info(
+                                    "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
+                                    step="create_password",
+                                )
+                            elif _is_phone_input_page(current_url, body_text, page):
                                 emitter.warn(
                                     "浏览器模式2 步骤1手机号提交后仍停留在手机号页，继续观察下一轮页面变化..."
                                     + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
@@ -6449,7 +6999,10 @@ def run_browser_registration(
                             action_label="reset-password/new-password 已提交",
                             timeout_ms=15000,
                         )
-                        _prepare_manual_v2_login_flow("浏览器模式2 已完成首次重置密码，重新打开第二步手机登录流程...")
+                        _prepare_manual_v2_login_flow(
+                            "浏览器模式2 已完成首次重置密码，先使用已保存手机号与密码重新登录 ChatGPT 完成资料补充...",
+                            profile_completion_only=True,
+                        )
                         continue
 
                     if (
@@ -6462,7 +7015,10 @@ def run_browser_registration(
                             "浏览器模式2 已进入 reset-password/success 页面，直接转入第二步手机登录流程...",
                             step="create_password",
                         )
-                        _prepare_manual_v2_login_flow("浏览器模式2 已完成首次重置密码成功页，重新打开第二步手机登录流程...")
+                        _prepare_manual_v2_login_flow(
+                            "浏览器模式2 已完成首次重置密码成功页，先使用已保存手机号与密码重新登录 ChatGPT 完成资料补充...",
+                            profile_completion_only=True,
+                        )
                         continue
 
                     if (
@@ -6472,10 +7028,7 @@ def run_browser_registration(
                         and not _is_reset_password_new_password_page(current_url, body_text, page)
                         and not _is_login_password_page(current_url, body_text, page)
                         and not password_submitted
-                        and (
-                            is_phone_stage_page
-                            or _is_phone_flow_page(current_url, body_text)
-                        )
+                        and _is_phone_input_page(current_url, body_text, page)
                     ):
                         if not manual_v2_wait_phone_logged:
                             manual_v2_wait_phone_logged = True
@@ -6493,6 +7046,49 @@ def run_browser_registration(
                             )
                         _sleep_with_page(page, 1000)
                         continue
+
+                    if (
+                        manual_v2_login_flow_started
+                        and manual_v2_profile_completion_mode
+                        and _is_logged_in_chatgpt_home(current_url, body_text)
+                    ):
+                        _extend_manual_v2_deadline(1800)
+                        emitter.success(
+                            "浏览器模式2 reset-password 后复用手机号与密码登录时，站点直接进入已登录的 ChatGPT 主页；"
+                            + "说明当前账号无需补资料，直接切入真正的步骤2 OAuth 获取 Token 流程...",
+                            step="create_account",
+                        )
+                        manual_v2_profile_completion_mode = False
+                        _prepare_manual_v2_login_flow(
+                            "浏览器模式2 已确认 reset-password 后登录可直接进入 ChatGPT 主页，"
+                            + "无需补资料，现进入真正的步骤2 OAuth 获取 Token 流程..."
+                        )
+                        continue
+
+                    if (
+                        manual_v2_login_flow_started
+                        and manual_v2_profile_completion_mode
+                        and not manual_v2_phone_entry_clicked
+                        and "chatgpt.com" in current_url_lower
+                        and "auth.openai.com" not in current_url_lower
+                        and not _is_login_with_bridge_page(current_url, body_text)
+                    ):
+                        _extend_manual_v2_deadline(1800)
+                        if _click_first(
+                            page,
+                            [
+                                'a:has-text("Log in")',
+                                'button:has-text("Log in")',
+                                '[role="button"]:has-text("Log in")',
+                                'a:has-text("登录")',
+                                'button:has-text("登录")',
+                                '[role="button"]:has-text("登录")',
+                            ],
+                            timeout_ms=1500,
+                        ):
+                            emitter.info("浏览器模式2 reset-password 后的补资料登录流已点击 ChatGPT 首页“登录”，准备进入手机登录...", step="oauth_init")
+                            _wait_for_load(page, timeout_ms=2500)
+                            continue
 
                     if (
                         manual_v2_contact_seen
@@ -6534,13 +7130,53 @@ def run_browser_registration(
                             timeout_ms=20000,
                         )
                         if _is_about_you_missing_email_error(current_url, body_text):
+                            if manual_v2_profile_completion_mode:
+                                emitter.warn(
+                                    "浏览器模式2 reset-password 后的补资料流程在 about-you 提交后命中 authentication missing_email，"
+                                    + "这说明资料补充阶段已结束，下一步直接切入真正的步骤2 OAuth 补邮箱链路...",
+                                    step="create_email",
+                                )
+                                manual_v2_profile_completion_mode = False
+                                manual_v2_post_login_pending_email = False
+                                manual_v2_bridge_entered_at = 0.0
+                                manual_v2_bridge_logged = False
+                                manual_v2_post_login_recover_attempts = 0
+                                manual_v2_post_login_retryable_error_attempts = 0
+                                manual_v2_email_verification_logged = False
+                                email_submitted = False
+                                _prepare_manual_v2_login_flow(
+                                    "浏览器模式2 reset-password 后的补资料阶段已结束，"
+                                    + "现在进入真正的步骤2 OAuth 获取 Token / 绑定邮箱流程..."
+                                )
+                                continue
+                            emitter.warn(
+                                "浏览器模式2 about-you 提交后命中 authentication missing_email，"
+                                + "优先直接补跳 add-email，避免重复回到手机登录与 about-you...",
+                                step="create_email",
+                            )
+                            manual_v2_post_login_pending_email = False
+                            manual_v2_bridge_entered_at = 0.0
+                            manual_v2_bridge_logged = False
+                            manual_v2_post_login_recover_attempts = 0
+                            manual_v2_post_login_retryable_error_attempts = 0
+                            manual_v2_email_verification_logged = False
+                            email_submitted = False
+                            if _goto_manual_v2_add_email("浏览器模式2 about-you missing_email 后直接补跳 add-email"):
+                                continue
                             _prepare_manual_v2_login_flow(
                                 "浏览器模式2 about-you 提交后命中 authentication missing_email，"
-                                + "直接复用已有手机号与密码，重新进入第二步登录补邮箱链路..."
+                                + "补跳 add-email 未成功，再回退到第二步登录补邮箱链路..."
                             )
                             continue
                         emitter.success("浏览器模式2 已完成 about-you，转入手机登录补邮箱流程...", step="create_account")
-                        _prepare_manual_v2_login_flow("浏览器模式2 正在清理注册残留状态，并重新打开手机登录流程...")
+                        if manual_v2_profile_completion_mode:
+                            manual_v2_profile_completion_mode = False
+                            _prepare_manual_v2_login_flow(
+                                "浏览器模式2 已完成 about-you 资料填写，"
+                                + "现在进入真正的步骤2 OAuth 获取 Token 流程..."
+                            )
+                        else:
+                            _prepare_manual_v2_login_flow("浏览器模式2 正在清理注册残留状态，并重新打开手机登录流程...")
                         continue
 
                     if manual_v2_contact_seen and not manual_v2_login_flow_started:
@@ -6597,6 +7233,55 @@ def run_browser_registration(
                         _sleep_with_page(page, 800)
                         continue
 
+                    if (
+                        manual_v2_login_flow_started
+                        and not manual_v2_profile_completion_mode
+                        and _is_choose_account_page(current_url, body_text, page)
+                    ):
+                        _extend_manual_v2_deadline(1800)
+                        if _click_choose_account_phone_card(page, manual_v2_phone_number) or _click_first(
+                            page,
+                            [
+                                '[role="listitem"] button',
+                                '[role="listitem"] [role="button"]',
+                                '[data-testid*="account" i] button',
+                                '[data-testid*="account" i] [role="button"]',
+                                'button:has-text("Continue as")',
+                                '[role="button"]:has-text("Continue as")',
+                                'button:has-text("继续使用")',
+                                '[role="button"]:has-text("继续使用")',
+                            ],
+                            timeout_ms=1500,
+                        ):
+                            emitter.info(
+                                "浏览器模式2 第二步命中 choose-an-account 页面，已自动点击当前已登录账号，等待站点跳到绑定邮箱链路...",
+                                step="oauth_init",
+                            )
+                            _wait_for_load(page, timeout_ms=2500)
+                            continue
+                        if _click_first(
+                            page,
+                            [
+                                'button:has-text("Use another account")',
+                                '[role="button"]:has-text("Use another account")',
+                                'button:has-text("使用其他账号")',
+                                '[role="button"]:has-text("使用其他账号")',
+                            ],
+                            timeout_ms=1200,
+                        ):
+                            emitter.warn(
+                                "浏览器模式2 choose-an-account 页面未找到可直接复用的账号卡片，已切到“使用其他账号”，回退到手机号登录链路...",
+                                step="oauth_init",
+                            )
+                            _wait_for_load(page, timeout_ms=2000)
+                            continue
+                        emitter.warn(
+                            "浏览器模式2 当前停留在 choose-an-account 页面，但未识别到可点击的账号卡片或“使用其他账号”按钮；继续下一轮观察...",
+                            step="oauth_init",
+                        )
+                        _sleep_with_page(page, 600)
+                        continue
+
                     if manual_v2_login_flow_started and not manual_v2_phone_entry_clicked and _is_phone_login_entry_page(current_url, body_text, page):
                         _extend_manual_v2_deadline(1800)
                         if _click_first(
@@ -6649,6 +7334,60 @@ def run_browser_registration(
 
                     if manual_v2_login_flow_started and _is_login_with_bridge_page(current_url, body_text):
                         _extend_manual_v2_deadline(1800)
+                        if manual_v2_profile_completion_mode and not manual_v2_phone_entry_clicked:
+                            if _bootstrap_manual_v2_login_entry(current_url, body_text):
+                                current_url, body_text = _describe_page(page)
+                                current_url_lower = current_url.lower()
+                                body_lower = body_text.lower()
+                                if _is_phone_input_page(current_url, body_text, page):
+                                    manual_v2_phone_entry_clicked = True
+                                    emitter.info(
+                                        "浏览器模式2 reset-password 后的补资料登录流已在登录弹层切到手机登录入口，准备填写手机号...",
+                                        step="oauth_init",
+                                    )
+                        if (
+                            manual_v2_profile_completion_mode
+                            and manual_v2_phone_entry_clicked
+                            and not manual_v2_login_phone_submitted
+                            and _is_manual_v2_login_phone_input_stage(current_url, body_text, page)
+                        ):
+                            if not manual_v2_phone_number:
+                                manual_v2_phone_number = _extract_input_value_by_hints(
+                                    page,
+                                    ["phone", "mobile", "手机号", "电话", "tel"],
+                                )
+                            if manual_v2_phone_number:
+                                if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="create_email"):
+                                    raise RuntimeError("浏览器模式2 reset-password 后的补资料登录流自动提交已保存手机号失败")
+                                manual_v2_login_phone_submitted = True
+                                manual_v2_post_login_pending_email = False
+                                manual_v2_bridge_entered_at = 0.0
+                                manual_v2_bridge_logged = False
+                                manual_v2_post_login_recover_attempts = 0
+                                manual_v2_post_login_retryable_error_attempts = 0
+                                emitter.info(
+                                    "浏览器模式2 reset-password 后的补资料登录流已自动复用保存的手机号并提交，等待密码页...",
+                                    step="create_email",
+                                )
+                                _wait_for_load(page, timeout_ms=4000)
+                                continue
+                        if manual_v2_profile_completion_mode:
+                            if not manual_v2_bridge_logged:
+                                manual_v2_bridge_logged = True
+                                manual_v2_bridge_entered_at = time.time()
+                                emitter.info(
+                                    "浏览器模式2 补资料登录流进入 chatgpt.com/auth/login_with 桥接页，当前仅等待站点继续跳到密码页或 about-you，"
+                                    + "此阶段不进入绑定邮箱逻辑...",
+                                    step="oauth_init",
+                                )
+                                emitter.info(
+                                    "补资料桥接页会话诊断: cookies="
+                                    + _browser_cookie_presence_summary(context),
+                                    step="oauth_init",
+                                )
+                            _wait_for_load(page, timeout_ms=2000)
+                            _sleep_with_page(page, 500)
+                            continue
                         if not manual_v2_bridge_logged:
                             manual_v2_bridge_logged = True
                             manual_v2_bridge_entered_at = time.time()
@@ -6696,6 +7435,39 @@ def run_browser_registration(
                     if (
                         manual_v2_login_flow_started
                         and manual_v2_post_login_pending_email
+                        and _is_retryable_error_page(current_url, body_text)
+                    ):
+                        manual_v2_post_login_retryable_error_attempts += 1
+                        emitter.warn(
+                            "浏览器模式2 第二步密码提交后命中可重试错误页，"
+                            + f"先在当前页 Try again/Retry/重试，第 {manual_v2_post_login_retryable_error_attempts}/3 次原地恢复...",
+                            step="oauth_init",
+                        )
+                        if _try_recover_timeout_error_page(
+                            current_url,
+                            body_text,
+                            step="oauth_init",
+                            action_label="第二步密码提交后的错误页已点击重试",
+                            timeout_ms=12000,
+                        ):
+                            continue
+                        if manual_v2_post_login_retryable_error_attempts < 3:
+                            emitter.warn(
+                                "浏览器模式2 当前页重试后仍未恢复，将继续保留在现有链路中等待下一轮页面更新，再尝试原地恢复...",
+                                step="oauth_init",
+                            )
+                            _wait_for_load(page, timeout_ms=1800)
+                            _sleep_with_page(page, 600)
+                            continue
+                        if _restart_manual_v2_login_page(
+                            "浏览器模式2 第二步密码提交后连续 3 次原地 Try again/Retry/重试 仍未恢复，"
+                            + "改为重新打开 auth.openai.com/log-in 页面并复用手机号+密码重新登录。"
+                        ):
+                            continue
+
+                    if (
+                        manual_v2_login_flow_started
+                        and manual_v2_post_login_pending_email
                         and "auth.openai.com/log-in" in current_url_lower
                         and manual_v2_login_phone_submitted
                     ):
@@ -6707,9 +7479,9 @@ def run_browser_registration(
                             + _browser_cookie_presence_summary(context),
                             step="oauth_init",
                         )
-                        if _restart_manual_v2_login_oauth(
+                        if _restart_manual_v2_login_page(
                             "浏览器模式2 第二步密码提交后未能继续进入绑定邮箱链路，"
-                            + "优先重新生成授权链接并重试手机号+密码登录。"
+                            + "直接重新打开 auth.openai.com/log-in 页面并复用手机号+密码重新登录。"
                         ):
                             continue
                         continue_probe = _manual_v2_authorize_continue_via_page_api(page, ctx.email)
@@ -6792,6 +7564,8 @@ def run_browser_registration(
                         phone_input = _first_visible_locator(
                             page,
                             [
+                                'input[id="phoneNumberInput"]',
+                                'input[name="phoneNumberInput"]',
                                 'input[type="tel"]',
                                 'input[inputmode="tel"]',
                                 'input[name*="phone" i]',
@@ -6835,6 +7609,7 @@ def run_browser_registration(
                             manual_v2_bridge_entered_at = 0.0
                             manual_v2_bridge_logged = False
                             manual_v2_post_login_recover_attempts = 0
+                            manual_v2_post_login_retryable_error_attempts = 0
                             emitter.info("浏览器模式2 已提交手机号，等待密码页...", step="create_email")
                             _wait_for_load(page, timeout_ms=5000)
                             _post_phone_url, _post_phone_body = _describe_page(page)
@@ -6856,14 +7631,21 @@ def run_browser_registration(
                             + _browser_cookie_presence_summary(context),
                             step="create_email",
                         )
+                        if not _wait_for_add_email_ready(page, timeout_ms=12000):
+                            raise RuntimeError(
+                                "浏览器模式2 add-email 页面未稳定就绪: "
+                                + _summarize_primary_actions(page)
+                            )
                         if not _fill_first(
                             page,
                             [
                                 'input[name="email"]',
+                                'input[type="email"]',
                                 'input[autocomplete="email"]',
                                 'input[id*="-email" i]',
                                 'input[placeholder*="email" i]',
                                 'input[placeholder*="电子邮件" i]',
+                                'input[type="text"]',
                             ],
                             ctx.email,
                         ):
@@ -7128,17 +7910,40 @@ def run_browser_registration(
                     ):
                         raise RuntimeError("浏览器模式提交密码失败")
                     password_submitted = True
-                    if is_manual_v2_mode and manual_v2_login_flow_started and current_phase == "login":
+                    if (
+                        is_manual_v2_mode
+                        and manual_v2_login_flow_started
+                        and current_phase == "login"
+                        and not manual_v2_profile_completion_mode
+                    ):
                         manual_v2_post_login_pending_email = True
                         manual_v2_bridge_entered_at = 0.0
                         manual_v2_bridge_logged = False
                         manual_v2_post_login_recover_attempts = 0
+                        manual_v2_post_login_retryable_error_attempts = 0
                     emitter.info(
                         ("浏览器登录密码已提交，密码: " if current_phase == "login" else "浏览器注册密码已提交，密码: ")
                         + ctx.account_password,
                         step="create_password",
                     )
-                    if is_manual_v2_mode and manual_v2_login_flow_started and current_phase == "login":
+                    if (
+                        is_manual_v2_mode
+                        and manual_v2_login_flow_started
+                        and current_phase == "login"
+                        and manual_v2_profile_completion_mode
+                    ):
+                        emitter.info(
+                            "浏览器模式2 补资料登录密码已提交，当前仅等待站点进入 about-you / ChatGPT 主页；"
+                            + "此阶段不绑定邮箱，也不进入步骤2 OAuth。",
+                            step="create_account",
+                        )
+                        emitter.info(
+                            "补资料阶段密码提交后会话诊断: cookies="
+                            + _browser_cookie_presence_summary(context)
+                            + f", current_url={_mask_secret(current_url, head=56, tail=12)}",
+                            step="create_account",
+                        )
+                    elif is_manual_v2_mode and manual_v2_login_flow_started and current_phase == "login":
                         emitter.info(
                             "浏览器模式2 第二步登录密码已提交，当前优先等待 add-email / email-verification，暂不重拉 OAuth...",
                             step="create_email",
@@ -7201,9 +8006,42 @@ def run_browser_registration(
                         timeout_ms=20000,
                     )
                     if is_manual_v2_mode and _is_about_you_missing_email_error(current_url, body_text):
+                        if manual_v2_profile_completion_mode:
+                            emitter.warn(
+                                "浏览器模式2 reset-password 后的补资料流程在 about-you 提交后命中 authentication missing_email，"
+                                + "不在此阶段绑定邮箱，直接切入真正的步骤2 OAuth 补邮箱链路...",
+                                step="create_email",
+                            )
+                            manual_v2_profile_completion_mode = False
+                            manual_v2_post_login_pending_email = False
+                            manual_v2_bridge_entered_at = 0.0
+                            manual_v2_bridge_logged = False
+                            manual_v2_post_login_recover_attempts = 0
+                            manual_v2_post_login_retryable_error_attempts = 0
+                            manual_v2_email_verification_logged = False
+                            email_submitted = False
+                            _prepare_manual_v2_login_flow(
+                                "浏览器模式2 reset-password 后的补资料阶段已结束，"
+                                + "现在进入真正的步骤2 OAuth 获取 Token / 绑定邮箱流程..."
+                            )
+                            continue
+                        emitter.warn(
+                            "浏览器模式2 about-you 提交后命中 authentication missing_email，"
+                            + "优先直接补跳 add-email，避免重复回到手机登录与 about-you...",
+                            step="create_email",
+                        )
+                        manual_v2_post_login_pending_email = False
+                        manual_v2_bridge_entered_at = 0.0
+                        manual_v2_bridge_logged = False
+                        manual_v2_post_login_recover_attempts = 0
+                        manual_v2_post_login_retryable_error_attempts = 0
+                        manual_v2_email_verification_logged = False
+                        email_submitted = False
+                        if _goto_manual_v2_add_email("浏览器模式2 about-you missing_email 后直接补跳 add-email"):
+                            continue
                         _prepare_manual_v2_login_flow(
                             "浏览器模式2 about-you 提交后命中 authentication missing_email，"
-                            + "直接复用已有手机号与密码，重新进入第二步登录补邮箱链路..."
+                            + "补跳 add-email 未成功，再回退到第二步登录补邮箱链路..."
                         )
                         continue
                     continue
@@ -7601,11 +8439,42 @@ def run_browser_registration(
 
                 _is_third_party_page = any(domain in current_url_lower for domain in _third_party_oauth_domains)
                 if not _is_third_party_page and any(keyword in current_url_lower for keyword in ("consent", "workspace", "organization")):
-                    emitter.info(
-                        f"浏览器流程进入授权页: {_mask_secret(current_url, head=48, tail=12)}",
-                        step="workspace",
+                    if not manual_v2_workspace_logged:
+                        manual_v2_workspace_logged = True
+                        emitter.info(
+                            f"浏览器流程进入授权页: {_mask_secret(current_url, head=48, tail=12)}",
+                            step="workspace",
+                        )
+                        emitter.info(
+                            "授权页动作诊断: " + _summarize_primary_actions(page),
+                            step="workspace",
+                        )
+                    workspace_clicked = _click_first(
+                        page,
+                        [
+                            '[role="radio"][aria-checked="false"]',
+                            '[role="option"]',
+                            '[role="listitem"]',
+                            'button:has-text("Personal")',
+                            '[role="button"]:has-text("Personal")',
+                            'button:has-text("Workspace")',
+                            '[role="button"]:has-text("Workspace")',
+                            'button:has-text("Continue as")',
+                            '[role="button"]:has-text("Continue as")',
+                            'button:has-text("Use workspace")',
+                            '[role="button"]:has-text("Use workspace")',
+                        ],
+                        timeout_ms=1200,
                     )
-                    _click_primary_action(page, ["Continue", "Authorize", "Allow", "Next", "继续", "允许"])
+                    confirm_clicked = _click_primary_action(
+                        page,
+                        ["Continue", "Authorize", "Allow", "Next", "继续", "允许", "Confirm", "确认"],
+                    )
+                    if workspace_clicked or confirm_clicked:
+                        emitter.info(
+                            "浏览器正在推进授权页选择/确认动作...",
+                            step="workspace",
+                        )
                     _wait_for_load(page)
                     continue
 
@@ -7630,8 +8499,24 @@ def run_browser_registration(
                     )
 
                 if not _is_third_party_page and any(keyword in body_lower for keyword in ("authorize", "workspace", "organization", "allow access")):
-                    emitter.info("浏览器正在尝试确认授权...", step="workspace")
-                    _click_primary_action(page, ["Continue", "Authorize", "Allow", "Next", "继续", "允许"])
+                    if not manual_v2_workspace_logged:
+                        manual_v2_workspace_logged = True
+                        emitter.info("浏览器正在尝试确认授权...", step="workspace")
+                        emitter.info("授权页动作诊断: " + _summarize_primary_actions(page), step="workspace")
+                    _click_first(
+                        page,
+                        [
+                            '[role="radio"][aria-checked="false"]',
+                            '[role="option"]',
+                            '[role="listitem"]',
+                            'button:has-text("Personal")',
+                            '[role="button"]:has-text("Personal")',
+                            'button:has-text("Workspace")',
+                            '[role="button"]:has-text("Workspace")',
+                        ],
+                        timeout_ms=1000,
+                    )
+                    _click_primary_action(page, ["Continue", "Authorize", "Allow", "Next", "继续", "允许", "Confirm", "确认"])
                     _wait_for_load(page)
                     continue
 
