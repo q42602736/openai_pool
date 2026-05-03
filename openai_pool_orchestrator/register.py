@@ -47,6 +47,10 @@ try:
     from .token_compat import AUTH_CLAIM_KEY, decode_jwt_payload, normalize_token_data
 except ImportError:
     from token_compat import AUTH_CLAIM_KEY, decode_jwt_payload, normalize_token_data  # type: ignore
+try:
+    from .sms_providers import create_sms_provider_from_browser_config
+except ImportError:
+    from sms_providers import create_sms_provider_from_browser_config  # type: ignore
 
 # ==========================================
 # 日志事件发射器
@@ -2138,6 +2142,13 @@ def run(
     normalized_browser_config["browser_timezone"] = fingerprint_profile.timezone_id
     emitter.info(f"本次请求指纹: {describe_fingerprint(fingerprint_profile)}", step="oauth_init")
     browser_mode = register_mode_value in ("browser", "browser_manual", "browser_manual_v2")
+    sms_provider = create_sms_provider_from_browser_config(normalized_browser_config) if browser_mode else None
+    if (
+        register_mode_value == "browser_manual_v2"
+        and str(normalized_browser_config.get("browser_manual_v2_phone_mode") or "").strip().lower() == "hero_sms"
+        and sms_provider is None
+    ):
+        emitter.warn("浏览器模式2 已配置为 HeroSMS 全自动，但当前缺少有效的 HeroSMS API Key 或业务代码，运行时将无法自动取号。", step="oauth_init")
     verbose_auth_logs = str(os.getenv("OPENAI_POOL_VERBOSE_AUTH_LOGS") or "").strip().lower() in ("1", "true", "yes", "on")
 
     static_proxy = _normalize_proxy_value(proxy)
@@ -4125,6 +4136,7 @@ def run(
                     fallback_wait_for_otp_func=get_oai_code,
                     wait_manual_phone_input_func=browser_manual_phone_input_func,
                     wait_manual_sms_code_input_func=browser_manual_sms_code_input_func,
+                    sms_provider=sms_provider,
                     random_password_func=_random_password,
                     random_profile_name_func=_random_profile_name,
                     random_profile_birthdate_func=_random_profile_birthdate,

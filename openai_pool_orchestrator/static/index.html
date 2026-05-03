@@ -506,6 +506,41 @@
             </div>
           </div>
           <div class="config-row">
+            <div class="config-field" style="flex:1;max-width:260px;">
+              <label>模式2手机号来源</label>
+              <select id="browserManualV2PhoneMode">
+                <option value="manual">人工输入</option>
+                <option value="hero_sms">HeroSMS 全自动</option>
+              </select>
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>HeroSMS API Key</label>
+              <input type="password" id="heroSmsApiKey" value="" autocomplete="off" />
+            </div>
+          </div>
+          <div class="config-row">
+            <div class="config-field" style="flex:1;">
+              <label>HeroSMS 业务代码</label>
+              <input type="text" id="heroSmsService" value="" autocomplete="off" spellcheck="false" placeholder="必须手动填写，例如 dr；只有确认后再填" />
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>HeroSMS 固定国家</label>
+              <select id="heroSmsCountry">
+                <option value="16">英国 (+44) · ID 16</option>
+              </select>
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>HeroSMS Operator</label>
+              <select id="heroSmsOperator">
+                <option value="">自动选择最低价运营商</option>
+              </select>
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>取号重试次数</label>
+              <input type="number" id="heroSmsMaxAcquireRetries" value="5" min="1" max="20" />
+            </div>
+          </div>
+          <div class="config-row">
             <div class="config-field" style="flex:1;">
               <label>Locale</label>
               <input type="text" id="browserLocale" value="en-US" autocomplete="off" spellcheck="false" />
@@ -519,7 +554,7 @@
             <label>浏览器可执行文件路径（可选）</label>
             <input type="text" id="browserExecutablePath" value="" autocomplete="off" spellcheck="false" placeholder="/path/to/chrome 或留空自动探测本机 Chrome" />
             <div class="config-hint" style="margin-top:0;">
-              开启“显示浏览器窗口”后会以可见模式启动，方便你观察卡在哪一步；关闭时默认使用无头模式后台运行。模式2（手机注册）在关闭窗口后，可改为在 Worker 详情面板里手动提交手机号和短信验证码。
+              开启“显示浏览器窗口”后会以可见模式启动，方便你观察卡在哪一步；关闭时默认使用无头模式后台运行。模式2（手机注册）支持人工输入，也支持切到 HeroSMS 全自动接码。当前自动接码会固定使用你选中的国家池，并优先选择该国家池内最低价运营商。
             </div>
           </div>
           <div class="config-actions" style="margin-top:12px;">

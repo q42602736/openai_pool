@@ -34,6 +34,7 @@ from .mail_providers import create_provider, create_provider_by_name, MultiMailR
 from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
 from .token_compat import normalize_token_data
 from .register import generate_oauth_url, submit_callback_url, _random_password, _random_profile_name, _random_profile_birthdate
+from .sms_providers import list_hero_sms_countries, list_hero_sms_operator_quotes
 
 # ==========================================
 # 同步配置（内存持久化到 data/sync_config.json）
@@ -133,6 +134,12 @@ def _get_browser_config_snapshot(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
         "browser_block_media": _as_bool(config.get("browser_block_media", True), default=True),
         "browser_realistic_profile": _as_bool(config.get("browser_realistic_profile", False), default=False),
         "browser_clear_runtime_state": _as_bool(config.get("browser_clear_runtime_state", True), default=True),
+        "browser_manual_v2_phone_mode": str(config.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() or "manual",
+        "hero_sms_api_key": str(config.get("hero_sms_api_key", "") or "").strip(),
+        "hero_sms_service": str(config.get("hero_sms_service", "") or "").strip(),
+        "hero_sms_country": int(config.get("hero_sms_country", 16) or 16),
+        "hero_sms_operator": str(config.get("hero_sms_operator", "") or "").strip(),
+        "hero_sms_max_acquire_retries": int(config.get("hero_sms_max_acquire_retries", 5) or 5),
     }
 
 
@@ -387,6 +394,21 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["browser_locale"] = str(cfg.get("browser_locale", "en-US") or "en-US").strip() or "en-US"
     cfg["browser_timezone"] = str(cfg.get("browser_timezone", "America/New_York") or "America/New_York").strip() or "America/New_York"
     cfg["browser_block_media"] = _as_bool(cfg.get("browser_block_media", True), default=True)
+    phone_mode = str(cfg.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower()
+    if phone_mode not in ("manual", "hero_sms"):
+        phone_mode = "manual"
+    cfg["browser_manual_v2_phone_mode"] = phone_mode
+    cfg["hero_sms_api_key"] = str(cfg.get("hero_sms_api_key", "") or "").strip()
+    cfg["hero_sms_service"] = str(cfg.get("hero_sms_service", "") or "").strip()
+    try:
+        cfg["hero_sms_country"] = max(1, int(cfg.get("hero_sms_country", 16) or 16))
+    except (TypeError, ValueError):
+        cfg["hero_sms_country"] = 16
+    cfg["hero_sms_operator"] = str(cfg.get("hero_sms_operator", "") or "").strip()
+    try:
+        cfg["hero_sms_max_acquire_retries"] = max(1, min(int(cfg.get("hero_sms_max_acquire_retries", 5) or 5), 20))
+    except (TypeError, ValueError):
+        cfg["hero_sms_max_acquire_retries"] = 5
     cfg["token_proxy_sync"] = _as_bool(cfg.get("token_proxy_sync", False), default=False)
     cfg["token_proxy_db_path"] = str(cfg.get("token_proxy_db_path", "") or "").strip()
     return cfg
@@ -1883,18 +1905,32 @@ class TaskState:
                             "browser_block_media": bool(config_snapshot.get("browser_block_media", True)),
                             "browser_realistic_profile": bool(config_snapshot.get("browser_realistic_profile", True)),
                             "browser_clear_runtime_state": bool(config_snapshot.get("browser_clear_runtime_state", False)),
+                            "browser_manual_v2_phone_mode": str(config_snapshot.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() or "manual",
+                            "hero_sms_api_key": str(config_snapshot.get("hero_sms_api_key", "") or "").strip(),
+                            "hero_sms_service": str(config_snapshot.get("hero_sms_service", "") or "").strip(),
+                            "hero_sms_country": int(config_snapshot.get("hero_sms_country", 16) or 16),
+                            "hero_sms_operator": str(config_snapshot.get("hero_sms_operator", "") or "").strip(),
+                            "hero_sms_max_acquire_retries": int(config_snapshot.get("hero_sms_max_acquire_retries", 5) or 5),
                         },
-                        browser_manual_phone_input_func=lambda **kwargs: self.wait_for_worker_manual_input(
-                            worker_id,
-                            kind="phone_number",
-                            stop_event=self.stop_event,
-                            **kwargs,
+                        browser_manual_phone_input_func=(
+                            None
+                            if str(config_snapshot.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() == "hero_sms"
+                            else (lambda **kwargs: self.wait_for_worker_manual_input(
+                                worker_id,
+                                kind="phone_number",
+                                stop_event=self.stop_event,
+                                **kwargs,
+                            ))
                         ),
-                        browser_manual_sms_code_input_func=lambda **kwargs: self.wait_for_worker_manual_input(
-                            worker_id,
-                            kind="sms_code",
-                            stop_event=self.stop_event,
-                            **kwargs,
+                        browser_manual_sms_code_input_func=(
+                            None
+                            if str(config_snapshot.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() == "hero_sms"
+                            else (lambda **kwargs: self.wait_for_worker_manual_input(
+                                worker_id,
+                                kind="sms_code",
+                                stop_event=self.stop_event,
+                                **kwargs,
+                            ))
                         ),
                     )
 
@@ -2293,6 +2329,12 @@ class SyncConfigRequest(BaseModel):
     browser_block_media: bool = True
     browser_realistic_profile: bool = False
     browser_clear_runtime_state: bool = True
+    browser_manual_v2_phone_mode: str = "manual"
+    hero_sms_api_key: str = ""
+    hero_sms_service: str = ""
+    hero_sms_country: int = 16
+    hero_sms_operator: str = ""
+    hero_sms_max_acquire_retries: int = 5
     token_proxy_sync: bool = False
     token_proxy_db_path: str = ""
 
@@ -2308,6 +2350,12 @@ class BrowserConfigRequest(BaseModel):
     browser_block_media: bool = True
     browser_realistic_profile: bool = False
     browser_clear_runtime_state: bool = True
+    browser_manual_v2_phone_mode: str = "manual"
+    hero_sms_api_key: str = ""
+    hero_sms_service: str = ""
+    hero_sms_country: int = 16
+    hero_sms_operator: str = ""
+    hero_sms_max_acquire_retries: int = 5
 
 
 class WorkerManualInputRequest(BaseModel):
@@ -2523,6 +2571,51 @@ async def api_get_browser_config() -> Dict[str, Any]:
     return _get_browser_config_snapshot()
 
 
+@app.get("/api/browser-config/hero-sms-countries")
+async def api_get_hero_sms_countries() -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
+    service = str(cfg.get("hero_sms_service", "") or "").strip()
+    if not api_key:
+        return {"status": "missing_api_key", "countries": []}
+    try:
+        countries = await run_in_threadpool(
+            list_hero_sms_countries,
+            api_key=api_key,
+            service=service,
+            proxy="",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"获取 HeroSMS 国家列表失败: {exc}")
+    return {"status": "ok", "countries": countries}
+
+
+@app.get("/api/browser-config/hero-sms-operators")
+async def api_get_hero_sms_operators(country: int) -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
+    service = str(cfg.get("hero_sms_service", "") or "").strip()
+    if not api_key:
+        return {"status": "missing_api_key", "operators": []}
+    if not service:
+        return {"status": "missing_service", "operators": []}
+    try:
+        country_id = max(1, int(country or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="国家 ID 非法")
+    try:
+        operators = await run_in_threadpool(
+            list_hero_sms_operator_quotes,
+            api_key=api_key,
+            service=service,
+            country=country_id,
+            proxy="",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"获取 HeroSMS 运营商报价失败: {exc}")
+    return {"status": "ok", "operators": operators}
+
+
 @app.get("/api/proxy-pool/config")
 async def api_get_proxy_pool_config() -> Dict[str, Any]:
     cfg = _get_sync_config()
@@ -2679,6 +2772,12 @@ async def api_set_browser_config(req: BrowserConfigRequest) -> Dict[str, Any]:
         "browser_block_media": bool(req.browser_block_media),
         "browser_realistic_profile": bool(req.browser_realistic_profile),
         "browser_clear_runtime_state": bool(req.browser_clear_runtime_state),
+        "browser_manual_v2_phone_mode": str(req.browser_manual_v2_phone_mode or "manual").strip().lower() or "manual",
+        "hero_sms_api_key": req.hero_sms_api_key.strip(),
+        "hero_sms_service": req.hero_sms_service.strip(),
+        "hero_sms_country": max(1, int(req.hero_sms_country or 16)),
+        "hero_sms_operator": req.hero_sms_operator.strip(),
+        "hero_sms_max_acquire_retries": max(1, min(int(req.hero_sms_max_acquire_retries or 5), 20)),
     })
     cfg.pop("manual_v2_test_phone", None)
     cfg.pop("manual_v2_test_password", None)
@@ -2846,6 +2945,9 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
     upload_mode = str(req.upload_mode or "snapshot").strip().lower()
     if upload_mode not in ("snapshot", "decoupled"):
         upload_mode = "snapshot"
+    hero_sms_api_key = req.hero_sms_api_key.strip() if req.hero_sms_api_key else ""
+    if not hero_sms_api_key:
+        hero_sms_api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
     cfg.update({
         "base_url": new_base_url,
         "bearer_token": verified_token,
@@ -2871,6 +2973,12 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
         "browser_block_media": bool(req.browser_block_media),
         "browser_realistic_profile": bool(req.browser_realistic_profile),
         "browser_clear_runtime_state": bool(req.browser_clear_runtime_state),
+        "browser_manual_v2_phone_mode": str(req.browser_manual_v2_phone_mode or "manual").strip().lower() or "manual",
+        "hero_sms_api_key": hero_sms_api_key,
+        "hero_sms_service": req.hero_sms_service.strip(),
+        "hero_sms_country": max(1, int(req.hero_sms_country or 16)),
+        "hero_sms_operator": req.hero_sms_operator.strip(),
+        "hero_sms_max_acquire_retries": max(1, min(int(req.hero_sms_max_acquire_retries or 5), 20)),
     })
     cfg.pop("manual_v2_test_phone", None)
     cfg.pop("manual_v2_test_password", None)

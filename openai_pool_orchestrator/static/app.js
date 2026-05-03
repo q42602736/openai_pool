@@ -123,6 +123,13 @@ const COMPLETION_SEMANTICS_MAP = {
   requires_postprocess: '注册完成后仍需后处理',
 };
 
+const HERO_SMS_FALLBACK_COUNTRIES = [
+  { hero_sms_country: 16, name: '英国', iso_code: 'GB', dial_code: '44' },
+  { hero_sms_country: 1, name: '美国', iso_code: 'US', dial_code: '1' },
+  { hero_sms_country: 2, name: '加拿大', iso_code: 'CA', dial_code: '1' },
+  { hero_sms_country: 5, name: '澳大利亚', iso_code: 'AU', dial_code: '61' },
+];
+
 const WORKER_STATUS_PRIORITY = {
   registering: 6,
   postprocessing: 5,
@@ -281,6 +288,12 @@ document.addEventListener('DOMContentLoaded', () => {
     registerMode: $('registerMode'),
     browserVisible: $('browserVisible'),
     browserBlockMedia: $('browserBlockMedia'),
+    browserManualV2PhoneMode: $('browserManualV2PhoneMode'),
+    heroSmsApiKey: $('heroSmsApiKey'),
+    heroSmsService: $('heroSmsService'),
+    heroSmsCountry: $('heroSmsCountry'),
+    heroSmsOperator: $('heroSmsOperator'),
+    heroSmsMaxAcquireRetries: $('heroSmsMaxAcquireRetries'),
     manualV2TestPhone: $('manualV2TestPhone'),
     manualV2TestPassword: $('manualV2TestPassword'),
     browserTimeoutMs: $('browserTimeoutMs'),
@@ -324,6 +337,11 @@ document.addEventListener('DOMContentLoaded', () => {
   DOM.saveSyncConfigBtn.addEventListener('click', saveSyncConfig);
   if (DOM.saveTokenProxyConfigBtn) DOM.saveTokenProxyConfigBtn.addEventListener('click', saveTokenProxyConfig);
   if (DOM.browserConfigSaveBtn) DOM.browserConfigSaveBtn.addEventListener('click', saveBrowserConfig);
+  if (DOM.heroSmsCountry) {
+    DOM.heroSmsCountry.addEventListener('change', () => {
+      loadHeroSmsOperators(DOM.heroSmsCountry.value, '');
+    });
+  }
   if (DOM.registerMode) {
     DOM.registerMode.addEventListener('change', () => {
       if (DOM.registerMode.value === 'browser_manual') {
@@ -801,6 +819,116 @@ function normalizeWorkerSteps(steps) {
       return String(a.updated_at || '').localeCompare(String(b.updated_at || ''));
     })
     .slice(-MAX_WORKER_STEP_ITEMS);
+}
+
+function formatHeroSmsCountryLabel(item) {
+  const name = (item && item.name) || '未知国家';
+  const iso = (item && item.iso_code) || '';
+  const dial = (item && item.dial_code) || '';
+  const id = (item && item.hero_sms_country) || '';
+  const isoText = iso ? `${iso}` : '-';
+  const dialText = dial ? `+${dial}` : '+-';
+  return `${name} (${isoText} / ${dialText}) · ID ${id}`;
+}
+
+function formatHeroSmsOperatorLabel(item) {
+  const operator = String((item && item.operator) || '').trim() || '未知运营商';
+  const price = item && item.price !== null && item.price !== undefined ? `$${item.price}` : '无报价';
+  const count = item && item.count !== null && item.count !== undefined ? `库存 ${item.count}` : '库存 -';
+  const physical = item && item.physical_count !== null && item.physical_count !== undefined ? `实体 ${item.physical_count}` : '';
+  const sameAsAggregate = !!(item && item.same_as_aggregate);
+  const note = sameAsAggregate ? '接口返回聚合值' : '';
+  return [operator, price, count, physical, note].filter(Boolean).join(' · ');
+}
+
+function renderHeroSmsCountryOptions(countries, selectedValue) {
+  if (!DOM.heroSmsCountry) return;
+  const list = Array.isArray(countries) && countries.length > 0 ? countries : HERO_SMS_FALLBACK_COUNTRIES;
+  const normalizedSelected = String(selectedValue || DOM.heroSmsCountry.value || '16');
+  DOM.heroSmsCountry.innerHTML = '';
+  list.forEach((item) => {
+    const option = document.createElement('option');
+    option.value = String(item.hero_sms_country || '');
+    option.textContent = formatHeroSmsCountryLabel(item);
+    if (option.value === normalizedSelected) option.selected = true;
+    DOM.heroSmsCountry.appendChild(option);
+  });
+  if (![...DOM.heroSmsCountry.options].some(opt => opt.value === normalizedSelected)) {
+    const customOption = document.createElement('option');
+    customOption.value = normalizedSelected;
+    customOption.textContent = `自定义国家 ID ${normalizedSelected}`;
+    customOption.selected = true;
+    DOM.heroSmsCountry.appendChild(customOption);
+  }
+}
+
+function renderHeroSmsOperatorOptions(operators, selectedValue = '') {
+  if (!DOM.heroSmsOperator) return;
+  const normalizedSelected = String(selectedValue || '');
+  DOM.heroSmsOperator.innerHTML = '';
+
+  const sameAggregate = Array.isArray(operators)
+    && operators.length > 0
+    && operators.every((item) => String(item?.signature || '') === String(operators[0]?.signature || ''));
+
+  const autoOption = document.createElement('option');
+  autoOption.value = '';
+  autoOption.textContent = sameAggregate
+    ? '自动选择最低价运营商（当前接口未区分运营商报价）'
+    : '自动选择最低价运营商';
+  if (!normalizedSelected) autoOption.selected = true;
+  DOM.heroSmsOperator.appendChild(autoOption);
+
+  const list = Array.isArray(operators) ? operators : [];
+  list.forEach((item) => {
+    const value = String((item && item.operator) || '').trim();
+    if (!value) return;
+    const normalizedItem = { ...item, same_as_aggregate: sameAggregate };
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = formatHeroSmsOperatorLabel(normalizedItem);
+    if (value === normalizedSelected) option.selected = true;
+    DOM.heroSmsOperator.appendChild(option);
+  });
+
+  if (normalizedSelected && ![...DOM.heroSmsOperator.options].some(opt => opt.value === normalizedSelected)) {
+    const customOption = document.createElement('option');
+    customOption.value = normalizedSelected;
+    customOption.textContent = `${normalizedSelected} · 自定义`;
+    customOption.selected = true;
+    DOM.heroSmsOperator.appendChild(customOption);
+  }
+}
+
+async function loadHeroSmsOperators(countryValue = '', selectedOperator = '') {
+  if (!DOM.heroSmsOperator) return;
+  const country = parseInt(countryValue || DOM.heroSmsCountry?.value || '16', 10) || 16;
+  try {
+    const res = await fetch(`/api/browser-config/hero-sms-operators?country=${encodeURIComponent(country)}`);
+    const data = await res.json();
+    if (!res.ok) {
+      renderHeroSmsOperatorOptions([], selectedOperator);
+      return;
+    }
+    renderHeroSmsOperatorOptions(data.operators || [], selectedOperator);
+  } catch {
+    renderHeroSmsOperatorOptions([], selectedOperator);
+  }
+}
+
+async function loadHeroSmsCountries(selectedValue = '') {
+  if (!DOM.heroSmsCountry) return;
+  try {
+    const res = await fetch('/api/browser-config/hero-sms-countries');
+    const data = await res.json();
+    if (!res.ok) {
+      renderHeroSmsCountryOptions(HERO_SMS_FALLBACK_COUNTRIES, selectedValue);
+      return;
+    }
+    renderHeroSmsCountryOptions(data.countries || HERO_SMS_FALLBACK_COUNTRIES, selectedValue);
+  } catch {
+    renderHeroSmsCountryOptions(HERO_SMS_FALLBACK_COUNTRIES, selectedValue);
+  }
 }
 
 function normalizeWorkerManualInput(manualInput) {
@@ -2247,6 +2375,12 @@ function collectBrowserConfigForm() {
     browser_block_media: DOM.browserBlockMedia ? DOM.browserBlockMedia.checked : true,
     browser_realistic_profile: false,
     browser_clear_runtime_state: true,
+    browser_manual_v2_phone_mode: DOM.browserManualV2PhoneMode ? DOM.browserManualV2PhoneMode.value : 'manual',
+    hero_sms_api_key: DOM.heroSmsApiKey ? DOM.heroSmsApiKey.value.trim() : '',
+    hero_sms_service: DOM.heroSmsService ? DOM.heroSmsService.value.trim() : '',
+    hero_sms_country: DOM.heroSmsCountry ? (parseInt(DOM.heroSmsCountry.value, 10) || 16) : 16,
+    hero_sms_operator: DOM.heroSmsOperator ? DOM.heroSmsOperator.value.trim() : '',
+    hero_sms_max_acquire_retries: DOM.heroSmsMaxAcquireRetries ? (parseInt(DOM.heroSmsMaxAcquireRetries.value, 10) || 5) : 5,
     browser_timeout_ms: DOM.browserTimeoutMs ? (parseInt(DOM.browserTimeoutMs.value, 10) || 90000) : 90000,
     browser_slow_mo_ms: DOM.browserSlowMoMs ? (parseInt(DOM.browserSlowMoMs.value, 10) || 0) : 0,
     browser_locale: DOM.browserLocale ? DOM.browserLocale.value.trim() || 'en-US' : 'en-US',
@@ -2266,6 +2400,12 @@ function applyBrowserConfig(cfg) {
     DOM.browserVisible.disabled = false;
   }
   if (DOM.browserBlockMedia) DOM.browserBlockMedia.checked = cfg.browser_block_media !== false;
+  if (DOM.browserManualV2PhoneMode) DOM.browserManualV2PhoneMode.value = cfg.browser_manual_v2_phone_mode || 'manual';
+  if (DOM.heroSmsApiKey) DOM.heroSmsApiKey.value = cfg.hero_sms_api_key || '';
+  if (DOM.heroSmsService) DOM.heroSmsService.value = cfg.hero_sms_service || '';
+  if (DOM.heroSmsCountry) DOM.heroSmsCountry.dataset.selectedValue = String(cfg.hero_sms_country || 16);
+  if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = cfg.hero_sms_operator || '';
+  if (DOM.heroSmsMaxAcquireRetries) DOM.heroSmsMaxAcquireRetries.value = cfg.hero_sms_max_acquire_retries || 5;
   if (DOM.browserTimeoutMs) DOM.browserTimeoutMs.value = cfg.browser_timeout_ms || 90000;
   if (DOM.browserSlowMoMs) DOM.browserSlowMoMs.value = cfg.browser_slow_mo_ms || 0;
   if (DOM.browserLocale) DOM.browserLocale.value = cfg.browser_locale || 'en-US';
@@ -2313,6 +2453,8 @@ async function loadBrowserConfig() {
     if (!res.ok) return;
     const cfg = await res.json();
     applyBrowserConfig(cfg);
+    await loadHeroSmsCountries(cfg.hero_sms_country || 16);
+    await loadHeroSmsOperators(cfg.hero_sms_country || 16, cfg.hero_sms_operator || '');
   } catch { }
 }
 
@@ -2399,6 +2541,7 @@ async function saveSyncConfig() {
   const multithread = DOM.multithreadCheck ? DOM.multithreadCheck.checked : false;
   const thread_count = DOM.threadCountInput ? parseInt(DOM.threadCountInput.value) || 3 : 3;
   const auto_register = DOM.autoRegisterCheck ? DOM.autoRegisterCheck.checked : false;
+  const browserConfig = collectBrowserConfigForm();
 
   if (!base_url) { showToast('请填写平台地址', 'error'); return; }
   if (!email) { showToast('请填写邮箱', 'error'); return; }
@@ -2416,6 +2559,7 @@ async function saveSyncConfig() {
         sub2api_min_candidates, sub2api_auto_maintain, sub2api_maintain_interval_minutes,
         sub2api_maintain_actions,
         multithread, thread_count, auto_register,
+        ...browserConfig,
       }),
     });
     const data = await res.json();
@@ -2472,6 +2616,20 @@ async function saveBrowserConfig(options = {}) {
   const silentSuccess = !!options.silentSuccess;
   const statusText = options.statusText || '浏览器注册配置已保存';
   const payload = collectBrowserConfigForm();
+  if (payload.browser_manual_v2_phone_mode === 'hero_sms') {
+    if (!payload.hero_sms_api_key) {
+      const msg = '启用 HeroSMS 全自动时必须填写 HeroSMS API Key';
+      if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
+      showToast(msg, 'error');
+      return false;
+    }
+    if (!payload.hero_sms_service) {
+      const msg = '启用 HeroSMS 全自动时必须填写 HeroSMS 业务代码';
+      if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
+      showToast(msg, 'error');
+      return false;
+    }
+  }
   DOM.browserConfigSaveBtn.disabled = true;
   const oldText = DOM.browserConfigSaveBtn.textContent;
   DOM.browserConfigSaveBtn.textContent = '保存中...';
@@ -2490,6 +2648,7 @@ async function saveBrowserConfig(options = {}) {
       return false;
     }
     applyBrowserConfig(data);
+    await loadHeroSmsCountries(data.hero_sms_country || payload.hero_sms_country || 16);
     const msg = statusText;
     if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
     if (!silentSuccess) showToast(msg, 'success');
