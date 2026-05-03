@@ -518,6 +518,21 @@ def _click_locator_human_like(page: Any, locator: Any, *, timeout_ms: int = 1200
         return False
 
 
+def _wait_for_choose_account_transition(page: Any, previous_url: str, *, timeout_ms: int = 2500) -> bool:
+    deadline = time.time() + max(0.8, float(timeout_ms or 0) / 1000.0)
+    previous_url_lower = str(previous_url or "").strip().lower()
+    while time.time() < deadline:
+        _wait_for_load(page, timeout_ms=800)
+        current_url, current_body = _describe_page(page, force_refresh=True)
+        current_url_lower = str(current_url or "").strip().lower()
+        if current_url_lower and current_url_lower != previous_url_lower:
+            return True
+        if not _is_choose_account_page(current_url, current_body, page):
+            return True
+        _sleep_with_page(page, 180)
+    return False
+
+
 def _fill_first(page: Any, selectors: list[str], value: str, *, timeout_ms: int = 1200) -> bool:
     locator = _first_visible_locator(page, selectors)
     if locator is None:
@@ -2938,6 +2953,10 @@ def _is_contact_verification_page(url: str, body_text: str, page: Any) -> bool:
     phone_otp_input = _first_visible_locator(
         page,
         [
+            'input[name="code"]',
+            'input[id*="-code" i]',
+            'input[placeholder="Code"]',
+            'input[placeholder*="code" i]',
             'input[inputmode="numeric"]',
             'input[autocomplete="one-time-code"]',
             'input[name*="code" i]',
@@ -2985,54 +3004,77 @@ def _is_choose_account_page(url: str, body_text: str, page: Any) -> bool:
     ) is not None
 
 
-def _click_choose_account_phone_card(page: Any, phone_number: str) -> bool:
+def _click_choose_account_phone_card(page: Any, phone_number: str) -> Dict[str, str]:
     phone_text = str(phone_number or "").strip()
     if page is None or not phone_text:
-        return False
+        return {"clicked": "", "matched_text": "", "reason": "missing_phone"}
     digits = "".join(ch for ch in phone_text if ch.isdigit())
     tail_digits = digits[-8:] if len(digits) >= 8 else digits
     if not tail_digits:
-        return False
+        return {"clicked": "", "matched_text": "", "reason": "missing_digits"}
+
+    previous_url = ""
     try:
-        matched = bool(
-            page.evaluate(
-                """(tailDigits) => {
-                    const normalizeDigits = (value) => String(value || '').replace(/\\D+/g, '');
-                    const isVisible = (node) => {
-                        if (!node) return false;
-                        const rect = node.getBoundingClientRect();
-                        const style = window.getComputedStyle(node);
-                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                    };
-                    const clickNode = (node) => {
-                        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
-                            node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-                        });
-                    };
-                    const nodes = Array.from(document.querySelectorAll('span, div, p, button, [role="button"], [role="listitem"]'));
-                    for (const node of nodes) {
-                        const text = String(node.innerText || node.textContent || '').trim();
-                        if (!text) continue;
-                        const nodeDigits = normalizeDigits(text);
-                        if (!nodeDigits || !nodeDigits.endsWith(tailDigits)) continue;
-                        let clickable = node.closest('button, [role="button"], [role="listitem"], a');
-                        if (!clickable && node.parentElement) {
-                            clickable = node.parentElement.closest('button, [role="button"], [role="listitem"], a, div');
-                        }
-                        if (!clickable || !isVisible(clickable)) continue;
-                        clickNode(clickable);
-                        return true;
-                    }
-                    return false;
-                }""",
-                tail_digits,
-            )
-        )
+        previous_url = str(page.url or "").strip()
     except Exception:
-        matched = False
-    if matched:
-        _sleep_with_page(page, 600)
-    return matched
+        previous_url = ""
+
+    try:
+        text_nodes = page.locator("span, div, p, button, a, [role=\"button\"], [role=\"listitem\"]")
+        count = min(text_nodes.count(), 120)
+    except Exception:
+        count = 0
+        text_nodes = None
+
+    matched_text = ""
+    found_candidate = False
+    for index in range(count):
+        try:
+            item = text_nodes.nth(index)
+            if not item.is_visible():
+                continue
+            raw_text = str(item.inner_text(timeout=300) or "").strip()
+        except Exception:
+            continue
+        node_digits = "".join(ch for ch in raw_text if ch.isdigit())
+        if not node_digits or not node_digits.endswith(tail_digits):
+            continue
+        found_candidate = True
+        matched_text = raw_text
+        candidate_selectors = [
+            "xpath=ancestor-or-self::button[1]",
+            "xpath=ancestor-or-self::*[@role='button'][1]",
+            "xpath=ancestor-or-self::*[@role='listitem'][1]",
+            "xpath=ancestor-or-self::a[1]",
+            "xpath=ancestor-or-self::div[1]",
+        ]
+        for selector in candidate_selectors:
+            try:
+                candidate = item.locator(selector).first
+                if not candidate.is_visible():
+                    continue
+            except Exception:
+                continue
+            try:
+                candidate.scroll_into_view_if_needed(timeout=1200)
+            except Exception:
+                pass
+            clicked = _click_locator_human_like(page, candidate, timeout_ms=1500)
+            if not clicked:
+                try:
+                    candidate.click(timeout=1200)
+                    clicked = True
+                except Exception:
+                    clicked = False
+            if not clicked:
+                continue
+            if _wait_for_choose_account_transition(page, previous_url, timeout_ms=2800):
+                return {"clicked": "true", "matched_text": matched_text, "reason": "matched_phone_card"}
+        break
+
+    if found_candidate:
+        return {"clicked": "", "matched_text": matched_text, "reason": "candidate_not_clickable"}
+    return {"clicked": "", "matched_text": "", "reason": "no_candidate"}
 
 
 def _is_create_account_password_page(url: str, body_text: str, page: Any) -> bool:
@@ -3171,6 +3213,14 @@ def _wait_for_create_account_password_ready(page: Any, *, timeout_ms: int = 1200
         _wait_for_load(page, timeout_ms=1200)
         current_url, body_text = _describe_page(page)
         if not _is_create_account_password_page(current_url, body_text, page):
+            if (
+                _is_contact_verification_page(current_url, body_text, page)
+                or _is_phone_sms_send_failed_error(current_url, body_text, page)
+                or _is_timeout_error_page(current_url, body_text)
+                or _is_profile_page(current_url, body_text)
+                or _is_login_password_page(current_url, body_text, page)
+            ):
+                return True
             _sleep_with_page(page, 350)
             continue
         probe = _probe_create_account_password_page_state(page)
@@ -3214,6 +3264,15 @@ def _wait_for_create_account_password_ready(page: Any, *, timeout_ms: int = 1200
             if stable_rounds >= 2:
                 return True
         _sleep_with_page(page, 350)
+    current_url, body_text = _describe_page(page, force_refresh=True)
+    if (
+        _is_contact_verification_page(current_url, body_text, page)
+        or _is_phone_sms_send_failed_error(current_url, body_text, page)
+        or _is_timeout_error_page(current_url, body_text)
+        or _is_profile_page(current_url, body_text)
+        or _is_login_password_page(current_url, body_text, page)
+    ):
+        return True
     return False
 
 
@@ -4966,6 +5025,8 @@ def run_browser_registration(
                     score += 2
                 if "auth.openai.com" in candidate_url_lower:
                     score += 2
+                if candidate_state == "contact_verification":
+                    score += 6
                 if candidate_state == "password" or candidate_state == "auth":
                     score += 1
                 if candidate_state == "login_with_bridge":
@@ -5264,10 +5325,11 @@ def run_browser_registration(
             phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
 
         if phone_entry_visible and _click_first(page, phone_entry_selectors, timeout_ms=1200):
-            emitter.info("浏览器模式2 已自动切换到手机号注册入口，等待你输入手机号...", step="oauth_init")
+            emitter.info("浏览器模式2 已点击手机号注册入口，等待站点真正渲染手机号输入框...", step="oauth_init")
             clicked = True
             current_url, body_text = _wait_signup_transition(current_url, body_text, action_label="手机号注册入口已点击")
             if _entry_flow_ready(current_url, body_text):
+                emitter.info("浏览器模式2 已自动切换到手机号注册入口，已看到手机号输入控件。", step="oauth_init")
                 return True
 
         if _entry_flow_ready(current_url, body_text):
@@ -5319,13 +5381,23 @@ def run_browser_registration(
         ):
             if manual_v2_profile_completion_mode and manual_v2_phone_number:
                 emitter.info(
-                    "浏览器模式2 已在 auth.openai.com/log-in 页面切换到手机号登录入口，准备自动复用已保存手机号...",
+                    "浏览器模式2 已在 auth.openai.com/log-in 页面点击手机号登录入口，等待手机号输入页就绪后自动复用已保存手机号...",
                     step="oauth_init",
                 )
             else:
-                emitter.info("浏览器模式2 已在 auth.openai.com/log-in 页面切换到手机号登录入口，等待你输入手机号...", step="oauth_init")
+                emitter.info("浏览器模式2 已在 auth.openai.com/log-in 页面点击手机号登录入口，等待站点渲染手机号输入框...", step="oauth_init")
             _wait_for_load(page, timeout_ms=2000)
-            return True
+            latest_url, latest_body = _describe_page(page, force_refresh=True)
+            if _is_phone_input_page(latest_url, latest_body, page):
+                if manual_v2_profile_completion_mode and manual_v2_phone_number:
+                    emitter.info(
+                        "浏览器模式2 已在 auth.openai.com/log-in 页面切到手机号输入页，准备自动复用已保存手机号...",
+                        step="oauth_init",
+                    )
+                else:
+                    emitter.info("浏览器模式2 已在 auth.openai.com/log-in 页面切到手机号输入页。", step="oauth_init")
+                return True
+            return bool("continue with phone" in body_lower or "use phone instead" in body_lower or "继续使用手机登录" in body_text)
         return bool("continue with phone" in body_lower or "use phone instead" in body_lower or "继续使用手机登录" in body_text)
 
     def _reset_browser_phase_state(*, clear_profile: bool = False) -> None:
@@ -5608,6 +5680,7 @@ def run_browser_registration(
         step: str = "create_password",
         timeout_ms: int = 20000,
     ) -> tuple[str, str]:
+        nonlocal page
         previous_url_lower = str(previous_url or "").lower()
         previous_state = _classify_page_state(previous_url, previous_body, page)
         deadline_local = time.time() + max(2.0, float(timeout_ms) / 1000.0)
@@ -5633,6 +5706,11 @@ def run_browser_registration(
             latest_url_lower = latest_url.lower()
             latest_state = _classify_page_state(latest_url, latest_body, page)
             if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
+                return latest_url, latest_body
+            if any(
+                "contact-verification" in str(item.get("url", "")).lower()
+                for item in recent_network_events
+            ):
                 return latest_url, latest_body
             if _is_phone_sms_send_failed_error(latest_url, latest_body, page):
                 return latest_url, latest_body
@@ -6654,10 +6732,16 @@ def run_browser_registration(
                         )
                         current_url, body_text = _describe_page(page, force_refresh=True)
                         if _is_contact_verification_page(current_url, body_text, page):
+                            manual_v2_contact_seen = True
+                            manual_v2_contact_transition_last_key = ""
+                            manual_v2_waiting_phone_retry = False
+                            manual_v2_waiting_phone_retry_logged = False
+                            manual_v2_require_phone_resubmit = False
                             emitter.info(
                                 "浏览器模式2 create-account/password 提交后已进入短信验证码页，准备立即切换到验证码输入阶段...",
                                 step="phone_verification",
                             )
+                            continue
                         if _is_phone_sms_send_failed_error(current_url, body_text, page):
                             password_submitted = False
                             manual_v2_password_page_logged = False
@@ -7239,25 +7323,56 @@ def run_browser_registration(
                         and _is_choose_account_page(current_url, body_text, page)
                     ):
                         _extend_manual_v2_deadline(1800)
-                        if _click_choose_account_phone_card(page, manual_v2_phone_number) or _click_first(
-                            page,
-                            [
-                                '[role="listitem"] button',
-                                '[role="listitem"] [role="button"]',
-                                '[data-testid*="account" i] button',
-                                '[data-testid*="account" i] [role="button"]',
-                                'button:has-text("Continue as")',
-                                '[role="button"]:has-text("Continue as")',
-                                'button:has-text("继续使用")',
-                                '[role="button"]:has-text("继续使用")',
-                            ],
-                            timeout_ms=1500,
+                        choose_account_result = _click_choose_account_phone_card(page, manual_v2_phone_number)
+                        choose_account_clicked = str(choose_account_result.get("clicked") or "").strip().lower() == "true"
+                        if (
+                            not choose_account_clicked
+                            and not str(choose_account_result.get("matched_text") or "").strip()
+                            and _click_first(
+                                page,
+                                [
+                                    '[role="listitem"] button',
+                                    '[role="listitem"] [role="button"]',
+                                    '[data-testid*="account" i] button',
+                                    '[data-testid*="account" i] [role="button"]',
+                                    'button:has-text("Continue as")',
+                                    '[role="button"]:has-text("Continue as")',
+                                    'button:has-text("继续使用")',
+                                    '[role="button"]:has-text("继续使用")',
+                                ],
+                                timeout_ms=1500,
+                            )
+                            and _wait_for_choose_account_transition(page, current_url, timeout_ms=2800)
                         ):
+                            choose_account_clicked = True
+                            choose_account_result = {
+                                "clicked": "true",
+                                "matched_text": "",
+                                "reason": "fallback_account_button",
+                            }
+                        if choose_account_clicked:
                             emitter.info(
-                                "浏览器模式2 第二步命中 choose-an-account 页面，已自动点击当前已登录账号，等待站点跳到绑定邮箱链路...",
+                                "浏览器模式2 第二步命中 choose-an-account 页面，已自动点击当前已登录账号，等待站点跳到绑定邮箱链路..."
+                                + (
+                                    f" matched={_preview_text(choose_account_result.get('matched_text', ''), 48)}"
+                                    if choose_account_result.get("matched_text")
+                                    else ""
+                                ),
                                 step="oauth_init",
                             )
                             _wait_for_load(page, timeout_ms=2500)
+                            continue
+                        if str(choose_account_result.get("reason") or "").strip() == "candidate_not_clickable":
+                            emitter.warn(
+                                "浏览器模式2 当前停留在 choose-an-account 页面，已识别到目标手机号账号卡片，但真实点击未生效；继续下一轮观察..."
+                                + (
+                                    f" matched={_preview_text(choose_account_result.get('matched_text', ''), 48)}"
+                                    if choose_account_result.get("matched_text")
+                                    else ""
+                                ),
+                                step="oauth_init",
+                            )
+                            _sleep_with_page(page, 600)
                             continue
                         if _click_first(
                             page,
