@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional
 from curl_cffi import requests
 
 
+HERO_SMS_CANCEL_MIN_WAIT_SECONDS = 120
+
+
 DEFAULT_PHONE_COUNTRIES: List[Dict[str, Any]] = [
     {"isoCode": "GB", "dialCode": "44", "name": "英国", "aliases": ["United Kingdom", "UK", "Britain", "Great Britain"]},
     {"isoCode": "US", "dialCode": "1", "name": "美国", "aliases": ["United States", "USA", "America"]},
@@ -109,6 +112,7 @@ class SMSProvider(ABC):
 
 class HeroSMSProvider(SMSProvider):
     BASE_URL = "https://hero-sms.com/stubs/handler_api.php"
+    API_V1_BASE_URL = "https://hero-sms.com/api/v1"
     MAX_ACCEPTABLE_PRICE_RATIO = 1.05
     MAX_ACCEPTABLE_PRICE_DELTA = 0.0005
 
@@ -119,6 +123,8 @@ class HeroSMSProvider(SMSProvider):
         service: str = "",
         country: int = 16,
         operator: str = "",
+        target_price: Any = "",
+        fixed_price: bool = True,
         max_acquire_retries: int = 5,
     ) -> None:
         self.api_key = str(api_key or "").strip()
@@ -128,18 +134,45 @@ class HeroSMSProvider(SMSProvider):
         except (TypeError, ValueError):
             self.country = 16
         self.operator = str(operator or "").strip()
+        self.target_price_raw = str(target_price or "").strip()
+        self.target_price = self._parse_number(self.target_price_raw)
+        self.fixed_price = bool(fixed_price) and self.target_price is not None
         try:
             self.max_acquire_retries = max(1, int(max_acquire_retries or 5))
         except (TypeError, ValueError):
             self.max_acquire_retries = 5
 
-    def _resolve_catalog_country(self) -> Dict[str, Any]:
+    def _resolve_catalog_country(self, *, proxy: str = "") -> Dict[str, Any]:
         country_id = int(self.country or 16)
         if country_id == 16:
             return {"hero_sms_country": 16, "name": "英国", "iso_code": "GB", "dial_code": "44", "api_name": ""}
-        for item in DEFAULT_PHONE_COUNTRIES:
-            if str(item.get("isoCode") or "").strip().upper() == "GB" and country_id == 16:
-                return {"hero_sms_country": 16, "name": "英国", "iso_code": "GB", "dial_code": "44", "api_name": ""}
+        try:
+            countries = self.list_countries(proxy=proxy)
+        except Exception:
+            countries = []
+        catalog_by_iso: Dict[str, Dict[str, Any]] = {
+            str(item.get("isoCode") or "").strip().upper(): item
+            for item in DEFAULT_PHONE_COUNTRIES
+            if str(item.get("isoCode") or "").strip()
+        }
+        catalog_by_dial: Dict[str, Dict[str, Any]] = {
+            str(item.get("dialCode") or "").strip().lstrip("+"): item
+            for item in DEFAULT_PHONE_COUNTRIES
+            if str(item.get("dialCode") or "").strip()
+        }
+        for row in countries:
+            if self._parse_integer(row.get("heroSmsCountry")) != country_id:
+                continue
+            iso_code = str(row.get("isoCode") or "").strip().upper()
+            dial_code = str(row.get("dialCode") or "").strip().lstrip("+")
+            catalog_item = catalog_by_iso.get(iso_code) or catalog_by_dial.get(dial_code) or {}
+            return {
+                "hero_sms_country": country_id,
+                "name": str(catalog_item.get("name") or row.get("apiName") or "").strip(),
+                "iso_code": iso_code,
+                "dial_code": dial_code,
+                "api_name": str(row.get("apiName") or "").strip(),
+            }
         return {
             "hero_sms_country": country_id,
             "name": "",
@@ -190,6 +223,36 @@ class HeroSMSProvider(SMSProvider):
                 return response.json()
             except Exception:
                 pass
+        text = str(response.text or "").strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return response.json()
+            except Exception:
+                return text
+        return text
+
+    def _request_offers(self, *, proxy: str = "", timeout_seconds: int = 30, service: str = "", country: Optional[int] = None) -> Any:
+        normalized_proxy = _normalize_proxy_url(proxy)
+        proxies = {"http": normalized_proxy, "https": normalized_proxy} if normalized_proxy else None
+        params: Dict[str, Any] = {}
+        if service:
+            params["services"] = service
+        if country is not None:
+            params["countries"] = str(int(country))
+        response = requests.get(
+            f"{self.API_V1_BASE_URL}/activations/offers",
+            headers={
+                "Authorization": f"ApiKey {self.api_key}",
+                "Accept": "application/json",
+            },
+            params=params,
+            proxies=proxies,
+            timeout=timeout_seconds,
+            impersonate="chrome",
+        )
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "application/json" in content_type:
+            return response.json()
         text = str(response.text or "").strip()
         if text.startswith("{") or text.startswith("["):
             try:
@@ -399,10 +462,30 @@ class HeroSMSProvider(SMSProvider):
         return {"price": price, "count": count, "physical_count": physical_count}
 
     @classmethod
-    def _extract_country_price(cls, raw: Any, country_id: int, service: str) -> Optional[Dict[str, Any]]:
+    def _extract_country_price_options(cls, raw: Any, country_id: int, service: str) -> List[Dict[str, Any]]:
         matrix = cls._unwrap_price_matrix(raw)
         service_key = str(service or "").strip()
         id_key = str(country_id)
+
+        def walk(node: Any, results: List[Dict[str, Any]], seen: set[tuple[Any, Any, Any]]) -> None:
+            if isinstance(node, dict):
+                extracted = cls._extract_price_from_node(node)
+                if extracted and extracted.get("price") is not None:
+                    key = (
+                        extracted.get("price"),
+                        extracted.get("count"),
+                        extracted.get("physical_count"),
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        results.append(extracted)
+                for value in node.values():
+                    walk(value, results, seen)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item, results, seen)
+
+        candidates: List[Any] = []
         if isinstance(matrix, list):
             for item in matrix:
                 if not isinstance(item, dict):
@@ -412,28 +495,123 @@ class HeroSMSProvider(SMSProvider):
                 )
                 if item_country_id != country_id:
                     continue
-                direct = cls._extract_price_from_node(item)
-                if direct:
-                    return direct
+                candidates.append(item)
                 service_node = item.get(service_key) or item.get("serviceData") or item.get("data")
-                nested = cls._extract_price_from_node(service_node)
-                if nested:
-                    return nested
-            return None
-        if not isinstance(matrix, dict):
-            return None
-        candidates = [
-            ((matrix.get(service_key) or {}).get(id_key) if isinstance(matrix.get(service_key), dict) else None),
-            ((matrix.get(id_key) or {}).get(service_key) if isinstance(matrix.get(id_key), dict) else None),
-            ((matrix.get(id_key) or {}).get("default") if isinstance(matrix.get(id_key), dict) else None),
-            matrix.get(id_key),
-            matrix.get(service_key),
-        ]
+                if service_node is not None:
+                    candidates.append(service_node)
+        elif isinstance(matrix, dict):
+            candidates.extend([
+                (matrix.get(service_key) or {}).get(id_key) if isinstance(matrix.get(service_key), dict) else None,
+                (matrix.get(id_key) or {}).get(service_key) if isinstance(matrix.get(id_key), dict) else None,
+                (matrix.get(id_key) or {}).get("default") if isinstance(matrix.get(id_key), dict) else None,
+                matrix.get(id_key),
+                matrix.get(service_key),
+            ])
+
+        options: List[Dict[str, Any]] = []
+        seen: set[tuple[Any, Any, Any]] = set()
         for candidate in candidates:
-            extracted = cls._extract_price_from_node(candidate)
-            if extracted:
-                return extracted
-        return None
+            walk(candidate, options, seen)
+        options.sort(key=lambda item: (float(item.get("price") or 999999.0), -int(item.get("count") or 0)))
+        return options
+
+    @classmethod
+    def _extract_country_price(cls, raw: Any, country_id: int, service: str) -> Optional[Dict[str, Any]]:
+        options = cls._extract_country_price_options(raw, country_id, service)
+        return options[0] if options else None
+
+    @classmethod
+    def _extract_offers_price_tiers(cls, raw: Any, country_id: int, service: str) -> List[Dict[str, Any]]:
+        payload = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
+        if not isinstance(payload, dict):
+            return []
+        service_node = payload.get(str(service or "").strip())
+        if not isinstance(service_node, dict):
+            return []
+        country_node = service_node.get(str(country_id))
+        if not isinstance(country_node, dict):
+            return []
+
+        price_map = country_node.get("map")
+        counts = country_node.get("counts") if isinstance(country_node.get("counts"), dict) else {}
+        prices = country_node.get("prices") if isinstance(country_node.get("prices"), dict) else {}
+        total_count = cls._parse_integer(counts.get("total"))
+        physical_count = cls._parse_integer(counts.get("physical"))
+        default_price_count = cls._parse_integer(counts.get("defaultPrice"))
+        default_price = cls._parse_number(prices.get("default"))
+        min_price = cls._parse_number(prices.get("min"))
+        retail_price = cls._parse_number(prices.get("retail"))
+
+        rows: List[Dict[str, Any]] = []
+        seen: set[tuple[Any, Any, Any, Any]] = set()
+
+        if isinstance(price_map, dict):
+            for key, value in price_map.items():
+                price = cls._parse_number(key)
+                count = cls._parse_integer(value)
+                if price is None:
+                    continue
+                signature = (
+                    price,
+                    count,
+                    physical_count,
+                    default_price == price,
+                )
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                rows.append({
+                    "price": price,
+                    "count": count,
+                    "physical_count": physical_count,
+                    "is_default_price": bool(default_price is not None and price == default_price),
+                    "is_min_price": bool(min_price is not None and price == min_price),
+                    "default_price_count": default_price_count,
+                    "total_count": total_count,
+                    "retail_price": retail_price,
+                    "source": "offers_map",
+                    "signature": "|".join([
+                        str(price),
+                        str(count),
+                        str(physical_count),
+                        str(bool(default_price is not None and price == default_price)),
+                    ]),
+                })
+
+        if default_price is not None:
+            signature = (
+                default_price,
+                default_price_count,
+                physical_count,
+                True,
+            )
+            if signature not in seen:
+                rows.append({
+                    "price": default_price,
+                    "count": default_price_count,
+                    "physical_count": physical_count,
+                    "is_default_price": True,
+                    "is_min_price": bool(min_price is not None and default_price == min_price),
+                    "default_price_count": default_price_count,
+                    "total_count": total_count,
+                    "retail_price": retail_price,
+                    "source": "offers_default",
+                    "signature": "|".join([
+                        str(default_price),
+                        str(default_price_count),
+                        str(physical_count),
+                        "True",
+                    ]),
+                })
+
+        rows.sort(
+            key=lambda item: (
+                float(item.get("price") or 999999.0),
+                -int(item.get("count") or 0),
+                0 if item.get("is_default_price") else 1,
+            )
+        )
+        return rows
 
     def get_top_countries_by_service(self, *, proxy: str = "") -> List[Dict[str, Any]]:
         for action in ("getTopCountriesByServiceRank", "getTopCountriesByService"):
@@ -522,11 +700,54 @@ class HeroSMSProvider(SMSProvider):
         options.sort(key=lambda item: (float(item.get("price") or 999999.0), -int(item.get("count") or 0)))
         return options
 
+    def get_price_tier_options(self, *, country: int, proxy: str = "") -> List[Dict[str, Any]]:
+        try:
+            offers_data = self._request_offers(proxy=proxy, service=self.service, country=country)
+            offers_rows = self._extract_offers_price_tiers(offers_data, country, self.service)
+            if offers_rows:
+                return offers_rows
+        except Exception:
+            pass
+        for action in ("getPricesVerification", "getPrices"):
+            try:
+                data = self._request(action, proxy=proxy, service=self.service, country=country)
+            except Exception:
+                continue
+            if isinstance(data, str):
+                try:
+                    import json as _json
+                    data = _json.loads(data)
+                except Exception:
+                    continue
+            options = self._extract_country_price_options(data, country, self.service)
+            if options:
+                normalized: List[Dict[str, Any]] = []
+                for item in options:
+                    normalized.append({
+                        "price": item.get("price"),
+                        "count": item.get("count"),
+                        "physical_count": item.get("physical_count"),
+                        "is_default_price": False,
+                        "is_min_price": False,
+                        "default_price_count": None,
+                        "total_count": None,
+                        "retail_price": None,
+                        "source": "compat_prices",
+                        "signature": "|".join([
+                            str(item.get("price")),
+                            str(item.get("count")),
+                            str(item.get("physical_count")),
+                        ]),
+                    })
+                return normalized
+        return []
+
     def resolve_country_and_operator(self, *, proxy: str = "") -> Dict[str, Any]:
-        base = self._resolve_catalog_country()
+        base = self._resolve_catalog_country(proxy=proxy)
         country_id = int(base.get("hero_sms_country") or self.country or 16)
         aggregate_price = None
         aggregate_count = None
+        price_tier_options = self.get_price_tier_options(country=country_id, proxy=proxy)
         priced_rows = self.list_country_prices(
             [{
                 "heroSmsCountry": country_id,
@@ -540,6 +761,9 @@ class HeroSMSProvider(SMSProvider):
         if priced_rows:
             aggregate_price = priced_rows[0].get("price")
             aggregate_count = priced_rows[0].get("count")
+        if price_tier_options:
+            aggregate_price = price_tier_options[0].get("price")
+            aggregate_count = price_tier_options[0].get("count")
         selected_operator = str(self.operator or "").strip()
         operator_rows: List[Dict[str, Any]] = []
         selected_operator_price = None
@@ -557,6 +781,8 @@ class HeroSMSProvider(SMSProvider):
             "hero_sms_country": country_id,
             "aggregate_price": aggregate_price,
             "aggregate_count": aggregate_count,
+            "price_tier_options": price_tier_options,
+            "target_price": self.target_price,
             "operator_options": operator_rows,
             "selected_operator": selected_operator,
             "selected_operator_price": selected_operator_price,
@@ -569,7 +795,9 @@ class HeroSMSProvider(SMSProvider):
         selected_country_id = self._parse_integer(selection.get("hero_sms_country")) or int(self.country or 16)
         selected_operator = str(selection.get("selected_operator") or "").strip()
         operator_was_auto_selected = not str(self.operator or "").strip() and bool(selected_operator)
-        expected_price = self._parse_number(selection.get("selected_operator_price"))
+        expected_price = self.target_price
+        if expected_price is None:
+            expected_price = self._parse_number(selection.get("selected_operator_price"))
         if expected_price is None:
             expected_price = self._parse_number(selection.get("aggregate_price"))
         balance_before = self.get_balance(proxy=proxy)
@@ -580,6 +808,7 @@ class HeroSMSProvider(SMSProvider):
                 "attempt="
                 + str(attempt)
                 + f", operator={current_operator or 'ANY'}"
+                + f", target_price=${self.target_price if self.target_price is not None else '-'}"
                 + f", expected=${expected_price if expected_price is not None else '-'}"
                 + f", balance_before=${balance_before if balance_before is not None else '-'}"
             )
@@ -590,6 +819,10 @@ class HeroSMSProvider(SMSProvider):
                 }
                 if current_operator:
                     params["operator"] = current_operator
+                if self.target_price is not None:
+                    params["maxPrice"] = self.target_price
+                    if self.fixed_price:
+                        params["fixedPrice"] = "true"
                 data = self._request("getNumberV2", proxy=proxy, **params)
             except Exception as exc:
                 last_error = f"HeroSMS API 请求失败: {exc}"
@@ -673,6 +906,7 @@ class HeroSMSProvider(SMSProvider):
                 "activation_id": activation_id,
                 "phone_number": phone_number,
                 "activation_cost": actual_cost if actual_cost is not None else data.get("activationCost"),
+                "target_price": self.target_price,
                 "operator": selected_operator,
                 "operator_fallback_to_aggregate": bool(operator_was_auto_selected and not selected_operator),
                 "country": selected_country_id,
@@ -682,6 +916,7 @@ class HeroSMSProvider(SMSProvider):
                 "country_dial_code": str(selection.get("dial_code") or "").strip().lstrip("+"),
                 "aggregate_price": selection.get("aggregate_price"),
                 "aggregate_count": selection.get("aggregate_count"),
+                "price_tier_options": selection.get("price_tier_options") or [],
                 "operator_options": selection.get("operator_options") or [],
                 "selected_operator_price": selection.get("selected_operator_price"),
                 "selected_operator_count": selection.get("selected_operator_count"),
@@ -695,7 +930,11 @@ class HeroSMSProvider(SMSProvider):
     def mark_ready(self, activation_id: str, *, proxy: str = "") -> None:
         if not str(activation_id or "").strip():
             raise RuntimeError("HeroSMS mark_ready 缺少 activation_id")
-        self._request("setStatus", proxy=proxy, id=str(activation_id).strip(), status=1)
+        result = self._request("setStatus", proxy=proxy, id=str(activation_id).strip(), status=1)
+        if isinstance(result, str):
+            text = str(result or "").strip().upper()
+            if text and not text.startswith(("ACCESS_", "STATUS_")) and "OK" not in text:
+                raise RuntimeError(f"HeroSMS mark_ready 返回异常: {result}")
 
     def _get_status(self, activation_id: str, *, proxy: str = "") -> Dict[str, Any]:
         data = self._request("getStatusV2", proxy=proxy, id=str(activation_id).strip())
@@ -746,18 +985,135 @@ class HeroSMSProvider(SMSProvider):
     def complete(self, activation_id: str, *, proxy: str = "") -> None:
         if not str(activation_id or "").strip():
             return
-        try:
-            self._request("setStatus", proxy=proxy, id=str(activation_id).strip(), status=6)
-        except Exception:
-            return
+        result = self._request("setStatus", proxy=proxy, id=str(activation_id).strip(), status=6)
+        if isinstance(result, str):
+            text = str(result or "").strip().upper()
+            if text and not text.startswith(("ACCESS_", "STATUS_")) and "OK" not in text:
+                raise RuntimeError(f"HeroSMS complete 返回异常: {result}")
 
-    def cancel(self, activation_id: str, *, proxy: str = "") -> None:
+    def cancel(self, activation_id: str, *, proxy: str = "") -> Dict[str, Any]:
         if not str(activation_id or "").strip():
-            return
+            return {"ok": False, "code": "EMPTY_ACTIVATION_ID", "message": "缺少 activation_id", "retryable": False}
+        result = self._request("setStatus", proxy=proxy, id=str(activation_id).strip(), status=8)
+        if isinstance(result, dict):
+            code = str(result.get("title") or result.get("code") or result.get("status") or result.get("error") or "").strip().upper()
+            details = str(result.get("details") or result.get("message") or result.get("description") or "").strip()
+            if code in ("ACCESS_CANCEL", "STATUS_CANCEL"):
+                return {"ok": True, "code": code, "message": details or "取消成功", "retryable": False}
+            if code == "EARLY_CANCEL_DENIED":
+                min_wait = HERO_SMS_CANCEL_MIN_WAIT_SECONDS
+                info = result.get("info") if isinstance(result.get("info"), dict) else {}
+                try:
+                    min_wait = max(1, int(info.get("minActivationTime") or min_wait))
+                except (TypeError, ValueError):
+                    min_wait = HERO_SMS_CANCEL_MIN_WAIT_SECONDS
+                return {
+                    "ok": False,
+                    "code": code,
+                    "message": details or "未到最短取消等待时间",
+                    "retryable": True,
+                    "retry_after_seconds": min_wait,
+                }
+            if code in ("FREE_CANCELLATION_EXPIRED", "OTP_RECEIVED", "ACTIVATION_NOT_ACTIVE", "NO_ACTIVATION"):
+                return {"ok": False, "code": code, "message": details or f"取消不可执行: {code}", "retryable": False}
+            if code:
+                return {"ok": False, "code": code, "message": details or f"取消返回异常: {result}", "retryable": False}
+        if isinstance(result, str):
+            text = str(result or "").strip().upper()
+            if text in ("ACCESS_CANCEL", "STATUS_CANCEL"):
+                return {"ok": True, "code": text, "message": "取消成功", "retryable": False}
+            if text == "EARLY_CANCEL_DENIED":
+                return {
+                    "ok": False,
+                    "code": text,
+                    "message": "未到最短取消等待时间，需至少等待 120 秒",
+                    "retryable": True,
+                    "retry_after_seconds": HERO_SMS_CANCEL_MIN_WAIT_SECONDS,
+                }
+            if text in ("FREE_CANCELLATION_EXPIRED", "OTP_RECEIVED", "ACTIVATION_NOT_ACTIVE", "NO_ACTIVATION"):
+                return {"ok": False, "code": text, "message": f"取消不可执行: {text}", "retryable": False}
+            if text and not text.startswith(("ACCESS_", "STATUS_")) and "OK" not in text:
+                raise RuntimeError(f"HeroSMS cancel 返回异常: {result}")
+        return {"ok": True, "code": str(result or "ACCESS_CANCEL"), "message": "取消成功", "retryable": False}
+
+
+def schedule_hero_sms_delayed_cancel(
+    *,
+    provider: SMSProvider,
+    activation_id: str,
+    purchased_at: float,
+    proxy: str = "",
+    min_wait_seconds: int = HERO_SMS_CANCEL_MIN_WAIT_SECONDS,
+    logger: Optional[Any] = None,
+) -> Optional[threading.Thread]:
+    activation = str(activation_id or "").strip()
+    if not activation:
+        return None
+    delay_seconds = max(0.0, float(min_wait_seconds) - max(0.0, time.time() - float(purchased_at or 0.0)))
+
+    def _log(message: str) -> None:
+        if callable(logger):
+            try:
+                logger(message)
+            except Exception:
+                pass
+
+    def _runner() -> None:
+        if delay_seconds > 0:
+            _log(
+                "HeroSMS 延迟取消已入队: "
+                + f"activation_id={activation}, remaining={round(delay_seconds, 1)}s"
+            )
+            time.sleep(delay_seconds)
         try:
-            self._request("setStatus", proxy=proxy, id=str(activation_id).strip(), status=8)
-        except Exception:
+            result = provider.cancel(activation, proxy=proxy)
+        except Exception as exc:
+            _log(f"HeroSMS 延迟取消执行异常: activation_id={activation}, error={exc}")
             return
+        code = str((result or {}).get("code") or "")
+        if result and result.get("ok"):
+            _log(f"HeroSMS 延迟取消成功: activation_id={activation}, code={code or 'ACCESS_CANCEL'}")
+            return
+        retryable = bool(result and result.get("retryable"))
+        retry_after = 0.0
+        try:
+            retry_after = max(0.0, float((result or {}).get("retry_after_seconds") or 0.0))
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        if retryable and retry_after > 0:
+            retry_delay = max(0.0, retry_after - max(0.0, time.time() - float(purchased_at or 0.0)))
+            _log(
+                "HeroSMS 延迟取消仍被拒绝，准备再次等待后重试: "
+                + f"activation_id={activation}, code={code or '-'}, retry_after={round(retry_delay, 1)}s"
+            )
+            if retry_delay > 0:
+                time.sleep(retry_delay)
+            try:
+                retry_result = provider.cancel(activation, proxy=proxy)
+            except Exception as exc:
+                _log(f"HeroSMS 延迟取消重试异常: activation_id={activation}, error={exc}")
+                return
+            retry_code = str((retry_result or {}).get("code") or "")
+            if retry_result and retry_result.get("ok"):
+                _log(f"HeroSMS 延迟取消重试成功: activation_id={activation}, code={retry_code or 'ACCESS_CANCEL'}")
+            else:
+                _log(
+                    "HeroSMS 延迟取消重试结束但未成功: "
+                    + f"activation_id={activation}, code={retry_code or '-'}, message={str((retry_result or {}).get('message') or '-')}"
+                )
+            return
+        _log(
+            "HeroSMS 延迟取消结束但未成功: "
+            + f"activation_id={activation}, code={code or '-'}, message={str((result or {}).get('message') or '-')}"
+        )
+
+    worker = threading.Thread(
+        target=_runner,
+        name=f"hero-sms-cancel-{activation}",
+        daemon=True,
+    )
+    worker.start()
+    return worker
 
 
 def create_sms_provider_from_browser_config(browser_config: Optional[Dict[str, Any]]) -> Optional[SMSProvider]:
@@ -772,6 +1128,8 @@ def create_sms_provider_from_browser_config(browser_config: Optional[Dict[str, A
         service=service,
         country=cfg.get("hero_sms_country") or 16,
         operator=str(cfg.get("hero_sms_operator") or "").strip(),
+        target_price=cfg.get("hero_sms_target_price") or "",
+        fixed_price=bool(cfg.get("hero_sms_fixed_price", True)),
         max_acquire_retries=cfg.get("hero_sms_max_acquire_retries") or 5,
     )
 
@@ -851,5 +1209,45 @@ def list_hero_sms_operator_quotes(
                 str(item.get("physical_count")),
                 str(item.get("error") or ""),
             ]),
+        })
+    return normalized
+
+
+def list_hero_sms_price_tiers(
+    *,
+    api_key: str,
+    service: str,
+    country: int,
+    operator: str = "",
+    proxy: str = "",
+) -> List[Dict[str, Any]]:
+    service_text = str(service or "").strip()
+    if not api_key or not service_text:
+        return []
+    try:
+        country_id = max(1, int(country or 0))
+    except (TypeError, ValueError):
+        return []
+    provider = HeroSMSProvider(
+        api_key=api_key,
+        service=service_text,
+        country=country_id,
+        operator=str(operator or "").strip(),
+    )
+    rows = provider.get_operator_quote_options(country=country_id, proxy=proxy) if str(operator or "").strip() else provider.get_price_tier_options(country=country_id, proxy=proxy)
+    normalized: List[Dict[str, Any]] = []
+    for item in rows:
+        normalized.append({
+            "price": item.get("price"),
+            "count": item.get("count"),
+            "physical_count": item.get("physical_count"),
+            "is_default_price": bool(item.get("is_default_price", False)),
+            "is_min_price": bool(item.get("is_min_price", False)),
+            "default_price_count": item.get("default_price_count"),
+            "total_count": item.get("total_count"),
+            "retail_price": item.get("retail_price"),
+            "source": str(item.get("source") or ""),
+            "operator": str(item.get("operator") or "").strip(),
+            "signature": str(item.get("signature") or ""),
         })
     return normalized

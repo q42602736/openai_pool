@@ -513,6 +513,13 @@
                 <option value="hero_sms">HeroSMS 全自动</option>
               </select>
             </div>
+            <div class="config-field" style="flex:1;max-width:320px;">
+              <label>人工模式老号处理</label>
+              <select id="browserManualV2ManualRestartOnEnterPassword">
+                <option value="false">关闭：沿用当前逻辑</option>
+                <option value="true">开启：命中 Enter your password 直接重来</option>
+              </select>
+            </div>
             <div class="config-field" style="flex:1;">
               <label>HeroSMS API Key</label>
               <input type="password" id="heroSmsApiKey" value="" autocomplete="off" />
@@ -530,10 +537,21 @@
               </select>
             </div>
             <div class="config-field" style="flex:1;">
-              <label>HeroSMS Operator</label>
+              <label>HeroSMS 运营商</label>
               <select id="heroSmsOperator">
-                <option value="">自动选择最低价运营商</option>
+                <option value="">自动/不指定</option>
               </select>
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>HeroSMS 价格档位</label>
+              <select id="heroSmsPriceTierSelect">
+                <option value="">自动最低价</option>
+              </select>
+              <div id="heroSmsPriceTierList" class="config-hint" style="margin-top:6px;">价格档加载后会显示在这里。</div>
+            </div>
+            <div class="config-field" style="flex:1;">
+              <label>HeroSMS 目标价格</label>
+              <input type="text" id="heroSmsTargetPrice" value="" autocomplete="off" spellcheck="false" placeholder="留空=自动最低价；例如 0.0169" />
             </div>
             <div class="config-field" style="flex:1;">
               <label>取号重试次数</label>
@@ -541,6 +559,13 @@
             </div>
           </div>
           <div class="config-row">
+            <div class="config-field" style="flex:1;max-width:260px;">
+              <label>价格模式</label>
+              <select id="heroSmsFixedPrice">
+                <option value="true">严格锁定选中价位</option>
+                <option value="false">只作价格上限</option>
+              </select>
+            </div>
             <div class="config-field" style="flex:1;">
               <label>Locale</label>
               <input type="text" id="browserLocale" value="en-US" autocomplete="off" spellcheck="false" />
@@ -554,7 +579,7 @@
             <label>浏览器可执行文件路径（可选）</label>
             <input type="text" id="browserExecutablePath" value="" autocomplete="off" spellcheck="false" placeholder="/path/to/chrome 或留空自动探测本机 Chrome" />
             <div class="config-hint" style="margin-top:0;">
-              开启“显示浏览器窗口”后会以可见模式启动，方便你观察卡在哪一步；关闭时默认使用无头模式后台运行。模式2（手机注册）支持人工输入，也支持切到 HeroSMS 全自动接码。当前自动接码会固定使用你选中的国家池，并优先选择该国家池内最低价运营商。
+              开启“显示浏览器窗口”后会以可见模式启动，方便你观察卡在哪一步；关闭时默认使用无头模式后台运行。模式2（手机注册）支持人工输入，也支持切到 HeroSMS 全自动接码。当前自动接码会固定使用你选中的国家池，并按价格档约束取号；短信 60 秒超时后会先结束本地流程，并在后台等到可取消窗口后再补发取消。
             </div>
           </div>
           <div class="config-actions" style="margin-top:12px;">
@@ -868,7 +893,7 @@
   <!-- Toast 容器 -->
   <div id="toastContainer" class="toast-container"></div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260508-hero-sms-country"></script>
 </body>
 
 </html>

@@ -289,10 +289,15 @@ document.addEventListener('DOMContentLoaded', () => {
     browserVisible: $('browserVisible'),
     browserBlockMedia: $('browserBlockMedia'),
     browserManualV2PhoneMode: $('browserManualV2PhoneMode'),
+    browserManualV2ManualRestartOnEnterPassword: $('browserManualV2ManualRestartOnEnterPassword'),
     heroSmsApiKey: $('heroSmsApiKey'),
     heroSmsService: $('heroSmsService'),
     heroSmsCountry: $('heroSmsCountry'),
     heroSmsOperator: $('heroSmsOperator'),
+    heroSmsPriceTierSelect: $('heroSmsPriceTierSelect'),
+    heroSmsTargetPrice: $('heroSmsTargetPrice'),
+    heroSmsFixedPrice: $('heroSmsFixedPrice'),
+    heroSmsPriceTierList: $('heroSmsPriceTierList'),
     heroSmsMaxAcquireRetries: $('heroSmsMaxAcquireRetries'),
     manualV2TestPhone: $('manualV2TestPhone'),
     manualV2TestPassword: $('manualV2TestPassword'),
@@ -339,7 +344,27 @@ document.addEventListener('DOMContentLoaded', () => {
   if (DOM.browserConfigSaveBtn) DOM.browserConfigSaveBtn.addEventListener('click', saveBrowserConfig);
   if (DOM.heroSmsCountry) {
     DOM.heroSmsCountry.addEventListener('change', () => {
-      loadHeroSmsOperators(DOM.heroSmsCountry.value, '');
+      DOM.heroSmsCountry.dataset.selectedValue = DOM.heroSmsCountry.value || '';
+      if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = '';
+      if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = '';
+      loadHeroSmsOperators(DOM.heroSmsCountry.value, '').then(() => {
+        loadHeroSmsPriceTiers(DOM.heroSmsCountry.value, '', DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '');
+      });
+    });
+  }
+  if (DOM.heroSmsOperator) {
+    DOM.heroSmsOperator.addEventListener('change', () => {
+      loadHeroSmsPriceTiers(
+        DOM.heroSmsCountry ? DOM.heroSmsCountry.value : '16',
+        '',
+        DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '',
+      );
+    });
+  }
+  if (DOM.heroSmsPriceTierSelect) {
+    DOM.heroSmsPriceTierSelect.addEventListener('change', () => {
+      const value = DOM.heroSmsPriceTierSelect ? DOM.heroSmsPriceTierSelect.value : '';
+      if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = value || '';
     });
   }
   if (DOM.registerMode) {
@@ -831,20 +856,89 @@ function formatHeroSmsCountryLabel(item) {
   return `${name} (${isoText} / ${dialText}) · ID ${id}`;
 }
 
-function formatHeroSmsOperatorLabel(item) {
-  const operator = String((item && item.operator) || '').trim() || '未知运营商';
+function formatHeroSmsPriceTierLabel(item) {
   const price = item && item.price !== null && item.price !== undefined ? `$${item.price}` : '无报价';
   const count = item && item.count !== null && item.count !== undefined ? `库存 ${item.count}` : '库存 -';
   const physical = item && item.physical_count !== null && item.physical_count !== undefined ? `实体 ${item.physical_count}` : '';
-  const sameAsAggregate = !!(item && item.same_as_aggregate);
-  const note = sameAsAggregate ? '接口返回聚合值' : '';
-  return [operator, price, count, physical, note].filter(Boolean).join(' · ');
+  const tags = [];
+  if (item && item.is_default_price) tags.push('默认价');
+  if (item && item.is_min_price) tags.push('最低价');
+  if (item && item.source === 'offers_map') tags.push('官网价位图');
+  if (item && item.source === 'compat_prices') tags.push('兼容聚合');
+  if (item && item.operator) tags.push(`运营商 ${item.operator}`);
+  return [price, count, physical, ...tags].filter(Boolean).join(' · ');
+}
+
+function renderHeroSmsPriceTierList(rows, selectedPrice = '') {
+  if (!DOM.heroSmsPriceTierList) return;
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) {
+    DOM.heroSmsPriceTierList.textContent = '当前国家未返回可解析价格档；留空时会按接口可用最低价尝试取号。';
+    return;
+  }
+  const normalizedSelected = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
+  const topRows = list.slice(0, 8).map((item) => {
+    const priceText = item && item.price !== null && item.price !== undefined ? String(item.price) : '';
+    const picked = normalizedSelected && priceText === normalizedSelected;
+    return `${picked ? '[当前]' : '[可选]'} ${formatHeroSmsPriceTierLabel(item)}`;
+  });
+  const hasOnlyOperatorAggregate = list.every((item) => String(item && item.source || '') === 'operator');
+  DOM.heroSmsPriceTierList.textContent = hasOnlyOperatorAggregate
+    ? `当前运营商接口仅返回聚合报价: ${topRows.join(' | ')}`
+    : topRows.join(' | ');
+}
+
+function renderHeroSmsPriceTierOptions(rows, selectedPrice = '') {
+  if (!DOM.heroSmsPriceTierSelect) return;
+  const list = Array.isArray(rows) ? rows : [];
+  const normalizedSelected = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
+  DOM.heroSmsPriceTierSelect.innerHTML = '';
+  const autoOption = document.createElement('option');
+  autoOption.value = '';
+  autoOption.textContent = '自动最低价';
+  autoOption.selected = !normalizedSelected;
+  DOM.heroSmsPriceTierSelect.appendChild(autoOption);
+  list.slice(0, 30).forEach((item) => {
+    const priceText = item && item.price !== null && item.price !== undefined ? String(item.price) : '';
+    if (!priceText) return;
+    const option = document.createElement('option');
+    option.value = priceText;
+    option.textContent = formatHeroSmsPriceTierLabel(item);
+    option.selected = priceText === normalizedSelected;
+    DOM.heroSmsPriceTierSelect.appendChild(option);
+  });
+}
+
+function renderHeroSmsOperatorOptions(operators, selectedValue = '') {
+  if (!DOM.heroSmsOperator) return;
+  const list = Array.isArray(operators) ? operators : [];
+  const normalizedSelected = String(selectedValue || '');
+  DOM.heroSmsOperator.innerHTML = '';
+  const autoOption = document.createElement('option');
+  autoOption.value = '';
+  autoOption.textContent = '自动/不指定';
+  autoOption.selected = !normalizedSelected;
+  DOM.heroSmsOperator.appendChild(autoOption);
+  list.forEach((item) => {
+    const value = String((item && item.operator) || '').trim();
+    if (!value) return;
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = [
+      value,
+      item && item.count !== null && item.count !== undefined ? `库存 ${item.count}` : '库存 -',
+      item && item.physical_count !== null && item.physical_count !== undefined ? `实体 ${item.physical_count}` : '',
+    ].filter(Boolean).join(' · ');
+    option.selected = value === normalizedSelected;
+    DOM.heroSmsOperator.appendChild(option);
+  });
 }
 
 function renderHeroSmsCountryOptions(countries, selectedValue) {
   if (!DOM.heroSmsCountry) return;
   const list = Array.isArray(countries) && countries.length > 0 ? countries : HERO_SMS_FALLBACK_COUNTRIES;
-  const normalizedSelected = String(selectedValue || DOM.heroSmsCountry.value || '16');
+  const savedSelected = DOM.heroSmsCountry.dataset.selectedValue || '';
+  const normalizedSelected = String(selectedValue || savedSelected || DOM.heroSmsCountry.value || '16');
   DOM.heroSmsCountry.innerHTML = '';
   list.forEach((item) => {
     const option = document.createElement('option');
@@ -860,44 +954,8 @@ function renderHeroSmsCountryOptions(countries, selectedValue) {
     customOption.selected = true;
     DOM.heroSmsCountry.appendChild(customOption);
   }
-}
-
-function renderHeroSmsOperatorOptions(operators, selectedValue = '') {
-  if (!DOM.heroSmsOperator) return;
-  const normalizedSelected = String(selectedValue || '');
-  DOM.heroSmsOperator.innerHTML = '';
-
-  const sameAggregate = Array.isArray(operators)
-    && operators.length > 0
-    && operators.every((item) => String(item?.signature || '') === String(operators[0]?.signature || ''));
-
-  const autoOption = document.createElement('option');
-  autoOption.value = '';
-  autoOption.textContent = sameAggregate
-    ? '自动选择最低价运营商（当前接口未区分运营商报价）'
-    : '自动选择最低价运营商';
-  if (!normalizedSelected) autoOption.selected = true;
-  DOM.heroSmsOperator.appendChild(autoOption);
-
-  const list = Array.isArray(operators) ? operators : [];
-  list.forEach((item) => {
-    const value = String((item && item.operator) || '').trim();
-    if (!value) return;
-    const normalizedItem = { ...item, same_as_aggregate: sameAggregate };
-    const option = document.createElement('option');
-    option.value = value;
-    option.textContent = formatHeroSmsOperatorLabel(normalizedItem);
-    if (value === normalizedSelected) option.selected = true;
-    DOM.heroSmsOperator.appendChild(option);
-  });
-
-  if (normalizedSelected && ![...DOM.heroSmsOperator.options].some(opt => opt.value === normalizedSelected)) {
-    const customOption = document.createElement('option');
-    customOption.value = normalizedSelected;
-    customOption.textContent = `${normalizedSelected} · 自定义`;
-    customOption.selected = true;
-    DOM.heroSmsOperator.appendChild(customOption);
-  }
+  DOM.heroSmsCountry.value = normalizedSelected;
+  DOM.heroSmsCountry.dataset.selectedValue = normalizedSelected;
 }
 
 async function loadHeroSmsOperators(countryValue = '', selectedOperator = '') {
@@ -906,13 +964,38 @@ async function loadHeroSmsOperators(countryValue = '', selectedOperator = '') {
   try {
     const res = await fetch(`/api/browser-config/hero-sms-operators?country=${encodeURIComponent(country)}`);
     const data = await res.json();
-    if (!res.ok) {
-      renderHeroSmsOperatorOptions([], selectedOperator);
-      return;
-    }
-    renderHeroSmsOperatorOptions(data.operators || [], selectedOperator);
+    const rows = res.ok ? (data.operators || []) : [];
+    renderHeroSmsOperatorOptions(rows, selectedOperator);
   } catch {
     renderHeroSmsOperatorOptions([], selectedOperator);
+  }
+}
+
+async function loadHeroSmsPriceTiers(countryValue = '', selectedPrice = '', operatorValue = '') {
+  if (!DOM.heroSmsTargetPrice) return;
+  const country = parseInt(countryValue || DOM.heroSmsCountry?.value || '16', 10) || 16;
+  const operator = String(operatorValue || DOM.heroSmsOperator?.value || '').trim();
+  try {
+    const query = new URLSearchParams({ country: String(country) });
+    if (operator) query.set('operator', operator);
+    const res = await fetch(`/api/browser-config/hero-sms-price-tiers?${query.toString()}`);
+    const data = await res.json();
+    const rows = res.ok ? (data.price_tiers || []) : [];
+    if (!Array.isArray(rows) || !rows.length) {
+      renderHeroSmsPriceTierOptions([], selectedPrice);
+      renderHeroSmsPriceTierList([], selectedPrice);
+      return;
+    }
+    renderHeroSmsPriceTierOptions(rows, selectedPrice);
+    renderHeroSmsPriceTierList(rows, selectedPrice);
+    const normalizedSelected = String(selectedPrice || DOM.heroSmsTargetPrice.value || '').trim();
+    if (normalizedSelected) return;
+    const hints = rows.slice(0, 8).map(formatHeroSmsPriceTierLabel).join(' | ');
+    DOM.heroSmsTargetPrice.placeholder = `留空=自动最低价；可选: ${hints}`;
+  } catch {
+    renderHeroSmsPriceTierOptions([], selectedPrice);
+    renderHeroSmsPriceTierList([], selectedPrice);
+    return;
   }
 }
 
@@ -2369,6 +2452,7 @@ async function cleanupSub2ApiDuplicates() {
 // Sub2Api 同步配置
 // ==========================================
 function collectBrowserConfigForm() {
+  const savedHeroSmsCountry = DOM.heroSmsCountry ? DOM.heroSmsCountry.dataset.selectedValue : '';
   return {
     register_mode: DOM.registerMode ? DOM.registerMode.value : 'browser',
     browser_headless: DOM.browserVisible ? !DOM.browserVisible.checked : true,
@@ -2376,10 +2460,13 @@ function collectBrowserConfigForm() {
     browser_realistic_profile: false,
     browser_clear_runtime_state: true,
     browser_manual_v2_phone_mode: DOM.browserManualV2PhoneMode ? DOM.browserManualV2PhoneMode.value : 'manual',
+    browser_manual_v2_manual_restart_on_enter_password: DOM.browserManualV2ManualRestartOnEnterPassword ? DOM.browserManualV2ManualRestartOnEnterPassword.value === 'true' : false,
     hero_sms_api_key: DOM.heroSmsApiKey ? DOM.heroSmsApiKey.value.trim() : '',
     hero_sms_service: DOM.heroSmsService ? DOM.heroSmsService.value.trim() : '',
-    hero_sms_country: DOM.heroSmsCountry ? (parseInt(DOM.heroSmsCountry.value, 10) || 16) : 16,
+    hero_sms_country: DOM.heroSmsCountry ? (parseInt(savedHeroSmsCountry || DOM.heroSmsCountry.value, 10) || 16) : 16,
     hero_sms_operator: DOM.heroSmsOperator ? DOM.heroSmsOperator.value.trim() : '',
+    hero_sms_target_price: DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '',
+    hero_sms_fixed_price: DOM.heroSmsFixedPrice ? DOM.heroSmsFixedPrice.value === 'true' : true,
     hero_sms_max_acquire_retries: DOM.heroSmsMaxAcquireRetries ? (parseInt(DOM.heroSmsMaxAcquireRetries.value, 10) || 5) : 5,
     browser_timeout_ms: DOM.browserTimeoutMs ? (parseInt(DOM.browserTimeoutMs.value, 10) || 90000) : 90000,
     browser_slow_mo_ms: DOM.browserSlowMoMs ? (parseInt(DOM.browserSlowMoMs.value, 10) || 0) : 0,
@@ -2401,10 +2488,15 @@ function applyBrowserConfig(cfg) {
   }
   if (DOM.browserBlockMedia) DOM.browserBlockMedia.checked = cfg.browser_block_media !== false;
   if (DOM.browserManualV2PhoneMode) DOM.browserManualV2PhoneMode.value = cfg.browser_manual_v2_phone_mode || 'manual';
+  if (DOM.browserManualV2ManualRestartOnEnterPassword) {
+    DOM.browserManualV2ManualRestartOnEnterPassword.value = String(cfg.browser_manual_v2_manual_restart_on_enter_password === true);
+  }
   if (DOM.heroSmsApiKey) DOM.heroSmsApiKey.value = cfg.hero_sms_api_key || '';
   if (DOM.heroSmsService) DOM.heroSmsService.value = cfg.hero_sms_service || '';
   if (DOM.heroSmsCountry) DOM.heroSmsCountry.dataset.selectedValue = String(cfg.hero_sms_country || 16);
   if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = cfg.hero_sms_operator || '';
+  if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = cfg.hero_sms_target_price || '';
+  if (DOM.heroSmsFixedPrice) DOM.heroSmsFixedPrice.value = String(cfg.hero_sms_fixed_price !== false);
   if (DOM.heroSmsMaxAcquireRetries) DOM.heroSmsMaxAcquireRetries.value = cfg.hero_sms_max_acquire_retries || 5;
   if (DOM.browserTimeoutMs) DOM.browserTimeoutMs.value = cfg.browser_timeout_ms || 90000;
   if (DOM.browserSlowMoMs) DOM.browserSlowMoMs.value = cfg.browser_slow_mo_ms || 0;
@@ -2455,6 +2547,7 @@ async function loadBrowserConfig() {
     applyBrowserConfig(cfg);
     await loadHeroSmsCountries(cfg.hero_sms_country || 16);
     await loadHeroSmsOperators(cfg.hero_sms_country || 16, cfg.hero_sms_operator || '');
+    await loadHeroSmsPriceTiers(cfg.hero_sms_country || 16, cfg.hero_sms_target_price || '', cfg.hero_sms_operator || '');
   } catch { }
 }
 
@@ -2648,7 +2741,20 @@ async function saveBrowserConfig(options = {}) {
       return false;
     }
     applyBrowserConfig(data);
-    await loadHeroSmsCountries(data.hero_sms_country || payload.hero_sms_country || 16);
+    const refreshHeroSmsUi = async () => {
+      await loadHeroSmsCountries(data.hero_sms_country || payload.hero_sms_country || 16);
+      await loadHeroSmsOperators(data.hero_sms_country || payload.hero_sms_country || 16, data.hero_sms_operator || payload.hero_sms_operator || '');
+      await loadHeroSmsPriceTiers(
+        data.hero_sms_country || payload.hero_sms_country || 16,
+        data.hero_sms_target_price || payload.hero_sms_target_price || '',
+        data.hero_sms_operator || payload.hero_sms_operator || '',
+      );
+    };
+    if (silentSuccess) {
+      void refreshHeroSmsUi();
+    } else {
+      await refreshHeroSmsUi();
+    }
     const msg = statusText;
     if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
     if (!silentSuccess) showToast(msg, 'success');

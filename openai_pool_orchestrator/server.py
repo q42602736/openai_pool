@@ -34,7 +34,7 @@ from .mail_providers import create_provider, create_provider_by_name, MultiMailR
 from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
 from .token_compat import normalize_token_data
 from .register import generate_oauth_url, submit_callback_url, _random_password, _random_profile_name, _random_profile_birthdate
-from .sms_providers import list_hero_sms_countries, list_hero_sms_operator_quotes
+from .sms_providers import list_hero_sms_countries, list_hero_sms_operator_quotes, list_hero_sms_price_tiers
 
 # ==========================================
 # 同步配置（内存持久化到 data/sync_config.json）
@@ -135,10 +135,16 @@ def _get_browser_config_snapshot(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
         "browser_realistic_profile": _as_bool(config.get("browser_realistic_profile", False), default=False),
         "browser_clear_runtime_state": _as_bool(config.get("browser_clear_runtime_state", True), default=True),
         "browser_manual_v2_phone_mode": str(config.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() or "manual",
+        "browser_manual_v2_manual_restart_on_enter_password": _as_bool(
+            config.get("browser_manual_v2_manual_restart_on_enter_password", False),
+            default=False,
+        ),
         "hero_sms_api_key": str(config.get("hero_sms_api_key", "") or "").strip(),
         "hero_sms_service": str(config.get("hero_sms_service", "") or "").strip(),
         "hero_sms_country": int(config.get("hero_sms_country", 16) or 16),
         "hero_sms_operator": str(config.get("hero_sms_operator", "") or "").strip(),
+        "hero_sms_target_price": str(config.get("hero_sms_target_price", "") or "").strip(),
+        "hero_sms_fixed_price": _as_bool(config.get("hero_sms_fixed_price", True), default=True),
         "hero_sms_max_acquire_retries": int(config.get("hero_sms_max_acquire_retries", 5) or 5),
     }
 
@@ -319,6 +325,7 @@ def _load_sync_config() -> Dict[str, Any]:
         "browser_locale": "en-US",
         "browser_timezone": "America/New_York",
         "browser_block_media": True,
+        "hero_sms_target_price": "",
     }
 
 
@@ -405,6 +412,8 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         cfg["hero_sms_country"] = 16
     cfg["hero_sms_operator"] = str(cfg.get("hero_sms_operator", "") or "").strip()
+    cfg["hero_sms_target_price"] = str(cfg.get("hero_sms_target_price", "") or "").strip()
+    cfg["hero_sms_fixed_price"] = _as_bool(cfg.get("hero_sms_fixed_price", True), default=True)
     try:
         cfg["hero_sms_max_acquire_retries"] = max(1, min(int(cfg.get("hero_sms_max_acquire_retries", 5) or 5), 20))
     except (TypeError, ValueError):
@@ -1910,6 +1919,7 @@ class TaskState:
                             "hero_sms_service": str(config_snapshot.get("hero_sms_service", "") or "").strip(),
                             "hero_sms_country": int(config_snapshot.get("hero_sms_country", 16) or 16),
                             "hero_sms_operator": str(config_snapshot.get("hero_sms_operator", "") or "").strip(),
+                            "hero_sms_target_price": str(config_snapshot.get("hero_sms_target_price", "") or "").strip(),
                             "hero_sms_max_acquire_retries": int(config_snapshot.get("hero_sms_max_acquire_retries", 5) or 5),
                         },
                         browser_manual_phone_input_func=(
@@ -2330,10 +2340,13 @@ class SyncConfigRequest(BaseModel):
     browser_realistic_profile: bool = False
     browser_clear_runtime_state: bool = True
     browser_manual_v2_phone_mode: str = "manual"
+    browser_manual_v2_manual_restart_on_enter_password: bool = False
     hero_sms_api_key: str = ""
     hero_sms_service: str = ""
     hero_sms_country: int = 16
     hero_sms_operator: str = ""
+    hero_sms_target_price: str = ""
+    hero_sms_fixed_price: bool = True
     hero_sms_max_acquire_retries: int = 5
     token_proxy_sync: bool = False
     token_proxy_db_path: str = ""
@@ -2351,10 +2364,13 @@ class BrowserConfigRequest(BaseModel):
     browser_realistic_profile: bool = False
     browser_clear_runtime_state: bool = True
     browser_manual_v2_phone_mode: str = "manual"
+    browser_manual_v2_manual_restart_on_enter_password: bool = False
     hero_sms_api_key: str = ""
     hero_sms_service: str = ""
     hero_sms_country: int = 16
     hero_sms_operator: str = ""
+    hero_sms_target_price: str = ""
+    hero_sms_fixed_price: bool = True
     hero_sms_max_acquire_retries: int = 5
 
 
@@ -2616,6 +2632,33 @@ async def api_get_hero_sms_operators(country: int) -> Dict[str, Any]:
     return {"status": "ok", "operators": operators}
 
 
+@app.get("/api/browser-config/hero-sms-price-tiers")
+async def api_get_hero_sms_price_tiers(country: int, operator: str = "") -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
+    service = str(cfg.get("hero_sms_service", "") or "").strip()
+    if not api_key:
+        return {"status": "missing_api_key", "price_tiers": []}
+    if not service:
+        return {"status": "missing_service", "price_tiers": []}
+    try:
+        country_id = max(1, int(country or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="国家 ID 非法")
+    try:
+        price_tiers = await run_in_threadpool(
+            list_hero_sms_price_tiers,
+            api_key=api_key,
+            service=service,
+            country=country_id,
+            operator=str(operator or "").strip(),
+            proxy="",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"获取 HeroSMS 价格档失败: {exc}")
+    return {"status": "ok", "price_tiers": price_tiers}
+
+
 @app.get("/api/proxy-pool/config")
 async def api_get_proxy_pool_config() -> Dict[str, Any]:
     cfg = _get_sync_config()
@@ -2773,10 +2816,13 @@ async def api_set_browser_config(req: BrowserConfigRequest) -> Dict[str, Any]:
         "browser_realistic_profile": bool(req.browser_realistic_profile),
         "browser_clear_runtime_state": bool(req.browser_clear_runtime_state),
         "browser_manual_v2_phone_mode": str(req.browser_manual_v2_phone_mode or "manual").strip().lower() or "manual",
+        "browser_manual_v2_manual_restart_on_enter_password": bool(req.browser_manual_v2_manual_restart_on_enter_password),
         "hero_sms_api_key": req.hero_sms_api_key.strip(),
         "hero_sms_service": req.hero_sms_service.strip(),
         "hero_sms_country": max(1, int(req.hero_sms_country or 16)),
         "hero_sms_operator": req.hero_sms_operator.strip(),
+        "hero_sms_target_price": req.hero_sms_target_price.strip(),
+        "hero_sms_fixed_price": bool(req.hero_sms_fixed_price),
         "hero_sms_max_acquire_retries": max(1, min(int(req.hero_sms_max_acquire_retries or 5), 20)),
     })
     cfg.pop("manual_v2_test_phone", None)
@@ -2974,10 +3020,13 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
         "browser_realistic_profile": bool(req.browser_realistic_profile),
         "browser_clear_runtime_state": bool(req.browser_clear_runtime_state),
         "browser_manual_v2_phone_mode": str(req.browser_manual_v2_phone_mode or "manual").strip().lower() or "manual",
+        "browser_manual_v2_manual_restart_on_enter_password": bool(req.browser_manual_v2_manual_restart_on_enter_password),
         "hero_sms_api_key": hero_sms_api_key,
         "hero_sms_service": req.hero_sms_service.strip(),
         "hero_sms_country": max(1, int(req.hero_sms_country or 16)),
         "hero_sms_operator": req.hero_sms_operator.strip(),
+        "hero_sms_target_price": req.hero_sms_target_price.strip(),
+        "hero_sms_fixed_price": bool(req.hero_sms_fixed_price),
         "hero_sms_max_acquire_retries": max(1, min(int(req.hero_sms_max_acquire_retries or 5), 20)),
     })
     cfg.pop("manual_v2_test_phone", None)
