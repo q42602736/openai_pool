@@ -38,6 +38,7 @@
     "delete_abnormal_accounts": true,
     "dedupe_duplicate_accounts": true
   },
+  "cpa_upload_enabled": true,
   "cpa_base_url": "CPA地址",
   "cpa_token": "CPA密钥",
   "min_candidates": 1000,

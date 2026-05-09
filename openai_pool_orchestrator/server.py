@@ -300,6 +300,7 @@ def _load_sync_config() -> Dict[str, Any]:
             pass
     return {
         "base_url": "", "bearer_token": "", "account_name": "AutoReg", "auto_sync": False,
+        "cpa_upload_enabled": True,
         "cpa_base_url": "", "cpa_token": "", "min_candidates": 800,
         "used_percent_threshold": 95, "auto_maintain": False, "maintain_interval_minutes": 30,
         "upload_mode": "snapshot",
@@ -360,6 +361,7 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["mail_provider_configs"] = provider_cfgs
     cfg["mail_strategy"] = strategy
     cfg["mail_provider"] = providers[0]
+    cfg["cpa_upload_enabled"] = _as_bool(cfg.get("cpa_upload_enabled", True), default=True)
     upload_mode = str(cfg.get("upload_mode", "snapshot") or "snapshot").strip().lower()
     if upload_mode not in ("snapshot", "decoupled"):
         upload_mode = "snapshot"
@@ -465,6 +467,11 @@ _sync_config = _normalize_config(_load_sync_config())
 def _is_auto_sync_enabled(cfg: Optional[Dict[str, Any]] = None) -> bool:
     config = cfg if cfg is not None else _get_sync_config()
     return _as_bool(config.get("auto_sync", False), default=False)
+
+
+def _is_cpa_upload_enabled(cfg: Optional[Dict[str, Any]] = None) -> bool:
+    config = cfg if cfg is not None else _get_sync_config()
+    return _as_bool(config.get("cpa_upload_enabled", True), default=True)
 
 
 def _push_refresh_token(base_url: str, bearer: str, refresh_token: str) -> Dict[str, Any]:
@@ -2245,6 +2252,8 @@ _pool_maintain_lock = threading.Lock()
 
 def _get_pool_maintainer(cfg: Optional[Dict[str, Any]] = None) -> Optional[PoolMaintainer]:
     cfg = cfg or _get_sync_config()
+    if not _is_cpa_upload_enabled(cfg):
+        return None
     base_url = str(cfg.get("cpa_base_url", "")).strip()
     token = str(cfg.get("cpa_token", "")).strip()
     if not base_url or not token:
@@ -2514,7 +2523,7 @@ async def api_migrate_tokens_compat(req: TokenCompatMigrationRequest) -> Dict[st
         proxy = str(cfg.get("proxy", "") or "").strip()
         return _migrate_local_tokens_for_compat(
             filenames=req.filenames,
-            reupload_cpa=bool(req.reupload_cpa and cpa_base_url and cpa_token),
+            reupload_cpa=bool(req.reupload_cpa and _is_cpa_upload_enabled(cfg) and cpa_base_url and cpa_token),
             cpa_base_url=cpa_base_url,
             cpa_token=cpa_token,
             proxy=proxy,
@@ -3918,11 +3927,9 @@ def _sync_extension_token_to_targets(
         "token_proxy": None,
     }
 
-    cpa_base_url = str(cfg.get("cpa_base_url") or "").strip()
-    cpa_token = str(cfg.get("cpa_token") or "").strip()
-    if cpa_base_url and cpa_token:
+    pool_maintainer = _get_pool_maintainer(cfg)
+    if pool_maintainer:
         try:
-            pool_maintainer = PoolMaintainer(cpa_base_url=cpa_base_url, cpa_token=cpa_token)
             cpa_ok = bool(pool_maintainer.upload_token(file_name, token_data, proxy=""))
             upload_results["cpa"] = cpa_ok
             if cpa_ok:
@@ -4109,6 +4116,7 @@ async def api_tokens_platform_clear(req: TokenPlatformMarkRequest) -> Dict[str, 
 
 
 class PoolConfigRequest(BaseModel):
+    cpa_upload_enabled: Optional[bool] = None
     cpa_base_url: str = ""
     cpa_token: str = ""
     min_candidates: int = 800
@@ -4130,6 +4138,7 @@ async def api_get_pool_config() -> Dict[str, Any]:
     cfg = _get_sync_config()
     token = str(cfg.get("cpa_token", ""))
     return {
+        "cpa_upload_enabled": _is_cpa_upload_enabled(cfg),
         "cpa_base_url": cfg.get("cpa_base_url", ""),
         "cpa_token_preview": (token[:12] + "...") if len(token) > 12 else token,
         "min_candidates": cfg.get("min_candidates", 800),
@@ -4142,16 +4151,21 @@ async def api_get_pool_config() -> Dict[str, Any]:
 @app.post("/api/pool/config")
 async def api_set_pool_config(req: PoolConfigRequest) -> Dict[str, Any]:
     cfg = _get_sync_config()
+    if req.cpa_upload_enabled is None:
+        cpa_upload_enabled = _is_cpa_upload_enabled(cfg)
+    else:
+        cpa_upload_enabled = bool(req.cpa_upload_enabled)
     cfg["cpa_base_url"] = req.cpa_base_url.strip()
     cfg["cpa_token"] = req.cpa_token.strip() or str(cfg.get("cpa_token", "") or "").strip()
     cfg["min_candidates"] = req.min_candidates
     cfg["used_percent_threshold"] = req.used_percent_threshold
-    cfg["auto_maintain"] = req.auto_maintain
+    cfg["cpa_upload_enabled"] = cpa_upload_enabled
+    cfg["auto_maintain"] = bool(req.auto_maintain and cpa_upload_enabled)
     cfg["maintain_interval_minutes"] = max(5, req.maintain_interval_minutes)
     _save_sync_config(cfg)
 
     # 启停自动维护
-    if req.auto_maintain:
+    if cpa_upload_enabled and req.auto_maintain:
         _start_auto_maintain()
     else:
         _stop_auto_maintain()
@@ -4161,6 +4175,9 @@ async def api_set_pool_config(req: PoolConfigRequest) -> Dict[str, Any]:
 
 @app.get("/api/pool/status")
 async def api_pool_status() -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    if not _is_cpa_upload_enabled(cfg):
+        return {"configured": False, "disabled": True, "error": "CPA 上传已关闭"}
     pm = _get_pool_maintainer()
     if not pm:
         return {"configured": False, "error": "CPA 未配置"}
@@ -4171,6 +4188,8 @@ async def api_pool_status() -> Dict[str, Any]:
 
 @app.post("/api/pool/check")
 async def api_pool_check() -> Dict[str, Any]:
+    if not _is_cpa_upload_enabled():
+        raise HTTPException(status_code=400, detail="CPA 上传已关闭")
     pm = _get_pool_maintainer()
     if not pm:
         raise HTTPException(status_code=400, detail="CPA 未配置")
@@ -4180,6 +4199,8 @@ async def api_pool_check() -> Dict[str, Any]:
 
 @app.post("/api/pool/maintain")
 async def api_pool_maintain() -> Dict[str, Any]:
+    if not _is_cpa_upload_enabled():
+        raise HTTPException(status_code=400, detail="CPA 上传已关闭")
     pm = _get_pool_maintainer()
     if not pm:
         raise HTTPException(status_code=400, detail="CPA 未配置")
@@ -4203,13 +4224,15 @@ async def api_pool_maintain() -> Dict[str, Any]:
 @app.post("/api/pool/auto")
 async def api_pool_auto(enable: bool = True) -> Dict[str, Any]:
     cfg = _get_sync_config()
-    cfg["auto_maintain"] = enable
+    if enable and not _is_cpa_upload_enabled(cfg):
+        raise HTTPException(status_code=400, detail="CPA 上传已关闭，不能开启自动维护")
+    cfg["auto_maintain"] = bool(enable and _is_cpa_upload_enabled(cfg))
     _save_sync_config(cfg)
-    if enable:
+    if enable and _is_cpa_upload_enabled(cfg):
         _start_auto_maintain()
     else:
         _stop_auto_maintain()
-    return {"auto_maintain": enable}
+    return {"auto_maintain": bool(enable and _is_cpa_upload_enabled(cfg))}
 
 
 @app.get("/api/mail/config")

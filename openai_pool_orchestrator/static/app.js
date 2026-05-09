@@ -208,6 +208,7 @@ document.addEventListener('DOMContentLoaded', () => {
     headerLocalTokenDelta: $('headerLocalTokenDelta'),
     headerLocalTokenBar: $('headerLocalTokenBar'),
     themeToggleBtn: $('themeToggleBtn'),
+    cpaUploadEnabled: $('cpaUploadEnabled'),
     cpaBaseUrl: $('cpaBaseUrl'),
     cpaToken: $('cpaToken'),
     cpaMinCandidates: $('cpaMinCandidates'),
@@ -377,6 +378,13 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
   if (DOM.uploadModeSaveBtn) DOM.uploadModeSaveBtn.addEventListener('click', saveUploadMode);
+  if (DOM.cpaUploadEnabled && DOM.cpaAutoMaintain) {
+    DOM.cpaUploadEnabled.addEventListener('change', () => {
+      if (!DOM.cpaUploadEnabled.checked) {
+        DOM.cpaAutoMaintain.checked = false;
+      }
+    });
+  }
   DOM.cpaTestBtn.addEventListener('click', testCpaConnection);
   DOM.cpaSaveBtn.addEventListener('click', savePoolConfig);
   DOM.mailTestBtn.addEventListener('click', testMailConnection);
@@ -2923,17 +2931,22 @@ async function loadPoolConfig() {
   try {
     const res = await fetch('/api/pool/config');
     const cfg = await res.json();
+    if (DOM.cpaUploadEnabled) DOM.cpaUploadEnabled.checked = cfg.cpa_upload_enabled !== false;
     DOM.cpaBaseUrl.value = cfg.cpa_base_url || '';
     DOM.cpaMinCandidates.value = cfg.min_candidates || 800;
     DOM.cpaUsedPercent.value = cfg.used_percent_threshold || 95;
     DOM.cpaAutoMaintain.checked = !!cfg.auto_maintain;
     DOM.cpaInterval.value = cfg.maintain_interval_minutes || 30;
+    if (DOM.cpaUploadEnabled && !DOM.cpaUploadEnabled.checked) {
+      DOM.cpaAutoMaintain.checked = false;
+    }
     if (DOM.cpaStatus) DOM.cpaStatus.textContent = '';
   } catch { }
 }
 
 async function savePoolConfig() {
   const payload = {
+    cpa_upload_enabled: DOM.cpaUploadEnabled ? DOM.cpaUploadEnabled.checked : true,
     cpa_base_url: DOM.cpaBaseUrl.value.trim(),
     cpa_token: DOM.cpaToken.value.trim(),
     min_candidates: parseInt(DOM.cpaMinCandidates.value) || 800,
@@ -2999,6 +3012,7 @@ async function pollPoolStatus() {
       if (DOM.poolError) DOM.poolError.textContent = '--';
       if (DOM.poolThreshold) DOM.poolThreshold.textContent = '--';
       if (DOM.poolPercent) DOM.poolPercent.textContent = '--';
+      if (DOM.cpaStatus && data.disabled) DOM.cpaStatus.textContent = data.error || 'CPA 上传已关闭';
       updateHeaderCpa(null);
       return;
     }
