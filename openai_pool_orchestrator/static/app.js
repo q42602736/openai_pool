@@ -1011,6 +1011,13 @@ async function loadHeroSmsPriceTiers(countryValue = '', selectedPrice = '', oper
   }
 }
 
+function getHeroSmsAvailableTierPrices() {
+  if (!DOM.heroSmsPriceTierSelect) return [];
+  return [...DOM.heroSmsPriceTierSelect.options]
+    .map(option => String(option?.value || '').trim())
+    .filter(value => !!value);
+}
+
 async function loadHeroSmsCountries(selectedValue = '') {
   if (!DOM.heroSmsCountry) return;
   try {
@@ -2733,6 +2740,15 @@ async function saveBrowserConfig(options = {}) {
       if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
       showToast(msg, 'error');
       return false;
+    }
+    if (payload.hero_sms_fixed_price && payload.hero_sms_target_price) {
+      const availablePrices = getHeroSmsAvailableTierPrices();
+      if (availablePrices.length && !availablePrices.includes(payload.hero_sms_target_price)) {
+        const msg = `固定价模式只能选择当前真实价档，当前可选: ${availablePrices.join(', ')}；如果你要手填 ${payload.hero_sms_target_price}，请改用“只作价格上限”。`;
+        if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
+        showToast(msg, 'error');
+        return false;
+      }
     }
   }
   DOM.browserConfigSaveBtn.disabled = true;

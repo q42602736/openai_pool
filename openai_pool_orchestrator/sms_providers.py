@@ -248,6 +248,14 @@ class HeroSMSProvider(SMSProvider):
             return "fixed"
         return "ceiling"
 
+    @classmethod
+    def _is_matching_price_tier(cls, left: Any, right: Any) -> bool:
+        left_number = cls._parse_number(left)
+        right_number = cls._parse_number(right)
+        if left_number is None or right_number is None:
+            return False
+        return abs(left_number - right_number) <= cls.PRICE_COMPARE_EPSILON
+
     def _request(self, action: str, *, proxy: str = "", timeout_seconds: int = 30, **params: Any) -> Any:
         normalized_proxy = _normalize_proxy_url(proxy)
         proxies = {"http": normalized_proxy, "https": normalized_proxy} if normalized_proxy else None
@@ -850,9 +858,37 @@ class HeroSMSProvider(SMSProvider):
             "selected_operator_count": selected_operator_count,
         }
 
+    def _ensure_fixed_price_matches_known_tier(self, selection: Dict[str, Any]) -> None:
+        if not self.fixed_price or self.target_price is None:
+            return
+        price_tier_options = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
+        operator_options = selection.get("operator_options") if isinstance(selection.get("operator_options"), list) else []
+        candidate_prices: List[Any] = []
+        candidate_prices.extend(item.get("price") for item in price_tier_options if isinstance(item, dict))
+        candidate_prices.extend(item.get("price") for item in operator_options if isinstance(item, dict))
+        if selection.get("selected_operator_price") is not None:
+            candidate_prices.append(selection.get("selected_operator_price"))
+        if not candidate_prices:
+            return
+        if any(self._is_matching_price_tier(price, self.target_price) for price in candidate_prices):
+            return
+        normalized_prices = sorted(
+            {
+                round(float(price), 6)
+                for price in candidate_prices
+                if self._parse_number(price) is not None
+            }
+        )
+        raise RuntimeError(
+            "HeroSMS 固定价模式要求目标价格必须命中当前真实价档: "
+            + f"target=${self.target_price}, available={normalized_prices or '-'}。"
+            + "如果你想填 0.03 这种手输价格，请改用“只作价格上限”。"
+        )
+
     def acquire_number(self, *, proxy: str = "") -> Dict[str, Any]:
         last_error = ""
         selection = self.resolve_country_and_operator(proxy=proxy)
+        self._ensure_fixed_price_matches_known_tier(selection)
         selected_country_id = self._parse_integer(selection.get("hero_sms_country")) or int(self.country or 16)
         selected_operator = str(selection.get("selected_operator") or "").strip()
         operator_was_auto_selected = not str(self.operator or "").strip() and bool(selected_operator)
