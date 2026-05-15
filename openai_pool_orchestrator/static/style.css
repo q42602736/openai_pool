@@ -549,6 +549,41 @@ body.resizing * { cursor: col-resize !important; }
   margin-bottom: 8px;
 }
 
+.sidebar-browser-config {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sidebar-browser-config .config-row {
+  gap: 10px;
+}
+
+.sidebar-browser-config .config-field {
+  margin-bottom: 0;
+}
+
+.sidebar-browser-config .config-field label {
+  font-size: 10px;
+}
+
+.sidebar-browser-config .config-field input[type="text"],
+.sidebar-browser-config .config-field input[type="password"],
+.sidebar-browser-config .config-field input[type="number"],
+.sidebar-browser-config .config-field select {
+  font-size: 12px;
+  padding: 8px 10px;
+}
+
+.sidebar-browser-config .config-actions {
+  margin-top: 4px;
+}
+
+.sidebar-browser-config .config-hint {
+  font-size: 10px;
+  line-height: 1.5;
+}
+
 /* ==========================================
    iOS TOGGLE SWITCH — Refined
    ========================================== */
