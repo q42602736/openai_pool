@@ -944,6 +944,7 @@ class HeroSMSProvider(SMSProvider):
         ]
         exact_ceiling_candidates = self._resolve_ceiling_price_candidates(selection)
         exact_ceiling_mode = bool(self.target_price is not None and not self.fixed_price and exact_ceiling_candidates)
+        hidden_ceiling_fallback = bool(self.target_price is not None and not self.fixed_price and not exact_ceiling_candidates)
         exact_ceiling_index = 0
         auto_price_index = 0
         auto_price_floor = None
@@ -974,6 +975,11 @@ class HeroSMSProvider(SMSProvider):
                 )
             if preview_rows:
                 parts.append("price_tiers=" + ", ".join(preview_rows))
+            if hidden_ceiling_fallback:
+                parts.append(
+                    "ceiling_mode=hidden_pool"
+                    + f"(visible tiers within <=${self.target_price if self.target_price is not None else '-'}: none)"
+                )
             if debug_events:
                 parts.append("trace=" + " || ".join(str(item) for item in debug_events[:20]))
             return " | ".join(part for part in parts if part)
@@ -990,7 +996,11 @@ class HeroSMSProvider(SMSProvider):
                     if self.target_price is not None and not self.fixed_price
                     else f", target_price=${self.target_price if self.target_price is not None else '-'}"
                 )
-                + f", expected=${expected_price if expected_price is not None else '-'}"
+                + (
+                    f", expected=hidden_pool<=${self.target_price}"
+                    if hidden_ceiling_fallback and self.target_price is not None
+                    else f", expected=${expected_price if expected_price is not None else '-'}"
+                )
                 + (
                     f", ceiling_tier_index={exact_ceiling_index + 1}/{len(exact_ceiling_candidates)}"
                     if exact_ceiling_mode
@@ -1174,6 +1184,8 @@ class HeroSMSProvider(SMSProvider):
                 "target_price": self.target_price,
                 "max_price": self.target_price if self.target_price is not None and not self.fixed_price else None,
                 "price_mode": self._get_price_mode(),
+                "used_hidden_ceiling_fallback": hidden_ceiling_fallback,
+                "visible_ceiling_candidates": exact_ceiling_candidates,
                 "operator": selected_operator,
                 "operator_fallback_to_aggregate": bool(operator_was_auto_selected and not selected_operator),
                 "country": selected_country_id,

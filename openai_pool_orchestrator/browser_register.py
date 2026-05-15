@@ -6929,6 +6929,13 @@ def run_browser_registration(
                 "浏览器模式2 HeroSMS 取号轨迹: " + " || ".join(str(item) for item in debug_events[:12]),
                 step=step,
             )
+        if sms_order.get("used_hidden_ceiling_fallback"):
+            emitter.info(
+                "浏览器模式2 HeroSMS 当前可见价档里没有命中上限的低价档；"
+                + f"本轮改为直接探测隐藏低价池 <=${sms_order.get('max_price') if sms_order.get('max_price') is not None else sms_order.get('target_price')}"
+                + "，因此实际成交价可能低于当前展示档位。",
+                step=step,
+            )
         manual_v2_phone_number = str(sms_order.get("phone_number") or "").strip()
         manual_v2_sms_activation_id = str(sms_order.get("activation_id") or "").strip()
         manual_v2_sms_purchased_at = time.time()
@@ -6949,6 +6956,11 @@ def run_browser_registration(
             + (
                 f", max_price=${sms_order.get('max_price')}"
                 if sms_order.get("max_price") is not None
+                else ""
+            )
+            + (
+                ", ceiling_source=hidden_pool"
+                if sms_order.get("used_hidden_ceiling_fallback")
                 else ""
             )
             + (
