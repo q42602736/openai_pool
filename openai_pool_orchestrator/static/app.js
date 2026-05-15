@@ -407,8 +407,14 @@ document.addEventListener('DOMContentLoaded', () => {
     DOM.heroSmsPriceTierSelect.addEventListener('change', () => {
       if (suppressHeroSmsPriceTierChange) return;
       const value = DOM.heroSmsPriceTierSelect ? DOM.heroSmsPriceTierSelect.value : '';
-      if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = value || '';
-      lastManualHeroSmsTargetPrice = value || '';
+      if (value) {
+        if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = value;
+        lastManualHeroSmsTargetPrice = value;
+        return;
+      }
+      if (DOM.heroSmsTargetPrice && !DOM.heroSmsTargetPrice.value.trim()) {
+        lastManualHeroSmsTargetPrice = '';
+      }
     });
   }
   if (DOM.heroSmsTargetPrice) {

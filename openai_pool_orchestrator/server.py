@@ -1927,6 +1927,7 @@ class TaskState:
                             "hero_sms_country": int(config_snapshot.get("hero_sms_country", 16) or 16),
                             "hero_sms_operator": str(config_snapshot.get("hero_sms_operator", "") or "").strip(),
                             "hero_sms_target_price": str(config_snapshot.get("hero_sms_target_price", "") or "").strip(),
+                            "hero_sms_fixed_price": _as_bool(config_snapshot.get("hero_sms_fixed_price", True), default=True),
                             "hero_sms_max_acquire_retries": int(config_snapshot.get("hero_sms_max_acquire_retries", 5) or 5),
                         },
                         browser_manual_phone_input_func=(
