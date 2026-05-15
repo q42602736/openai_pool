@@ -24,9 +24,9 @@ try:
 except ImportError:
     from fingerprint_profile import FingerprintProfile, describe_fingerprint  # type: ignore
 try:
-    from .sms_providers import DEFAULT_PHONE_COUNTRIES, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, schedule_hero_sms_delayed_cancel
+    from .sms_providers import DEFAULT_PHONE_COUNTRIES, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, HeroSMSAcquireRetryableError, schedule_hero_sms_delayed_cancel
 except ImportError:
-    from sms_providers import DEFAULT_PHONE_COUNTRIES, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, schedule_hero_sms_delayed_cancel  # type: ignore
+    from sms_providers import DEFAULT_PHONE_COUNTRIES, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, HeroSMSAcquireRetryableError, schedule_hero_sms_delayed_cancel  # type: ignore
 
 
 DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
@@ -8020,10 +8020,20 @@ def run_browser_registration(
                             previous_url = current_url
                             previous_body = body_text
                             if not manual_v2_phone_number:
-                                _ensure_manual_v2_auto_phone(
-                                    step="add_phone",
-                                    prompt="浏览器模式2 已进入步骤1手机号页，准备通过 HeroSMS 自动获取本轮注册手机号...",
-                                )
+                                try:
+                                    _ensure_manual_v2_auto_phone(
+                                        step="add_phone",
+                                        prompt="浏览器模式2 已进入步骤1手机号页，准备通过 HeroSMS 自动获取本轮注册手机号...",
+                                    )
+                                except HeroSMSAcquireRetryableError as exc:
+                                    emitter.warn(str(exc), step="add_phone")
+                                    emitter.info(
+                                        "浏览器模式2 HeroSMS 当前取号失败，但不结束本轮浏览器流程；等待后继续在当前手机号页重试取号...",
+                                        step="add_phone",
+                                    )
+                                    _wait_for_load(page, timeout_ms=1200)
+                                    _sleep_with_page(page, 3000)
+                                    continue
                             manual_v2_wait_phone_logged = False
                             manual_v2_wait_phone_last_url = current_url
                             if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="add_phone"):

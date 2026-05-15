@@ -125,6 +125,10 @@ class SMSProvider(ABC):
         return None
 
 
+class HeroSMSAcquireRetryableError(RuntimeError):
+    """HeroSMS 当前轮无号，可在当前流程内继续重试。"""
+
+
 class HeroSMSProvider(SMSProvider):
     BASE_URL = "https://hero-sms.com/stubs/handler_api.php"
     API_V1_BASE_URL = "https://hero-sms.com/api/v1"
@@ -959,6 +963,21 @@ class HeroSMSProvider(SMSProvider):
                     break
         balance_before = self.get_balance(proxy=proxy)
         debug_events: List[str] = []
+
+        def _build_failure_message(message: str) -> str:
+            parts = [str(message or "").strip()]
+            preview_rows: List[str] = []
+            for item in price_tier_options[:8]:
+                preview_rows.append(
+                    f"${item.get('price') if item.get('price') is not None else '-'}"
+                    + f"/stock={item.get('count') if item.get('count') is not None else '-'}"
+                )
+            if preview_rows:
+                parts.append("price_tiers=" + ", ".join(preview_rows))
+            if debug_events:
+                parts.append("trace=" + " || ".join(str(item) for item in debug_events[:20]))
+            return " | ".join(part for part in parts if part)
+
         for attempt in range(1, self.max_acquire_retries + 1):
             current_operator = selected_operator
             debug_events.append(
@@ -1101,7 +1120,7 @@ class HeroSMSProvider(SMSProvider):
                     if attempt < self.max_acquire_retries:
                         time.sleep(3.0)
                         continue
-                    raise RuntimeError(last_error + "（重试耗尽）")
+                    raise HeroSMSAcquireRetryableError(_build_failure_message(last_error + "（重试耗尽）"))
                 raise RuntimeError(f"HeroSMS 获取号码失败: {data}")
 
             if not isinstance(data, dict):
@@ -1173,7 +1192,7 @@ class HeroSMSProvider(SMSProvider):
                 "debug_events": debug_events,
             }
 
-        raise RuntimeError(last_error or "HeroSMS 获取号码失败")
+        raise HeroSMSAcquireRetryableError(_build_failure_message(last_error or "HeroSMS 获取号码失败"))
 
     def mark_ready(self, activation_id: str, *, proxy: str = "") -> None:
         if not str(activation_id or "").strip():
