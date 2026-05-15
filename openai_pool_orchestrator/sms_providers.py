@@ -115,6 +115,9 @@ class HeroSMSProvider(SMSProvider):
     API_V1_BASE_URL = "https://hero-sms.com/api/v1"
     MAX_ACCEPTABLE_PRICE_RATIO = 1.05
     MAX_ACCEPTABLE_PRICE_DELTA = 0.0005
+    AUTO_PRICE_ESCALATION_RATIO = 1.05
+    AUTO_PRICE_ESCALATION_DELTA = 0.002
+    PRICE_COMPARE_EPSILON = 1e-9
 
     def __init__(
         self,
@@ -202,6 +205,44 @@ class HeroSMSProvider(SMSProvider):
             return int(digits)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _price_tier_has_usable_stock(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        count = HeroSMSProvider._parse_integer(item.get("count"))
+        physical_count = HeroSMSProvider._parse_integer(item.get("physical_count"))
+        if count is not None:
+            return count > 0
+        if physical_count is not None:
+            return physical_count > 0
+        return False
+
+    @classmethod
+    def _select_preferred_price_tier(cls, tiers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not tiers:
+            return None
+        in_stock = [item for item in tiers if cls._price_tier_has_usable_stock(item)]
+        if in_stock:
+            return in_stock[0]
+        return tiers[0]
+
+    def _resolve_actual_price_ceiling(self, expected_price: Optional[float]) -> Optional[float]:
+        if self.target_price is not None:
+            return self.target_price
+        if expected_price is None:
+            return None
+        return max(
+            expected_price * self.MAX_ACCEPTABLE_PRICE_RATIO,
+            expected_price + self.MAX_ACCEPTABLE_PRICE_DELTA,
+        )
+
+    def _get_price_mode(self) -> str:
+        if self.target_price is None:
+            return "auto"
+        if self.fixed_price:
+            return "fixed"
+        return "ceiling"
 
     def _request(self, action: str, *, proxy: str = "", timeout_seconds: int = 30, **params: Any) -> Any:
         normalized_proxy = _normalize_proxy_url(proxy)
@@ -748,6 +789,7 @@ class HeroSMSProvider(SMSProvider):
         aggregate_price = None
         aggregate_count = None
         price_tier_options = self.get_price_tier_options(country=country_id, proxy=proxy)
+        preferred_price_tier = self._select_preferred_price_tier(price_tier_options)
         priced_rows = self.list_country_prices(
             [{
                 "heroSmsCountry": country_id,
@@ -761,9 +803,9 @@ class HeroSMSProvider(SMSProvider):
         if priced_rows:
             aggregate_price = priced_rows[0].get("price")
             aggregate_count = priced_rows[0].get("count")
-        if price_tier_options:
-            aggregate_price = price_tier_options[0].get("price")
-            aggregate_count = price_tier_options[0].get("count")
+        if preferred_price_tier:
+            aggregate_price = preferred_price_tier.get("price")
+            aggregate_count = preferred_price_tier.get("count")
         selected_operator = str(self.operator or "").strip()
         operator_rows: List[Dict[str, Any]] = []
         selected_operator_price = None
@@ -782,6 +824,7 @@ class HeroSMSProvider(SMSProvider):
             "aggregate_price": aggregate_price,
             "aggregate_count": aggregate_count,
             "price_tier_options": price_tier_options,
+            "preferred_price_tier": preferred_price_tier or {},
             "target_price": self.target_price,
             "operator_options": operator_rows,
             "selected_operator": selected_operator,
@@ -795,11 +838,25 @@ class HeroSMSProvider(SMSProvider):
         selected_country_id = self._parse_integer(selection.get("hero_sms_country")) or int(self.country or 16)
         selected_operator = str(selection.get("selected_operator") or "").strip()
         operator_was_auto_selected = not str(self.operator or "").strip() and bool(selected_operator)
+        price_tier_options = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
+        auto_price_candidates = [
+            item for item in price_tier_options
+            if self._parse_number(item.get("price")) is not None
+        ]
+        auto_price_index = 0
+        auto_price_floor = None
         expected_price = self.target_price
         if expected_price is None:
             expected_price = self._parse_number(selection.get("selected_operator_price"))
         if expected_price is None:
             expected_price = self._parse_number(selection.get("aggregate_price"))
+        if expected_price is not None:
+            auto_price_floor = expected_price
+        if expected_price is not None:
+            for index, item in enumerate(auto_price_candidates):
+                if self._parse_number(item.get("price")) == expected_price:
+                    auto_price_index = index
+                    break
         balance_before = self.get_balance(proxy=proxy)
         debug_events: List[str] = []
         for attempt in range(1, self.max_acquire_retries + 1):
@@ -808,7 +865,12 @@ class HeroSMSProvider(SMSProvider):
                 "attempt="
                 + str(attempt)
                 + f", operator={current_operator or 'ANY'}"
-                + f", target_price=${self.target_price if self.target_price is not None else '-'}"
+                + f", price_mode={self._get_price_mode()}"
+                + (
+                    f", max_price=${self.target_price}"
+                    if self.target_price is not None and not self.fixed_price
+                    else f", target_price=${self.target_price if self.target_price is not None else '-'}"
+                )
                 + f", expected=${expected_price if expected_price is not None else '-'}"
                 + f", balance_before=${balance_before if balance_before is not None else '-'}"
             )
@@ -819,8 +881,9 @@ class HeroSMSProvider(SMSProvider):
                 }
                 if current_operator:
                     params["operator"] = current_operator
-                if self.target_price is not None:
-                    params["maxPrice"] = self.target_price
+                request_max_price = self.target_price if self.target_price is not None else expected_price
+                if request_max_price is not None:
+                    params["maxPrice"] = request_max_price
                     if self.fixed_price:
                         params["fixedPrice"] = "true"
                 data = self._request("getNumberV2", proxy=proxy, **params)
@@ -832,18 +895,41 @@ class HeroSMSProvider(SMSProvider):
                     continue
                 raise RuntimeError(last_error) from exc
 
-            if isinstance(data, str):
-                if data == "NO_BALANCE":
-                    debug_events.append(f"attempt={attempt}, response=NO_BALANCE")
+            response_code = ""
+            response_message = ""
+            if isinstance(data, dict):
+                response_code = str(
+                    data.get("title")
+                    or data.get("code")
+                    or data.get("status")
+                    or data.get("error")
+                    or ""
+                ).strip().upper()
+                response_message = str(
+                    data.get("details")
+                    or data.get("message")
+                    or data.get("description")
+                    or ""
+                ).strip()
+            elif isinstance(data, str):
+                response_code = str(data or "").strip().upper()
+
+            if response_code in {"NO_BALANCE", "BAD_KEY", "NO_NUMBERS"}:
+                debug_events.append(
+                    f"attempt={attempt}, response={response_code}, operator={current_operator or 'ANY'}, message={response_message or '-'}"
+                )
+                if response_code == "NO_BALANCE":
                     raise RuntimeError("HeroSMS 余额不足")
-                if data == "BAD_KEY":
-                    debug_events.append(f"attempt={attempt}, response=BAD_KEY")
+                if response_code == "BAD_KEY":
                     raise RuntimeError("HeroSMS API Key 无效")
-                if data == "NO_NUMBERS":
-                    debug_events.append(f"attempt={attempt}, response=NO_NUMBERS, operator={current_operator or 'ANY'}")
+                if response_code == "NO_NUMBERS":
                     if current_operator and operator_was_auto_selected:
                         selected_operator = ""
-                        expected_price = self._parse_number(selection.get("aggregate_price"))
+                        expected_price = (
+                            self.target_price
+                            if self.target_price is not None
+                            else self._parse_number(selection.get("aggregate_price"))
+                        )
                         debug_events.append(
                             f"attempt={attempt}, fallback=aggregate, from_operator={current_operator}, "
                             + f"new_expected=${expected_price if expected_price is not None else '-'}"
@@ -851,11 +937,48 @@ class HeroSMSProvider(SMSProvider):
                         last_error = "HeroSMS 自动选择的运营商当前无号，已回退到国家聚合池重试取号"
                         time.sleep(1.0)
                         continue
-                    last_error = (
-                        "HeroSMS 当前无可用号码: "
-                        + f"attempt={attempt}, operator={current_operator or 'ANY'}, "
-                        + f"country={selected_country_id}, service={self.service}"
-                    )
+                    if self.target_price is None and auto_price_index + 1 < len(auto_price_candidates):
+                        auto_price_index += 1
+                        next_price = self._parse_number(auto_price_candidates[auto_price_index].get("price"))
+                        if next_price is not None:
+                            if auto_price_floor is not None:
+                                auto_price_ceiling = min(
+                                    auto_price_floor * self.AUTO_PRICE_ESCALATION_RATIO,
+                                    auto_price_floor + self.AUTO_PRICE_ESCALATION_DELTA,
+                                )
+                                if next_price > auto_price_ceiling:
+                                    last_error = (
+                                        "HeroSMS 自动最低价可用号已超出允许涨价范围，停止继续抬价: "
+                                        + f"country={selected_country_id}, service={self.service}, "
+                                        + f"base=${auto_price_floor}, next=${next_price}, ceiling=${round(auto_price_ceiling, 6)}"
+                                    )
+                                    debug_events.append(
+                                        f"attempt={attempt}, stop=auto_price_ceiling, base=${auto_price_floor}, next=${next_price}, ceiling=${round(auto_price_ceiling, 6)}"
+                                    )
+                                    raise RuntimeError(last_error)
+                            expected_price = next_price
+                            last_error = (
+                                "HeroSMS 当前最低价档无号，已自动切换到下一档价格重试取号: "
+                                + f"country={selected_country_id}, service={self.service}, next_expected=${expected_price}"
+                            )
+                            debug_events.append(
+                                f"attempt={attempt}, fallback=next_price_tier, new_expected=${expected_price}, tier_index={auto_price_index}"
+                            )
+                            time.sleep(1.0)
+                            continue
+                    if self.target_price is not None:
+                        last_error = (
+                            "HeroSMS 在设定价格上限内无可用号码: "
+                            + f"attempt={attempt}, operator={current_operator or 'ANY'}, "
+                            + f"country={selected_country_id}, service={self.service}, "
+                            + f"max_price=${self.target_price}"
+                        )
+                    else:
+                        last_error = (
+                            "HeroSMS 当前无可用号码: "
+                            + f"attempt={attempt}, operator={current_operator or 'ANY'}, "
+                            + f"country={selected_country_id}, service={self.service}"
+                        )
                     if attempt < self.max_acquire_retries:
                         time.sleep(3.0)
                         continue
@@ -863,8 +986,8 @@ class HeroSMSProvider(SMSProvider):
                 raise RuntimeError(f"HeroSMS 获取号码失败: {data}")
 
             if not isinstance(data, dict):
-                debug_events.append(f"attempt={attempt}, invalid_response_type={type(data).__name__}")
-                raise RuntimeError(f"HeroSMS 获取号码返回异常结构: {type(data).__name__}")
+                debug_events.append(f"attempt={attempt}, invalid_response_type={type(data).__name__}, response={response_code or '-'}")
+                raise RuntimeError(f"HeroSMS 获取号码返回异常结构: {type(data).__name__}: {data}")
 
             activation_id = str(data.get("activationId") or data.get("id") or "").strip()
             phone_number = str(data.get("phoneNumber") or data.get("phone") or "").strip()
@@ -873,20 +996,24 @@ class HeroSMSProvider(SMSProvider):
                 raise RuntimeError(f"HeroSMS 获取号码缺少 activationId/phoneNumber: {data}")
             actual_cost = self._parse_number(data.get("activationCost"))
             if expected_price is not None and actual_cost is not None:
-                max_allowed_price = max(
-                    expected_price * self.MAX_ACCEPTABLE_PRICE_RATIO,
-                    expected_price + self.MAX_ACCEPTABLE_PRICE_DELTA,
-                )
-                if actual_cost > max_allowed_price:
+                max_allowed_price = self._resolve_actual_price_ceiling(expected_price)
+                if max_allowed_price is not None and actual_cost > (max_allowed_price + self.PRICE_COMPARE_EPSILON):
                     debug_events.append(
-                        f"attempt={attempt}, overpriced expected=${expected_price}, actual=${actual_cost}, "
+                        f"attempt={attempt}, overpriced expected=${expected_price}, allowed=${max_allowed_price}, actual=${actual_cost}, "
                         + f"operator={current_operator or 'ANY'}"
                     )
-                    last_error = (
-                        "HeroSMS 实际成交价高于预期报价: "
-                        f"expected={expected_price}, actual={actual_cost}, "
-                        f"operator={current_operator or '-'}, country={selected_country_id}"
-                    )
+                    if self.target_price is not None:
+                        last_error = (
+                            "HeroSMS 实际成交价超过设定价格上限: "
+                            f"max_price={self.target_price}, actual={actual_cost}, "
+                            f"operator={current_operator or '-'}, country={selected_country_id}"
+                        )
+                    else:
+                        last_error = (
+                            "HeroSMS 实际成交价高于预期报价: "
+                            f"expected={expected_price}, actual={actual_cost}, "
+                            f"operator={current_operator or '-'}, country={selected_country_id}"
+                        )
                     try:
                         self.cancel(activation_id, proxy=proxy)
                     except Exception:
@@ -907,6 +1034,8 @@ class HeroSMSProvider(SMSProvider):
                 "phone_number": phone_number,
                 "activation_cost": actual_cost if actual_cost is not None else data.get("activationCost"),
                 "target_price": self.target_price,
+                "max_price": self.target_price if self.target_price is not None and not self.fixed_price else None,
+                "price_mode": self._get_price_mode(),
                 "operator": selected_operator,
                 "operator_fallback_to_aggregate": bool(operator_was_auto_selected and not selected_operator),
                 "country": selected_country_id,

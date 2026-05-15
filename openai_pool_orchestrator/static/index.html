@@ -550,8 +550,8 @@
               <div id="heroSmsPriceTierList" class="config-hint" style="margin-top:6px;">价格档加载后会显示在这里。</div>
             </div>
             <div class="config-field" style="flex:1;">
-              <label>HeroSMS 目标价格</label>
-              <input type="text" id="heroSmsTargetPrice" value="" autocomplete="off" spellcheck="false" placeholder="留空=自动最低价；例如 0.0169" />
+              <label>HeroSMS 目标价 / 上限价</label>
+              <input type="text" id="heroSmsTargetPrice" value="" autocomplete="off" spellcheck="false" placeholder="留空=自动最低价；填 0.04 并选“只作价格上限”=仅取 <=0.04 的号码" />
             </div>
             <div class="config-field" style="flex:1;">
               <label>取号重试次数</label>
@@ -563,7 +563,7 @@
               <label>价格模式</label>
               <select id="heroSmsFixedPrice">
                 <option value="true">严格锁定选中价位</option>
-                <option value="false">只作价格上限</option>
+                <option value="false">只作价格上限（不超过目标价）</option>
               </select>
             </div>
             <div class="config-field" style="flex:1;">
