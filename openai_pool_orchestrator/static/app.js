@@ -62,6 +62,14 @@ const state = {
 };
 
 let suppressHeroSmsPriceTierChange = false;
+let lastManualHeroSmsTargetPrice = '';
+
+function restoreHeroSmsTargetPrice(value = '') {
+  if (!DOM.heroSmsTargetPrice) return;
+  const normalizedValue = String(value || '').trim();
+  if (DOM.heroSmsTargetPrice.value.trim() === normalizedValue) return;
+  DOM.heroSmsTargetPrice.value = normalizedValue;
+}
 
 // ==========================================
 // DOM 引用
@@ -349,24 +357,28 @@ document.addEventListener('DOMContentLoaded', () => {
     DOM.heroSmsCountry.addEventListener('change', () => {
       DOM.heroSmsCountry.dataset.selectedValue = DOM.heroSmsCountry.value || '';
       if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = '';
-      const currentTargetPrice = DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '';
+      const currentTargetPrice = lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
       loadHeroSmsOperators(DOM.heroSmsCountry.value, '').then(() => {
-        loadHeroSmsPriceTiers(
+        return loadHeroSmsPriceTiers(
           DOM.heroSmsCountry.value,
           currentTargetPrice,
           DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '',
-        );
+        ).finally(() => {
+          restoreHeroSmsTargetPrice(currentTargetPrice);
+        });
       });
     });
   }
   if (DOM.heroSmsOperator) {
     DOM.heroSmsOperator.addEventListener('change', () => {
-      const currentTargetPrice = DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '';
+      const currentTargetPrice = lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
       loadHeroSmsPriceTiers(
         DOM.heroSmsCountry ? DOM.heroSmsCountry.value : '16',
         currentTargetPrice,
         DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '',
-      );
+      ).finally(() => {
+        restoreHeroSmsTargetPrice(currentTargetPrice);
+      });
     });
   }
   if (DOM.heroSmsPriceTierSelect) {
@@ -374,6 +386,12 @@ document.addEventListener('DOMContentLoaded', () => {
       if (suppressHeroSmsPriceTierChange) return;
       const value = DOM.heroSmsPriceTierSelect ? DOM.heroSmsPriceTierSelect.value : '';
       if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = value || '';
+      lastManualHeroSmsTargetPrice = value || '';
+    });
+  }
+  if (DOM.heroSmsTargetPrice) {
+    DOM.heroSmsTargetPrice.addEventListener('input', () => {
+      lastManualHeroSmsTargetPrice = DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '';
     });
   }
   if (DOM.registerMode) {
@@ -2539,6 +2557,7 @@ function applyBrowserConfig(cfg) {
   if (DOM.heroSmsCountry) DOM.heroSmsCountry.dataset.selectedValue = String(cfg.hero_sms_country || 16);
   if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = cfg.hero_sms_operator || '';
   if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = cfg.hero_sms_target_price || '';
+  lastManualHeroSmsTargetPrice = cfg.hero_sms_target_price || '';
   if (DOM.heroSmsFixedPrice) DOM.heroSmsFixedPrice.value = String(cfg.hero_sms_fixed_price !== false);
   if (DOM.heroSmsMaxAcquireRetries) DOM.heroSmsMaxAcquireRetries.value = cfg.hero_sms_max_acquire_retries || 5;
   if (DOM.browserTimeoutMs) DOM.browserTimeoutMs.value = cfg.browser_timeout_ms || 90000;
