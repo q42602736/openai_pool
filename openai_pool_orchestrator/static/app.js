@@ -61,6 +61,8 @@ const state = {
   },
 };
 
+let suppressHeroSmsPriceTierChange = false;
+
 // ==========================================
 // DOM 引用
 // ==========================================
@@ -359,15 +361,17 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   if (DOM.heroSmsOperator) {
     DOM.heroSmsOperator.addEventListener('change', () => {
+      const currentTargetPrice = DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '';
       loadHeroSmsPriceTiers(
         DOM.heroSmsCountry ? DOM.heroSmsCountry.value : '16',
-        '',
+        currentTargetPrice,
         DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '',
       );
     });
   }
   if (DOM.heroSmsPriceTierSelect) {
     DOM.heroSmsPriceTierSelect.addEventListener('change', () => {
+      if (suppressHeroSmsPriceTierChange) return;
       const value = DOM.heroSmsPriceTierSelect ? DOM.heroSmsPriceTierSelect.value : '';
       if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = value || '';
     });
@@ -904,21 +908,40 @@ function renderHeroSmsPriceTierOptions(rows, selectedPrice = '') {
   if (!DOM.heroSmsPriceTierSelect) return;
   const list = Array.isArray(rows) ? rows : [];
   const normalizedSelected = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
-  DOM.heroSmsPriceTierSelect.innerHTML = '';
-  const autoOption = document.createElement('option');
-  autoOption.value = '';
-  autoOption.textContent = '自动最低价';
-  autoOption.selected = !normalizedSelected;
-  DOM.heroSmsPriceTierSelect.appendChild(autoOption);
-  list.slice(0, 30).forEach((item) => {
-    const priceText = item && item.price !== null && item.price !== undefined ? String(item.price) : '';
-    if (!priceText) return;
-    const option = document.createElement('option');
-    option.value = priceText;
-    option.textContent = formatHeroSmsPriceTierLabel(item);
-    option.selected = priceText === normalizedSelected;
-    DOM.heroSmsPriceTierSelect.appendChild(option);
-  });
+  suppressHeroSmsPriceTierChange = true;
+  try {
+    DOM.heroSmsPriceTierSelect.innerHTML = '';
+    const autoOption = document.createElement('option');
+    autoOption.value = '';
+    autoOption.textContent = '自动最低价';
+    autoOption.selected = !normalizedSelected;
+    DOM.heroSmsPriceTierSelect.appendChild(autoOption);
+
+    let hasSelectedPrice = false;
+    list.slice(0, 30).forEach((item) => {
+      const priceText = item && item.price !== null && item.price !== undefined ? String(item.price) : '';
+      if (!priceText) return;
+      const option = document.createElement('option');
+      option.value = priceText;
+      option.textContent = formatHeroSmsPriceTierLabel(item);
+      option.selected = priceText === normalizedSelected;
+      if (option.selected) hasSelectedPrice = true;
+      DOM.heroSmsPriceTierSelect.appendChild(option);
+    });
+
+    if (normalizedSelected && !hasSelectedPrice) {
+      const preservedOption = document.createElement('option');
+      preservedOption.value = normalizedSelected;
+      preservedOption.textContent = `$${normalizedSelected} · 手填保留值`;
+      preservedOption.selected = true;
+      preservedOption.dataset.manualPreserved = 'true';
+      DOM.heroSmsPriceTierSelect.appendChild(preservedOption);
+    }
+
+    DOM.heroSmsPriceTierSelect.value = normalizedSelected || '';
+  } finally {
+    suppressHeroSmsPriceTierChange = false;
+  }
 }
 
 function renderHeroSmsOperatorOptions(operators, selectedValue = '') {
@@ -1014,6 +1037,7 @@ async function loadHeroSmsPriceTiers(countryValue = '', selectedPrice = '', oper
 function getHeroSmsAvailableTierPrices() {
   if (!DOM.heroSmsPriceTierSelect) return [];
   return [...DOM.heroSmsPriceTierSelect.options]
+    .filter(option => String(option?.dataset?.manualPreserved || '') !== 'true')
     .map(option => String(option?.value || '').trim())
     .filter(value => !!value);
 }
