@@ -186,7 +186,9 @@ class HeroSMSProvider(SMSProvider):
 
     @staticmethod
     def _parse_number(value: Any) -> Optional[float]:
-        text = str(value or "").strip()
+        if value is None:
+            return None
+        text = str(value).strip()
         digits = "".join(ch for ch in text if ch.isdigit() or ch == ".")
         if not digits:
             return None
@@ -197,7 +199,9 @@ class HeroSMSProvider(SMSProvider):
 
     @staticmethod
     def _parse_integer(value: Any) -> Optional[int]:
-        text = str(value or "").strip()
+        if value is None:
+            return None
+        text = str(value).strip()
         digits = "".join(ch for ch in text if ch.isdigit() or ch == "-")
         if not digits:
             return None
@@ -619,7 +623,14 @@ class HeroSMSProvider(SMSProvider):
                     ]),
                 })
 
-        if default_price is not None:
+        if (
+            default_price is not None
+            and (default_price_count is None or default_price_count > 0)
+            and not any(
+                cls._parse_number(item.get("price")) == default_price
+                for item in rows
+            )
+        ):
             signature = (
                 default_price,
                 default_price_count,
@@ -653,6 +664,13 @@ class HeroSMSProvider(SMSProvider):
             )
         )
         return rows
+
+    @classmethod
+    def _format_price_tier_stock_for_display(cls, item: Dict[str, Any]) -> Optional[int]:
+        count = cls._parse_integer(item.get("count"))
+        if count is not None and count > 0:
+            return count
+        return None
 
     def get_top_countries_by_service(self, *, proxy: str = "") -> List[Dict[str, Any]]:
         for action in ("getTopCountriesByServiceRank", "getTopCountriesByService"):

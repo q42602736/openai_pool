@@ -6864,9 +6864,23 @@ def run_browser_registration(
         if price_tier_options:
             preview_rows = []
             for item in price_tier_options[:8]:
+                display_stock = None
+                try:
+                    display_stock = sms_provider._format_price_tier_stock_for_display(item)  # type: ignore[attr-defined]
+                except Exception:
+                    display_stock = item.get("count") if item.get("count") is not None else None
+                source_text = str(item.get("source") or "").strip()
+                extra_flags = []
+                if source_text:
+                    extra_flags.append(source_text)
+                if item.get("is_default_price"):
+                    extra_flags.append("default")
+                if item.get("is_min_price"):
+                    extra_flags.append("min")
                 preview_rows.append(
                     f"${item.get('price') if item.get('price') is not None else '-'}"
-                    + f"/stock={item.get('count') if item.get('count') is not None else '-'}"
+                    + f"/stock={display_stock if display_stock is not None else '-'}"
+                    + (f"/{'/'.join(extra_flags)}" if extra_flags else "")
                 )
             emitter.info(
                 "浏览器模式2 HeroSMS 当前国家价格档: "
