@@ -900,6 +900,32 @@ class HeroSMSProvider(SMSProvider):
             + "如果你想填 0.03 这种手输价格，请改用“只作价格上限”。"
         )
 
+    def _resolve_ceiling_price_candidates(self, selection: Dict[str, Any]) -> List[float]:
+        if self.target_price is None or self.fixed_price:
+            return []
+        price_tier_options = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
+        operator_options = selection.get("operator_options") if isinstance(selection.get("operator_options"), list) else []
+        candidate_prices: List[float] = []
+        for row in price_tier_options:
+            if not isinstance(row, dict):
+                continue
+            price = self._parse_number(row.get("price"))
+            if price is None or price > (self.target_price + self.PRICE_COMPARE_EPSILON):
+                continue
+            candidate_prices.append(price)
+        for row in operator_options:
+            if not isinstance(row, dict):
+                continue
+            price = self._parse_number(row.get("price"))
+            if price is None or price > (self.target_price + self.PRICE_COMPARE_EPSILON):
+                continue
+            candidate_prices.append(price)
+        selected_operator_price = self._parse_number(selection.get("selected_operator_price"))
+        if selected_operator_price is not None and selected_operator_price <= (self.target_price + self.PRICE_COMPARE_EPSILON):
+            candidate_prices.append(selected_operator_price)
+        normalized_prices = sorted({round(float(price), 6) for price in candidate_prices})
+        return normalized_prices
+
     def acquire_number(self, *, proxy: str = "") -> Dict[str, Any]:
         last_error = ""
         selection = self.resolve_country_and_operator(proxy=proxy)
@@ -912,6 +938,9 @@ class HeroSMSProvider(SMSProvider):
             item for item in price_tier_options
             if self._parse_number(item.get("price")) is not None
         ]
+        exact_ceiling_candidates = self._resolve_ceiling_price_candidates(selection)
+        exact_ceiling_mode = bool(self.target_price is not None and not self.fixed_price and exact_ceiling_candidates)
+        exact_ceiling_index = 0
         auto_price_index = 0
         auto_price_floor = None
         expected_price = self.target_price
@@ -919,6 +948,8 @@ class HeroSMSProvider(SMSProvider):
             expected_price = self._parse_number(selection.get("selected_operator_price"))
         if expected_price is None:
             expected_price = self._parse_number(selection.get("aggregate_price"))
+        if exact_ceiling_mode:
+            expected_price = exact_ceiling_candidates[0]
         if expected_price is not None:
             auto_price_floor = expected_price
         if expected_price is not None:
@@ -941,6 +972,11 @@ class HeroSMSProvider(SMSProvider):
                     else f", target_price=${self.target_price if self.target_price is not None else '-'}"
                 )
                 + f", expected=${expected_price if expected_price is not None else '-'}"
+                + (
+                    f", ceiling_tier_index={exact_ceiling_index + 1}/{len(exact_ceiling_candidates)}"
+                    if exact_ceiling_mode
+                    else ""
+                )
                 + f", balance_before=${balance_before if balance_before is not None else '-'}"
             )
             try:
@@ -951,9 +987,11 @@ class HeroSMSProvider(SMSProvider):
                 if current_operator:
                     params["operator"] = current_operator
                 request_max_price = self.target_price if self.target_price is not None else expected_price
+                if exact_ceiling_mode and expected_price is not None:
+                    request_max_price = expected_price
                 if request_max_price is not None:
                     params["maxPrice"] = request_max_price
-                    if self.fixed_price:
+                    if self.fixed_price or exact_ceiling_mode:
                         params["fixedPrice"] = "true"
                 data = self._request("getNumberV2", proxy=proxy, **params)
             except Exception as exc:
@@ -994,7 +1032,7 @@ class HeroSMSProvider(SMSProvider):
                 if response_code == "NO_NUMBERS":
                     if current_operator and operator_was_auto_selected:
                         selected_operator = ""
-                        expected_price = (
+                        expected_price = exact_ceiling_candidates[exact_ceiling_index] if exact_ceiling_mode else (
                             self.target_price
                             if self.target_price is not None
                             else self._parse_number(selection.get("aggregate_price"))
@@ -1004,6 +1042,18 @@ class HeroSMSProvider(SMSProvider):
                             + f"new_expected=${expected_price if expected_price is not None else '-'}"
                         )
                         last_error = "HeroSMS 自动选择的运营商当前无号，已回退到国家聚合池重试取号"
+                        time.sleep(1.0)
+                        continue
+                    if exact_ceiling_mode and exact_ceiling_index + 1 < len(exact_ceiling_candidates):
+                        exact_ceiling_index += 1
+                        expected_price = exact_ceiling_candidates[exact_ceiling_index]
+                        last_error = (
+                            "HeroSMS 上限模式当前最低档无号，已切到上限内下一档继续尝试: "
+                            + f"country={selected_country_id}, service={self.service}, next_expected=${expected_price}"
+                        )
+                        debug_events.append(
+                            f"attempt={attempt}, fallback=next_ceiling_tier, new_expected=${expected_price}, tier_index={exact_ceiling_index}"
+                        )
                         time.sleep(1.0)
                         continue
                     if self.target_price is None and auto_price_index + 1 < len(auto_price_candidates):
