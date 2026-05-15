@@ -62,6 +62,7 @@ const state = {
 };
 
 let suppressHeroSmsPriceTierChange = false;
+let suppressHeroSmsPriceTierChangeReleaseTimer = null;
 let lastManualHeroSmsTargetPrice = '';
 
 function restoreHeroSmsTargetPrice(value = '') {
@@ -69,6 +70,23 @@ function restoreHeroSmsTargetPrice(value = '') {
   const normalizedValue = String(value || '').trim();
   if (DOM.heroSmsTargetPrice.value.trim() === normalizedValue) return;
   DOM.heroSmsTargetPrice.value = normalizedValue;
+}
+
+function restoreHeroSmsTargetPriceLater(value = '', delayMs = 0) {
+  window.setTimeout(() => {
+    restoreHeroSmsTargetPrice(value);
+  }, Math.max(0, delayMs));
+}
+
+function beginSuppressHeroSmsPriceTierChange(durationMs = 300) {
+  suppressHeroSmsPriceTierChange = true;
+  if (suppressHeroSmsPriceTierChangeReleaseTimer) {
+    window.clearTimeout(suppressHeroSmsPriceTierChangeReleaseTimer);
+  }
+  suppressHeroSmsPriceTierChangeReleaseTimer = window.setTimeout(() => {
+    suppressHeroSmsPriceTierChange = false;
+    suppressHeroSmsPriceTierChangeReleaseTimer = null;
+  }, Math.max(50, durationMs));
 }
 
 // ==========================================
@@ -365,6 +383,8 @@ document.addEventListener('DOMContentLoaded', () => {
           DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '',
         ).finally(() => {
           restoreHeroSmsTargetPrice(currentTargetPrice);
+          restoreHeroSmsTargetPriceLater(currentTargetPrice, 80);
+          restoreHeroSmsTargetPriceLater(currentTargetPrice, 220);
         });
       });
     });
@@ -378,6 +398,8 @@ document.addEventListener('DOMContentLoaded', () => {
         DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '',
       ).finally(() => {
         restoreHeroSmsTargetPrice(currentTargetPrice);
+        restoreHeroSmsTargetPriceLater(currentTargetPrice, 80);
+        restoreHeroSmsTargetPriceLater(currentTargetPrice, 220);
       });
     });
   }
@@ -926,7 +948,7 @@ function renderHeroSmsPriceTierOptions(rows, selectedPrice = '') {
   if (!DOM.heroSmsPriceTierSelect) return;
   const list = Array.isArray(rows) ? rows : [];
   const normalizedSelected = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
-  suppressHeroSmsPriceTierChange = true;
+  beginSuppressHeroSmsPriceTierChange(320);
   try {
     DOM.heroSmsPriceTierSelect.innerHTML = '';
     const autoOption = document.createElement('option');
@@ -957,9 +979,7 @@ function renderHeroSmsPriceTierOptions(rows, selectedPrice = '') {
     }
 
     DOM.heroSmsPriceTierSelect.value = normalizedSelected || '';
-  } finally {
-    suppressHeroSmsPriceTierChange = false;
-  }
+  } finally {}
 }
 
 function renderHeroSmsOperatorOptions(operators, selectedValue = '') {
