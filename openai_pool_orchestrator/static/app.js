@@ -347,9 +347,13 @@ document.addEventListener('DOMContentLoaded', () => {
     DOM.heroSmsCountry.addEventListener('change', () => {
       DOM.heroSmsCountry.dataset.selectedValue = DOM.heroSmsCountry.value || '';
       if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = '';
-      if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = '';
+      const currentTargetPrice = DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '';
       loadHeroSmsOperators(DOM.heroSmsCountry.value, '').then(() => {
-        loadHeroSmsPriceTiers(DOM.heroSmsCountry.value, '', DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '');
+        loadHeroSmsPriceTiers(
+          DOM.heroSmsCountry.value,
+          currentTargetPrice,
+          DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '',
+        );
       });
     });
   }
