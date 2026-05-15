@@ -79,6 +79,21 @@ def _normalize_proxy_url(proxy: str) -> str:
     return ""
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
 class SMSProvider(ABC):
     @abstractmethod
     def acquire_number(self, *, proxy: str = "") -> Dict[str, Any]:
@@ -139,7 +154,7 @@ class HeroSMSProvider(SMSProvider):
         self.operator = str(operator or "").strip()
         self.target_price_raw = str(target_price or "").strip()
         self.target_price = self._parse_number(self.target_price_raw)
-        self.fixed_price = bool(fixed_price) and self.target_price is not None
+        self.fixed_price = _as_bool(fixed_price, default=True) and self.target_price is not None
         try:
             self.max_acquire_retries = max(1, int(max_acquire_retries or 5))
         except (TypeError, ValueError):
@@ -1312,7 +1327,7 @@ def create_sms_provider_from_browser_config(browser_config: Optional[Dict[str, A
         country=cfg.get("hero_sms_country") or 16,
         operator=str(cfg.get("hero_sms_operator") or "").strip(),
         target_price=cfg.get("hero_sms_target_price") or "",
-        fixed_price=bool(cfg.get("hero_sms_fixed_price", True)),
+        fixed_price=_as_bool(cfg.get("hero_sms_fixed_price", True), default=True),
         max_acquire_retries=cfg.get("hero_sms_max_acquire_retries") or 5,
     )
 

@@ -2831,7 +2831,7 @@ async def api_set_browser_config(req: BrowserConfigRequest) -> Dict[str, Any]:
         "hero_sms_country": max(1, int(req.hero_sms_country or 16)),
         "hero_sms_operator": req.hero_sms_operator.strip(),
         "hero_sms_target_price": req.hero_sms_target_price.strip(),
-        "hero_sms_fixed_price": bool(req.hero_sms_fixed_price),
+        "hero_sms_fixed_price": _as_bool(req.hero_sms_fixed_price, default=True),
         "hero_sms_max_acquire_retries": max(1, min(int(req.hero_sms_max_acquire_retries or 5), 20)),
     })
     cfg.pop("manual_v2_test_phone", None)
@@ -3035,7 +3035,7 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
         "hero_sms_country": max(1, int(req.hero_sms_country or 16)),
         "hero_sms_operator": req.hero_sms_operator.strip(),
         "hero_sms_target_price": req.hero_sms_target_price.strip(),
-        "hero_sms_fixed_price": bool(req.hero_sms_fixed_price),
+        "hero_sms_fixed_price": _as_bool(req.hero_sms_fixed_price, default=True),
         "hero_sms_max_acquire_retries": max(1, min(int(req.hero_sms_max_acquire_retries or 5), 20)),
     })
     cfg.pop("manual_v2_test_phone", None)

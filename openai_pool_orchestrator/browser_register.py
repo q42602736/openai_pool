@@ -68,6 +68,21 @@ _PAGE_SNAPSHOT_CACHE_LOCK = threading.Lock()
 _PAGE_SNAPSHOT_CACHE: dict[int, tuple[float, str, str]] = {}
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
 class BrowserPhoneVerificationRequiredError(RuntimeError):
     """浏览器流程进入手机号验证页。"""
 
@@ -291,7 +306,7 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
     phone_mode = str(source.get("browser_manual_v2_phone_mode") or "manual").strip().lower() or "manual"
     if phone_mode not in {"manual", "hero_sms"}:
         phone_mode = "manual"
-    manual_restart_on_enter_password = bool(source.get("browser_manual_v2_manual_restart_on_enter_password", False))
+    manual_restart_on_enter_password = _as_bool(source.get("browser_manual_v2_manual_restart_on_enter_password", False), default=False)
     hero_sms_api_key = str(source.get("hero_sms_api_key") or "").strip()
     hero_sms_service = str(source.get("hero_sms_service") or "").strip()
     try:
@@ -300,7 +315,7 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
         hero_sms_country = 16
     hero_sms_operator = str(source.get("hero_sms_operator") or "").strip()
     hero_sms_target_price = str(source.get("hero_sms_target_price") or "").strip()
-    hero_sms_fixed_price = bool(source.get("hero_sms_fixed_price", True))
+    hero_sms_fixed_price = _as_bool(source.get("hero_sms_fixed_price", True), default=True)
     try:
         hero_sms_max_acquire_retries = max(1, min(int(source.get("hero_sms_max_acquire_retries") or 5), 20))
     except (TypeError, ValueError):
@@ -312,15 +327,15 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
 
     return {
         "register_mode": register_mode,
-        "browser_headless": False if register_mode == "browser_manual" else bool(source.get("browser_headless", True)),
+        "browser_headless": False if register_mode == "browser_manual" else _as_bool(source.get("browser_headless", True), default=True),
         "browser_timeout_ms": timeout_ms,
         "browser_slow_mo_ms": slow_mo_ms,
         "browser_executable_path": executable_path,
         "browser_locale": locale,
         "browser_timezone": timezone_id,
-        "browser_block_media": bool(source.get("browser_block_media", True)),
-        "browser_realistic_profile": bool(source.get("browser_realistic_profile", False)),
-        "browser_clear_runtime_state": bool(source.get("browser_clear_runtime_state", True)),
+        "browser_block_media": _as_bool(source.get("browser_block_media", True), default=True),
+        "browser_realistic_profile": _as_bool(source.get("browser_realistic_profile", False), default=False),
+        "browser_clear_runtime_state": _as_bool(source.get("browser_clear_runtime_state", True), default=True),
         "browser_manual_v2_phone_mode": phone_mode,
         "browser_manual_v2_manual_restart_on_enter_password": manual_restart_on_enter_password,
         "hero_sms_api_key": hero_sms_api_key,
@@ -330,8 +345,9 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
         "hero_sms_target_price": hero_sms_target_price,
         "hero_sms_fixed_price": hero_sms_fixed_price,
         "hero_sms_max_acquire_retries": hero_sms_max_acquire_retries,
-        "browser_keep_open_on_error": bool(
-            raw_keep_open if raw_keep_open is not None else (not bool(source.get("browser_headless", True)))
+        "browser_keep_open_on_error": _as_bool(
+            raw_keep_open if raw_keep_open is not None else (not _as_bool(source.get("browser_headless", True), default=True)),
+            default=False,
         ),
     }
 
