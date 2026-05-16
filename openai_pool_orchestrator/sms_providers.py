@@ -96,7 +96,12 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 
 class SMSProvider(ABC):
     @abstractmethod
-    def acquire_number(self, *, proxy: str = "") -> Dict[str, Any]:
+    def acquire_number(
+        self,
+        *,
+        proxy: str = "",
+        stop_event: Optional[threading.Event] = None,
+    ) -> Dict[str, Any]:
         """返回至少包含 activation_id / phone_number 的字典。"""
 
     @abstractmethod
@@ -124,9 +129,26 @@ class SMSProvider(ABC):
     def get_balance(self, *, proxy: str = "") -> Optional[float]:
         return None
 
+    def peek_code(self, activation_id: str, *, proxy: str = "") -> str:
+        return ""
+
 
 class HeroSMSAcquireRetryableError(RuntimeError):
     """HeroSMS 当前轮无号，可在当前流程内继续重试。"""
+
+
+class HeroSMSAcquireStoppedError(RuntimeError):
+    """HeroSMS 取号过程中收到停止请求，当前流程应立即收尾。"""
+
+
+def _interruptible_sleep(seconds: float, stop_event: Optional[threading.Event] = None) -> bool:
+    duration = max(0.0, float(seconds or 0.0))
+    if duration <= 0:
+        return bool(stop_event and stop_event.is_set())
+    if stop_event is None:
+        time.sleep(duration)
+        return False
+    return bool(stop_event.wait(duration))
 
 
 class HeroSMSProvider(SMSProvider):
@@ -930,7 +952,12 @@ class HeroSMSProvider(SMSProvider):
         normalized_prices = sorted({round(float(price), 6) for price in candidate_prices})
         return normalized_prices
 
-    def acquire_number(self, *, proxy: str = "") -> Dict[str, Any]:
+    def acquire_number(
+        self,
+        *,
+        proxy: str = "",
+        stop_event: Optional[threading.Event] = None,
+    ) -> Dict[str, Any]:
         last_error = ""
         selection = self.resolve_country_and_operator(proxy=proxy)
         self._ensure_fixed_price_matches_known_tier(selection)
@@ -985,6 +1012,8 @@ class HeroSMSProvider(SMSProvider):
             return " | ".join(part for part in parts if part)
 
         for attempt in range(1, self.max_acquire_retries + 1):
+            if stop_event is not None and stop_event.is_set():
+                raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
             current_operator = selected_operator
             debug_events.append(
                 "attempt="
@@ -1027,7 +1056,8 @@ class HeroSMSProvider(SMSProvider):
                 last_error = f"HeroSMS API 请求失败: {exc}"
                 debug_events.append(f"attempt={attempt}, request_error={exc}")
                 if attempt < self.max_acquire_retries:
-                    time.sleep(5.0)
+                    if _interruptible_sleep(5.0, stop_event):
+                        raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止") from exc
                     continue
                 raise RuntimeError(last_error) from exc
 
@@ -1071,7 +1101,8 @@ class HeroSMSProvider(SMSProvider):
                             + f"new_expected=${expected_price if expected_price is not None else '-'}"
                         )
                         last_error = "HeroSMS 自动选择的运营商当前无号，已回退到国家聚合池重试取号"
-                        time.sleep(1.0)
+                        if _interruptible_sleep(1.0, stop_event):
+                            raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
                         continue
                     if exact_ceiling_mode and exact_ceiling_index + 1 < len(exact_ceiling_candidates):
                         exact_ceiling_index += 1
@@ -1083,7 +1114,8 @@ class HeroSMSProvider(SMSProvider):
                         debug_events.append(
                             f"attempt={attempt}, fallback=next_ceiling_tier, new_expected=${expected_price}, tier_index={exact_ceiling_index}"
                         )
-                        time.sleep(1.0)
+                        if _interruptible_sleep(1.0, stop_event):
+                            raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
                         continue
                     if self.target_price is None and auto_price_index + 1 < len(auto_price_candidates):
                         auto_price_index += 1
@@ -1112,7 +1144,8 @@ class HeroSMSProvider(SMSProvider):
                             debug_events.append(
                                 f"attempt={attempt}, fallback=next_price_tier, new_expected=${expected_price}, tier_index={auto_price_index}"
                             )
-                            time.sleep(1.0)
+                            if _interruptible_sleep(1.0, stop_event):
+                                raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
                             continue
                     if self.target_price is not None:
                         last_error = (
@@ -1128,7 +1161,8 @@ class HeroSMSProvider(SMSProvider):
                             + f"country={selected_country_id}, service={self.service}"
                         )
                     if attempt < self.max_acquire_retries:
-                        time.sleep(3.0)
+                        if _interruptible_sleep(3.0, stop_event):
+                            raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
                         continue
                     raise HeroSMSAcquireRetryableError(_build_failure_message(last_error + "（重试耗尽）"))
                 raise RuntimeError(f"HeroSMS 获取号码失败: {data}")
@@ -1167,7 +1201,8 @@ class HeroSMSProvider(SMSProvider):
                     except Exception:
                         pass
                     if attempt < self.max_acquire_retries:
-                        time.sleep(2.0)
+                        if _interruptible_sleep(2.0, stop_event):
+                            raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
                         continue
                     raise RuntimeError(last_error)
             if not phone_number.startswith("+"):
@@ -1251,14 +1286,31 @@ class HeroSMSProvider(SMSProvider):
             try:
                 status = self._get_status(activation, proxy=proxy)
             except Exception:
-                time.sleep(interval)
+                if _interruptible_sleep(interval, stop_event):
+                    return ""
                 continue
             if status.get("cancelled"):
                 return ""
             code = str(status.get("code") or "").strip()
             if status.get("received") and code:
                 return code
-            time.sleep(interval)
+            if _interruptible_sleep(interval, stop_event):
+                return ""
+        return ""
+
+    def peek_code(self, activation_id: str, *, proxy: str = "") -> str:
+        activation = str(activation_id or "").strip()
+        if not activation:
+            return ""
+        try:
+            status = self._get_status(activation, proxy=proxy)
+        except Exception:
+            return ""
+        if status.get("cancelled"):
+            return ""
+        code = str(status.get("code") or "").strip()
+        if status.get("received") and code:
+            return code
         return ""
 
     def complete(self, activation_id: str, *, proxy: str = "") -> None:

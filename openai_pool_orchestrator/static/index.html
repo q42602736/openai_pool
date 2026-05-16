@@ -156,124 +156,132 @@
               <span>浏览器注册配置</span>
             </div>
             <div class="sidebar-browser-config">
-              <div class="config-row">
-                <div class="config-field" style="flex:1;max-width:220px;">
-                  <label>注册模式</label>
-                  <select id="registerMode">
-                    <option value="browser">浏览器自动化</option>
-                    <option value="browser_manual">浏览器手动验证</option>
-                    <option value="browser_manual_v2">浏览器模式2（手机注册）</option>
-                    <option value="protocol">协议模式</option>
-                  </select>
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label class="ios-toggle-label" for="browserVisible">
-                    <span class="ios-toggle ios-toggle-sm">
-                      <input type="checkbox" id="browserVisible" />
-                      <span class="toggle-track"></span>
-                    </span>
-                    <span>显示浏览器窗口</span>
-                  </label>
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label class="ios-toggle-label" for="browserBlockMedia">
-                    <span class="ios-toggle ios-toggle-sm">
-                      <input type="checkbox" id="browserBlockMedia" checked />
-                      <span class="toggle-track"></span>
-                    </span>
-                    <span>阻止图片/字体资源</span>
-                  </label>
-                </div>
-              </div>
-              <div class="config-row">
-                <div class="config-field" style="flex:1;">
-                  <label>超时(ms)</label>
-                  <input type="number" id="browserTimeoutMs" value="90000" min="15000" max="300000" />
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label>慢动作(ms)</label>
-                  <input type="number" id="browserSlowMoMs" value="0" min="0" max="5000" />
-                </div>
-              </div>
-              <div class="config-row">
-                <div class="config-field" style="flex:1;max-width:220px;">
-                  <label>模式2手机号来源</label>
-                  <select id="browserManualV2PhoneMode">
-                    <option value="manual">人工输入</option>
-                    <option value="hero_sms">HeroSMS 全自动</option>
-                  </select>
-                </div>
-                <div class="config-field" style="flex:1;max-width:260px;">
-                  <label>人工模式老号处理</label>
-                  <select id="browserManualV2ManualRestartOnEnterPassword">
-                    <option value="false">关闭：沿用当前逻辑</option>
-                    <option value="true">开启：命中 Enter your password 直接重来</option>
-                  </select>
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label>HeroSMS API Key</label>
-                  <input type="password" id="heroSmsApiKey" value="" autocomplete="off" />
+              <div class="sidebar-config-card">
+                <div class="sidebar-config-card-title">基础配置</div>
+                <div class="sidebar-config-grid">
+                  <div class="config-field span-2">
+                    <label>注册模式</label>
+                    <select id="registerMode">
+                      <option value="browser">浏览器自动化</option>
+                      <option value="browser_manual">浏览器手动验证</option>
+                      <option value="browser_manual_v2">浏览器模式2（手机注册）</option>
+                      <option value="protocol">协议模式</option>
+                    </select>
+                  </div>
+                  <div class="config-field">
+                    <label>模式2手机号来源</label>
+                    <select id="browserManualV2PhoneMode">
+                      <option value="manual">人工输入</option>
+                      <option value="hero_sms">HeroSMS 全自动</option>
+                    </select>
+                  </div>
+                  <div class="config-field">
+                    <label>超时(ms)</label>
+                    <input type="number" id="browserTimeoutMs" value="90000" min="15000" max="300000" />
+                  </div>
+                  <div class="config-field">
+                    <label>慢动作(ms)</label>
+                    <input type="number" id="browserSlowMoMs" value="0" min="0" max="5000" />
+                  </div>
+                  <div class="config-field span-2 config-field-toggle-group">
+                    <div class="config-mini-label">浏览器行为</div>
+                    <div class="sidebar-toggle-grid">
+                      <label class="sidebar-toggle-chip" for="browserVisible">
+                        <span class="ios-toggle ios-toggle-sm">
+                          <input type="checkbox" id="browserVisible" />
+                          <span class="toggle-track"></span>
+                        </span>
+                        <span>显示浏览器窗口</span>
+                      </label>
+                      <label class="sidebar-toggle-chip" for="browserBlockMedia">
+                        <span class="ios-toggle ios-toggle-sm">
+                          <input type="checkbox" id="browserBlockMedia" checked />
+                          <span class="toggle-track"></span>
+                        </span>
+                        <span>阻止图片/字体资源</span>
+                      </label>
+                    </div>
+                  </div>
                 </div>
               </div>
-              <div class="config-row">
-                <div class="config-field" style="flex:1;">
-                  <label>HeroSMS 业务代码</label>
-                  <input type="text" id="heroSmsService" value="" autocomplete="off" spellcheck="false" placeholder="必须手动填写，例如 dr；只有确认后再填" />
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label>HeroSMS 固定国家</label>
-                  <select id="heroSmsCountry">
-                    <option value="16">英国 (+44) · ID 16</option>
-                  </select>
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label>HeroSMS 运营商</label>
-                  <select id="heroSmsOperator">
-                    <option value="">自动/不指定</option>
-                  </select>
-                </div>
-              </div>
-              <div class="config-row">
-                <div class="config-field" style="flex:1;">
-                  <label>HeroSMS 价格档位</label>
-                  <select id="heroSmsPriceTierSelect">
-                    <option value="">自动最低价</option>
-                  </select>
-                  <div id="heroSmsPriceTierList" class="config-hint" style="margin-top:6px;">价格档加载后会显示在这里。</div>
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label>HeroSMS 目标价 / 上限价</label>
-                  <input type="text" id="heroSmsTargetPrice" value="" autocomplete="off" spellcheck="false" placeholder="留空=自动最低价；填 0.04 并选“只作价格上限”=仅取 <=0.04 的号码" />
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label>取号重试次数</label>
-                  <input type="number" id="heroSmsMaxAcquireRetries" value="5" min="1" max="20" />
-                </div>
-              </div>
-              <div class="config-row">
-                <div class="config-field" style="flex:1;max-width:220px;">
-                  <label>价格模式</label>
-                  <select id="heroSmsFixedPrice">
-                    <option value="true">严格锁定选中价位</option>
-                    <option value="false">只作价格上限（不超过目标价）</option>
-                  </select>
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label>Locale</label>
-                  <input type="text" id="browserLocale" value="en-US" autocomplete="off" spellcheck="false" />
-                </div>
-                <div class="config-field" style="flex:1;">
-                  <label>Timezone</label>
-                  <input type="text" id="browserTimezone" value="America/New_York" autocomplete="off" spellcheck="false" />
+
+              <div class="sidebar-config-card">
+                <div class="sidebar-config-card-title">HeroSMS 配置</div>
+                <div class="sidebar-config-grid">
+                  <div class="config-field">
+                    <label>固定国家</label>
+                    <select id="heroSmsCountry">
+                      <option value="16">英国 (+44) · ID 16</option>
+                    </select>
+                  </div>
+                  <div class="config-field">
+                    <label>运营商</label>
+                    <select id="heroSmsOperator">
+                      <option value="">自动/不指定</option>
+                    </select>
+                  </div>
+                  <div class="config-field span-2">
+                    <label>价格档位</label>
+                    <select id="heroSmsPriceTierSelect">
+                      <option value="">自动最低价</option>
+                    </select>
+                    <div id="heroSmsPriceTierList" class="config-hint"></div>
+                  </div>
+                  <div class="config-field">
+                    <label>目标价 / 上限价</label>
+                    <input type="text" id="heroSmsTargetPrice" value="" autocomplete="off" spellcheck="false" placeholder="如 0.04" />
+                  </div>
+                  <div class="config-field">
+                    <label>价格模式</label>
+                    <select id="heroSmsFixedPrice">
+                      <option value="true">严格锁定选中价位</option>
+                      <option value="false">只作价格上限（不超过目标价）</option>
+                    </select>
+                  </div>
+                  <div class="config-field">
+                    <label>取号重试次数</label>
+                    <input type="number" id="heroSmsMaxAcquireRetries" value="5" min="1" max="20" />
+                  </div>
                 </div>
               </div>
-              <div class="config-field">
-                <label>浏览器可执行文件路径（可选）</label>
-                <input type="text" id="browserExecutablePath" value="" autocomplete="off" spellcheck="false" placeholder="/path/to/chrome 或留空自动探测本机 Chrome" />
-                <div class="config-hint" style="margin-top:0;">
-                  模式2支持人工输入，也支持 HeroSMS 全自动接码。这里的改动在点击“保存浏览器配置”后立即生效，启动任务前也会自动同步一次。
+
+              <details class="sidebar-config-disclosure">
+                <summary>高级选项</summary>
+                <div class="sidebar-config-card sidebar-config-card-plain">
+                  <div class="sidebar-config-grid">
+                    <div class="config-field span-2">
+                      <label>HeroSMS API Key</label>
+                      <input type="password" id="heroSmsApiKey" value="" autocomplete="off" />
+                    </div>
+                    <div class="config-field">
+                      <label>HeroSMS 业务代码</label>
+                      <input type="text" id="heroSmsService" value="" autocomplete="off" spellcheck="false" placeholder="例如 dr" />
+                    </div>
+                    <div class="config-field">
+                      <label>人工模式老号处理</label>
+                      <select id="browserManualV2ManualRestartOnEnterPassword">
+                        <option value="false">关闭：沿用当前逻辑</option>
+                        <option value="true">开启：命中 Enter your password 直接重来</option>
+                      </select>
+                    </div>
+                    <div class="config-field">
+                      <label>Locale</label>
+                      <input type="text" id="browserLocale" value="en-US" autocomplete="off" spellcheck="false" />
+                    </div>
+                    <div class="config-field">
+                      <label>Timezone</label>
+                      <input type="text" id="browserTimezone" value="America/New_York" autocomplete="off" spellcheck="false" />
+                    </div>
+                    <div class="config-field span-2">
+                      <label>浏览器可执行文件路径（可选）</label>
+                      <input type="text" id="browserExecutablePath" value="" autocomplete="off" spellcheck="false" placeholder="/path/to/chrome 或留空自动探测本机 Chrome" />
+                    </div>
+                  </div>
+                  <div class="config-hint">
+                    模式2支持人工输入，也支持 HeroSMS 全自动接码。这里的改动在点击“保存浏览器配置”后立即生效，启动任务前也会自动同步一次。
+                  </div>
                 </div>
-              </div>
+              </details>
               <div class="config-actions" style="margin-top:12px;">
                 <button id="saveBrowserConfigBtn" class="btn btn-primary btn-sm">保存浏览器配置</button>
                 <span id="browserConfigStatus" class="inline-status"></span>

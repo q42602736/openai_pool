@@ -933,21 +933,7 @@ function formatHeroSmsPriceTierLabel(item) {
 
 function renderHeroSmsPriceTierList(rows, selectedPrice = '') {
   if (!DOM.heroSmsPriceTierList) return;
-  const list = Array.isArray(rows) ? rows : [];
-  if (!list.length) {
-    DOM.heroSmsPriceTierList.textContent = '当前国家未返回可解析价格档；留空时会按接口可用最低价尝试取号，填写目标价并选择上限模式后只会取不超过该价格的号码。';
-    return;
-  }
-  const normalizedSelected = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
-  const topRows = list.slice(0, 8).map((item) => {
-    const priceText = item && item.price !== null && item.price !== undefined ? String(item.price) : '';
-    const picked = normalizedSelected && priceText === normalizedSelected;
-    return `${picked ? '[当前]' : '[可选]'} ${formatHeroSmsPriceTierLabel(item)}`;
-  });
-  const hasOnlyOperatorAggregate = list.every((item) => String(item && item.source || '') === 'operator');
-  DOM.heroSmsPriceTierList.textContent = hasOnlyOperatorAggregate
-    ? `当前运营商接口仅返回聚合报价: ${topRows.join(' | ')}`
-    : topRows.join(' | ');
+  DOM.heroSmsPriceTierList.textContent = '';
 }
 
 function renderHeroSmsPriceTierOptions(rows, selectedPrice = '') {
