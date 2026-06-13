@@ -2104,6 +2104,8 @@ def run(
     browser_config: Optional[Dict[str, Any]] = None,
     browser_manual_phone_input_func: Optional[Callable[..., str]] = None,
     browser_manual_sms_code_input_func: Optional[Callable[..., str]] = None,
+    browser_manual_email_input_func: Optional[Callable[..., str]] = None,
+    browser_manual_email_code_input_func: Optional[Callable[..., str]] = None,
 ) -> Optional[str]:
     try:
         from .sentinel_runtime import SentinelRuntime
@@ -2132,6 +2134,10 @@ def run(
         else raw_timezone
     )
     register_mode_value = str(normalized_browser_config.get("register_mode") or "browser").strip().lower()
+    manual_v2_manual_email_mode = (
+        register_mode_value == "browser_manual_v2"
+        and str(normalized_browser_config.get("browser_manual_v2_email_mode") or "auto").strip().lower() == "manual"
+    )
     fingerprint_profile = generate_fingerprint_profile(
         locale_override=locale_override,
         timezone_override=timezone_override,
@@ -2143,12 +2149,17 @@ def run(
     emitter.info(f"本次请求指纹: {describe_fingerprint(fingerprint_profile)}", step="oauth_init")
     browser_mode = register_mode_value in ("browser", "browser_manual", "browser_manual_v2")
     sms_provider = create_sms_provider_from_browser_config(normalized_browser_config) if browser_mode else None
+    auto_sms_mode = str(normalized_browser_config.get("browser_manual_v2_phone_mode") or "").strip().lower()
     if (
         register_mode_value == "browser_manual_v2"
-        and str(normalized_browser_config.get("browser_manual_v2_phone_mode") or "").strip().lower() == "hero_sms"
+        and auto_sms_mode in ("hero_sms", "smsbower")
         and sms_provider is None
     ):
-        emitter.warn("浏览器模式2 已配置为 HeroSMS 全自动，但当前缺少有效的 HeroSMS API Key 或业务代码，运行时将无法自动取号。", step="oauth_init")
+        provider_label = "HeroSMS" if auto_sms_mode == "hero_sms" else "SMSBower"
+        emitter.warn(
+            f"浏览器模式2 已配置为 {provider_label} 全自动，但当前缺少有效的 API Key 或业务代码，运行时将无法自动取号。",
+            step="oauth_init",
+        )
     verbose_auth_logs = str(os.getenv("OPENAI_POOL_VERBOSE_AUTH_LOGS") or "").strip().lower() in ("1", "true", "yes", "on")
 
     static_proxy = _normalize_proxy_value(proxy)
@@ -4072,34 +4083,44 @@ def run(
             return None
 
         # ------- 步骤2：创建临时邮箱 -------
-        if mail_provider is not None:
-            emitter.info("正在创建临时邮箱...", step="create_email")
-            try:
-                if browser_mode:
-                    email, dev_token = mail_provider.create_mailbox(
-                        proxy=selected_browser_proxy,
-                        proxy_selector=None,
-                    )
-                else:
-                    email, dev_token = mail_provider.create_mailbox(
-                        proxy=static_proxy,
-                        proxy_selector=mail_proxy_selector,
-                    )
-            except TypeError:
-                email, dev_token = mail_provider.create_mailbox(
-                    proxy=selected_browser_proxy if browser_mode else static_proxy
-                )
-        else:
-            emitter.info("正在创建 Mail.tm 临时邮箱...", step="create_email")
-            email, dev_token = get_email_and_token(
-                selected_browser_proxies if browser_mode else static_proxies,
-                emitter,
-                proxy_selector=None if browser_mode else mail_proxies_selector,
+        effective_mail_provider = mail_provider
+        if browser_mode and manual_v2_manual_email_mode:
+            email = ""
+            dev_token = ""
+            effective_mail_provider = None
+            emitter.info(
+                "浏览器模式2 当前邮箱来源为手动输入，已跳过后台临时邮箱创建；后续会在 add-email / email-verification 阶段由你手动输入邮箱和邮箱验证码。",
+                step="create_email",
             )
-        if not email or not dev_token:
-            emitter.error("临时邮箱创建失败", step="create_email")
-            return None
-        emitter.success(f"临时邮箱创建成功: {email}", step="create_email")
+        else:
+            if mail_provider is not None:
+                emitter.info("正在创建临时邮箱...", step="create_email")
+                try:
+                    if browser_mode:
+                        email, dev_token = mail_provider.create_mailbox(
+                            proxy=selected_browser_proxy,
+                            proxy_selector=None,
+                        )
+                    else:
+                        email, dev_token = mail_provider.create_mailbox(
+                            proxy=static_proxy,
+                            proxy_selector=mail_proxy_selector,
+                        )
+                except TypeError:
+                    email, dev_token = mail_provider.create_mailbox(
+                        proxy=selected_browser_proxy if browser_mode else static_proxy
+                    )
+            else:
+                emitter.info("正在创建 Mail.tm 临时邮箱...", step="create_email")
+                email, dev_token = get_email_and_token(
+                    selected_browser_proxies if browser_mode else static_proxies,
+                    emitter,
+                    proxy_selector=None if browser_mode else mail_proxies_selector,
+                )
+            if not email or not dev_token:
+                emitter.error("临时邮箱创建失败", step="create_email")
+                return None
+            emitter.success(f"临时邮箱创建成功: {email}", step="create_email")
 
         if _stopped():
             return None
@@ -4112,7 +4133,7 @@ def run(
                     dev_token=dev_token,
                     emitter=emitter,
                     stop_event=stop_event,
-                    mail_provider=mail_provider,
+                    mail_provider=effective_mail_provider,
                     proxy=selected_browser_proxy,
                     browser_config=normalized_browser_config,
                     user_agent=fingerprint_profile.user_agent,
@@ -4136,6 +4157,8 @@ def run(
                     fallback_wait_for_otp_func=get_oai_code,
                     wait_manual_phone_input_func=browser_manual_phone_input_func,
                     wait_manual_sms_code_input_func=browser_manual_sms_code_input_func,
+                    wait_manual_email_input_func=browser_manual_email_input_func,
+                    wait_manual_email_code_input_func=browser_manual_email_code_input_func,
                     sms_provider=sms_provider,
                     random_password_func=_random_password,
                     random_profile_name_func=_random_profile_name,

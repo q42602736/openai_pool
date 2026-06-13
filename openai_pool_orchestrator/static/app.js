@@ -65,6 +65,35 @@ let suppressHeroSmsPriceTierChange = false;
 let suppressHeroSmsPriceTierChangeReleaseTimer = null;
 let lastManualHeroSmsTargetPrice = '';
 
+function getCurrentAutoSmsProviderMode() {
+  return String(DOM.browserManualV2PhoneMode?.value || 'manual').trim().toLowerCase();
+}
+
+function getCurrentHeroSmsServiceValue() {
+  const providerMode = getCurrentAutoSmsProviderMode();
+  if (providerMode === 'smsbower') {
+    return String(DOM.heroSmsServiceSelect?.value || DOM.heroSmsService?.value || '').trim();
+  }
+  return String(DOM.heroSmsService?.value || DOM.heroSmsServiceSelect?.value || '').trim();
+}
+
+function getCurrentHeroSmsCountryValue() {
+  if (!DOM.heroSmsCountry) return '16';
+  const selected = String(DOM.heroSmsCountry.dataset.selectedValue || DOM.heroSmsCountry.value || '').trim();
+  return selected || '16';
+}
+
+function isSmsBowerAutoCountrySelected(countryValue = '') {
+  return getCurrentAutoSmsProviderMode() === 'smsbower' && String(countryValue || getCurrentHeroSmsCountryValue()).trim() === '0';
+}
+
+function normalizeHeroSmsCountryForProvider(rawCountryValue = '', providerMode = getCurrentAutoSmsProviderMode()) {
+  const normalizedProviderMode = String(providerMode || 'manual').trim().toLowerCase();
+  const text = String(rawCountryValue ?? '').trim();
+  if (normalizedProviderMode !== 'smsbower' && text === '0') return '16';
+  return text || '16';
+}
+
 function restoreHeroSmsTargetPrice(value = '') {
   if (!DOM.heroSmsTargetPrice) return;
   const normalizedValue = String(value || '').trim();
@@ -157,6 +186,13 @@ const HERO_SMS_FALLBACK_COUNTRIES = [
   { hero_sms_country: 2, name: '加拿大', iso_code: 'CA', dial_code: '1' },
   { hero_sms_country: 5, name: '澳大利亚', iso_code: 'AU', dial_code: '61' },
 ];
+
+const SMSBOWER_AUTO_COUNTRY_OPTION = {
+  hero_sms_country: 0,
+  name: '自动选择国家（按价格上限）',
+  iso_code: 'AUTO',
+  dial_code: '',
+};
 
 const WORKER_STATUS_PRIORITY = {
   registering: 6,
@@ -318,9 +354,13 @@ document.addEventListener('DOMContentLoaded', () => {
     browserVisible: $('browserVisible'),
     browserBlockMedia: $('browserBlockMedia'),
     browserManualV2PhoneMode: $('browserManualV2PhoneMode'),
+    browserManualV2EmailMode: $('browserManualV2EmailMode'),
     browserManualV2ManualRestartOnEnterPassword: $('browserManualV2ManualRestartOnEnterPassword'),
     heroSmsApiKey: $('heroSmsApiKey'),
     heroSmsService: $('heroSmsService'),
+    heroSmsServiceInputWrap: $('heroSmsServiceInputWrap'),
+    heroSmsServiceSelect: $('heroSmsServiceSelect'),
+    heroSmsServiceSelectWrap: $('heroSmsServiceSelectWrap'),
     heroSmsCountry: $('heroSmsCountry'),
     heroSmsOperator: $('heroSmsOperator'),
     heroSmsPriceTierSelect: $('heroSmsPriceTierSelect'),
@@ -375,6 +415,9 @@ document.addEventListener('DOMContentLoaded', () => {
     DOM.heroSmsCountry.addEventListener('change', () => {
       DOM.heroSmsCountry.dataset.selectedValue = DOM.heroSmsCountry.value || '';
       if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = '';
+      if (isSmsBowerAutoCountrySelected()) {
+        if (DOM.heroSmsOperator) DOM.heroSmsOperator.value = '';
+      }
       const currentTargetPrice = lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
       loadHeroSmsOperators(DOM.heroSmsCountry.value, '').then(() => {
         return loadHeroSmsPriceTiers(
@@ -389,11 +432,88 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     });
   }
+  if (DOM.heroSmsServiceSelect) {
+    DOM.heroSmsServiceSelect.addEventListener('change', () => {
+      const value = DOM.heroSmsServiceSelect ? DOM.heroSmsServiceSelect.value.trim() : '';
+      if (DOM.heroSmsService) DOM.heroSmsService.value = value;
+      if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = '';
+      const currentTargetPrice = lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
+      loadHeroSmsCountries(getCurrentHeroSmsCountryValue()).then(() => {
+        return loadHeroSmsOperators(getCurrentHeroSmsCountryValue(), '').then(() => {
+          return loadHeroSmsPriceTiers(
+            getCurrentHeroSmsCountryValue(),
+            currentTargetPrice,
+            '',
+          );
+        });
+      }).finally(() => {
+        restoreHeroSmsTargetPrice(currentTargetPrice);
+        restoreHeroSmsTargetPriceLater(currentTargetPrice, 80);
+        restoreHeroSmsTargetPriceLater(currentTargetPrice, 220);
+      });
+    });
+  }
+  if (DOM.heroSmsService) {
+    DOM.heroSmsService.addEventListener('input', () => {
+      const providerMode = String(DOM.browserManualV2PhoneMode?.value || 'manual').trim().toLowerCase();
+      if (providerMode === 'smsbower') {
+        if (DOM.heroSmsService) DOM.heroSmsService.value = '';
+        return;
+      }
+      const value = DOM.heroSmsService ? DOM.heroSmsService.value.trim() : '';
+      if (DOM.heroSmsServiceSelect && DOM.heroSmsServiceSelect.value !== value) {
+        DOM.heroSmsServiceSelect.value = value;
+      }
+      if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = '';
+      const currentTargetPrice = lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
+      loadHeroSmsOperators(getCurrentHeroSmsCountryValue(), '').then(() => {
+        return loadHeroSmsPriceTiers(
+          getCurrentHeroSmsCountryValue(),
+          currentTargetPrice,
+          '',
+        ).finally(() => {
+          restoreHeroSmsTargetPrice(currentTargetPrice);
+          restoreHeroSmsTargetPriceLater(currentTargetPrice, 80);
+          restoreHeroSmsTargetPriceLater(currentTargetPrice, 220);
+        });
+      });
+    });
+  }
+  if (DOM.browserManualV2PhoneMode) {
+    DOM.browserManualV2PhoneMode.addEventListener('change', () => {
+      const currentTargetPrice = lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
+      syncHeroSmsServiceFieldVisibility();
+      if (DOM.heroSmsCountry) {
+        const normalizedCountry = normalizeHeroSmsCountryForProvider(
+          DOM.heroSmsCountry.dataset.selectedValue || DOM.heroSmsCountry.value || '',
+          getCurrentAutoSmsProviderMode(),
+        );
+        DOM.heroSmsCountry.dataset.selectedValue = normalizedCountry;
+        DOM.heroSmsCountry.value = normalizedCountry;
+      }
+      loadHeroSmsServices('').then(() => {
+        if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = '';
+        return loadHeroSmsCountries(getCurrentHeroSmsCountryValue()).then(() => {
+          return loadHeroSmsOperators(getCurrentHeroSmsCountryValue(), '').then(() => {
+            return loadHeroSmsPriceTiers(
+              getCurrentHeroSmsCountryValue(),
+              currentTargetPrice,
+              '',
+            );
+          });
+        });
+      }).finally(() => {
+        restoreHeroSmsTargetPrice(currentTargetPrice);
+        restoreHeroSmsTargetPriceLater(currentTargetPrice, 80);
+        restoreHeroSmsTargetPriceLater(currentTargetPrice, 220);
+      });
+    });
+  }
   if (DOM.heroSmsOperator) {
     DOM.heroSmsOperator.addEventListener('change', () => {
       const currentTargetPrice = lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
       loadHeroSmsPriceTiers(
-        DOM.heroSmsCountry ? DOM.heroSmsCountry.value : '16',
+        getCurrentHeroSmsCountryValue(),
         currentTargetPrice,
         DOM.heroSmsOperator ? DOM.heroSmsOperator.value : '',
       ).finally(() => {
@@ -912,7 +1032,8 @@ function formatHeroSmsCountryLabel(item) {
   const name = (item && item.name) || '未知国家';
   const iso = (item && item.iso_code) || '';
   const dial = (item && item.dial_code) || '';
-  const id = (item && item.hero_sms_country) || '';
+  const id = item && item.hero_sms_country !== null && item.hero_sms_country !== undefined ? String(item.hero_sms_country) : '';
+  if (String(id) === '0') return name;
   const isoText = iso ? `${iso}` : '-';
   const dialText = dial ? `+${dial}` : '+-';
   return `${name} (${isoText} / ${dialText}) · ID ${id}`;
@@ -981,7 +1102,7 @@ function renderHeroSmsOperatorOptions(operators, selectedValue = '') {
   DOM.heroSmsOperator.innerHTML = '';
   const autoOption = document.createElement('option');
   autoOption.value = '';
-  autoOption.textContent = '自动/不指定';
+  autoOption.textContent = isSmsBowerAutoCountrySelected() ? '自动/不指定（自动国家模式下禁用）' : '自动/不指定';
   autoOption.selected = !normalizedSelected;
   DOM.heroSmsOperator.appendChild(autoOption);
   list.forEach((item) => {
@@ -997,17 +1118,24 @@ function renderHeroSmsOperatorOptions(operators, selectedValue = '') {
     option.selected = value === normalizedSelected;
     DOM.heroSmsOperator.appendChild(option);
   });
+  DOM.heroSmsOperator.disabled = isSmsBowerAutoCountrySelected();
 }
 
 function renderHeroSmsCountryOptions(countries, selectedValue) {
   if (!DOM.heroSmsCountry) return;
-  const list = Array.isArray(countries) && countries.length > 0 ? countries : HERO_SMS_FALLBACK_COUNTRIES;
+  const providerMode = getCurrentAutoSmsProviderMode();
+  const list = Array.isArray(countries) && countries.length > 0 ? countries.slice() : HERO_SMS_FALLBACK_COUNTRIES.slice();
+  if (providerMode === 'smsbower' && !list.some(item => item && item.hero_sms_country !== null && item.hero_sms_country !== undefined && String(item.hero_sms_country) === '0')) {
+    list.unshift(SMSBOWER_AUTO_COUNTRY_OPTION);
+  }
   const savedSelected = DOM.heroSmsCountry.dataset.selectedValue || '';
-  const normalizedSelected = String(selectedValue || savedSelected || DOM.heroSmsCountry.value || '16');
+  const normalizedSelected = normalizeHeroSmsCountryForProvider(String(
+    selectedValue ?? savedSelected ?? DOM.heroSmsCountry.value ?? (providerMode === 'smsbower' ? '0' : '16')
+  ).trim() || (providerMode === 'smsbower' ? '0' : '16'), providerMode);
   DOM.heroSmsCountry.innerHTML = '';
   list.forEach((item) => {
     const option = document.createElement('option');
-    option.value = String(item.hero_sms_country || '');
+    option.value = item && item.hero_sms_country !== null && item.hero_sms_country !== undefined ? String(item.hero_sms_country) : '';
     option.textContent = formatHeroSmsCountryLabel(item);
     if (option.value === normalizedSelected) option.selected = true;
     DOM.heroSmsCountry.appendChild(option);
@@ -1023,11 +1151,96 @@ function renderHeroSmsCountryOptions(countries, selectedValue) {
   DOM.heroSmsCountry.dataset.selectedValue = normalizedSelected;
 }
 
+function renderHeroSmsServiceOptions(services, selectedValue = '') {
+  if (!DOM.heroSmsServiceSelect) return;
+  const list = Array.isArray(services) ? services : [];
+  const providerMode = getCurrentAutoSmsProviderMode();
+  let normalizedSelected = String(selectedValue || getCurrentHeroSmsServiceValue()).trim();
+  DOM.heroSmsServiceSelect.innerHTML = '';
+  const autoOption = document.createElement('option');
+  autoOption.value = '';
+  autoOption.textContent = '从平台拉取服务列表后选择';
+  autoOption.selected = !normalizedSelected;
+  DOM.heroSmsServiceSelect.appendChild(autoOption);
+  let hasSelected = false;
+  list.forEach((item) => {
+    const code = String((item && item.code) || '').trim();
+    const name = String((item && item.name) || code).trim();
+    if (!code) return;
+    const option = document.createElement('option');
+    option.value = code;
+    option.textContent = `${name} (${code})`;
+    option.selected = code === normalizedSelected;
+    if (option.selected) hasSelected = true;
+    DOM.heroSmsServiceSelect.appendChild(option);
+  });
+  if (providerMode === 'smsbower' && normalizedSelected && !hasSelected) {
+    normalizedSelected = '';
+    if (DOM.heroSmsService) DOM.heroSmsService.value = '';
+  }
+  if (normalizedSelected && !hasSelected) {
+    const customOption = document.createElement('option');
+    customOption.value = normalizedSelected;
+    customOption.textContent = `手填业务代码 (${normalizedSelected})`;
+    customOption.selected = true;
+    customOption.dataset.manualPreserved = 'true';
+    DOM.heroSmsServiceSelect.appendChild(customOption);
+  }
+  DOM.heroSmsServiceSelect.value = normalizedSelected || '';
+  if (DOM.heroSmsService) DOM.heroSmsService.value = normalizedSelected || '';
+}
+
+function syncHeroSmsServiceFieldVisibility() {
+  const providerMode = getCurrentAutoSmsProviderMode();
+  const serviceInput = DOM.heroSmsService;
+  const serviceInputWrap = DOM.heroSmsServiceInputWrap;
+  const serviceSelect = DOM.heroSmsServiceSelect;
+  const serviceSelectWrap = DOM.heroSmsServiceSelectWrap;
+  if (!serviceInput || !serviceSelect) return;
+  if (providerMode === 'smsbower') {
+    serviceInput.placeholder = 'SMSBower 模式下请直接从下拉框选择服务';
+    serviceInput.setAttribute('hidden', 'hidden');
+    serviceInput.setAttribute('aria-hidden', 'true');
+    serviceInput.disabled = true;
+    if (serviceInputWrap) serviceInputWrap.hidden = true;
+    if (serviceSelectWrap) serviceSelectWrap.style.marginTop = '0';
+  } else {
+    serviceInput.placeholder = '例如 dr';
+    serviceInput.removeAttribute('hidden');
+    serviceInput.removeAttribute('aria-hidden');
+    serviceInput.disabled = false;
+    if (serviceInputWrap) serviceInputWrap.hidden = false;
+    if (serviceSelectWrap) serviceSelectWrap.style.marginTop = '8px';
+  }
+}
+
+async function loadHeroSmsServices(selectedValue = '') {
+  if (!DOM.heroSmsServiceSelect) return;
+  try {
+    const res = await fetch('/api/browser-config/hero-sms-services');
+    const data = await res.json();
+    const rows = res.ok ? (data.services || []) : [];
+    renderHeroSmsServiceOptions(rows, selectedValue);
+  } catch {
+    renderHeroSmsServiceOptions([], selectedValue);
+  }
+}
+
 async function loadHeroSmsOperators(countryValue = '', selectedOperator = '') {
   if (!DOM.heroSmsOperator) return;
-  const country = parseInt(countryValue || DOM.heroSmsCountry?.value || '16', 10) || 16;
+  const rawCountry = String(countryValue || getCurrentHeroSmsCountryValue() || '16').trim();
+  const country = parseInt(rawCountry, 10);
+  if (isSmsBowerAutoCountrySelected(rawCountry)) {
+    renderHeroSmsOperatorOptions([], '');
+    return;
+  }
+  const service = getCurrentHeroSmsServiceValue();
   try {
-    const res = await fetch(`/api/browser-config/hero-sms-operators?country=${encodeURIComponent(country)}`);
+    const query = new URLSearchParams({ country: String(country) });
+    if (service) query.set('service', service);
+    const providerMode = getCurrentAutoSmsProviderMode();
+    if (providerMode === 'hero_sms' || providerMode === 'smsbower') query.set('provider_mode', providerMode);
+    const res = await fetch(`/api/browser-config/hero-sms-operators?${query.toString()}`);
     const data = await res.json();
     const rows = res.ok ? (data.operators || []) : [];
     renderHeroSmsOperatorOptions(rows, selectedOperator);
@@ -1038,11 +1251,16 @@ async function loadHeroSmsOperators(countryValue = '', selectedOperator = '') {
 
 async function loadHeroSmsPriceTiers(countryValue = '', selectedPrice = '', operatorValue = '') {
   if (!DOM.heroSmsTargetPrice) return;
-  const country = parseInt(countryValue || DOM.heroSmsCountry?.value || '16', 10) || 16;
-  const operator = String(operatorValue || DOM.heroSmsOperator?.value || '').trim();
+  const rawCountry = String(countryValue || getCurrentHeroSmsCountryValue() || '16').trim();
+  const country = parseInt(rawCountry, 10);
+  const operator = isSmsBowerAutoCountrySelected(rawCountry) ? '' : String(operatorValue || DOM.heroSmsOperator?.value || '').trim();
+  const service = getCurrentHeroSmsServiceValue();
   try {
     const query = new URLSearchParams({ country: String(country) });
     if (operator) query.set('operator', operator);
+    if (service) query.set('service', service);
+    const providerMode = getCurrentAutoSmsProviderMode();
+    if (providerMode === 'hero_sms' || providerMode === 'smsbower') query.set('provider_mode', providerMode);
     const res = await fetch(`/api/browser-config/hero-sms-price-tiers?${query.toString()}`);
     const data = await res.json();
     const rows = res.ok ? (data.price_tiers || []) : [];
@@ -1075,7 +1293,12 @@ function getHeroSmsAvailableTierPrices() {
 async function loadHeroSmsCountries(selectedValue = '') {
   if (!DOM.heroSmsCountry) return;
   try {
-    const res = await fetch('/api/browser-config/hero-sms-countries');
+    const query = new URLSearchParams();
+    const providerMode = getCurrentAutoSmsProviderMode();
+    const service = getCurrentHeroSmsServiceValue();
+    if (providerMode === 'hero_sms' || providerMode === 'smsbower') query.set('provider_mode', providerMode);
+    if (service) query.set('service', service);
+    const res = await fetch(`/api/browser-config/hero-sms-countries?${query.toString()}`);
     const data = await res.json();
     if (!res.ok) {
       renderHeroSmsCountryOptions(HERO_SMS_FALLBACK_COUNTRIES, selectedValue);
@@ -1670,7 +1893,14 @@ async function submitWorkerManualInput(workerId, manualInput, overrideValue = nu
     showToast(
       isRestartPhone
         ? '已请求回到手机号步骤'
-        : (normalizedInput.kind === 'phone_number' ? '手机号已提交' : '验证码已提交'),
+        : ({
+          phone_number: '手机号已提交',
+          sms_code: '验证码已提交',
+          email: '邮箱已提交',
+          email_address: '邮箱已提交',
+          email_code: '邮箱验证码已提交',
+          mail_otp: '邮箱验证码已提交',
+        }[normalizedInput.kind] || '输入内容已提交'),
       'success',
     );
     if (data.worker) mergeWorkerIntoRuntime(data.worker);
@@ -1692,8 +1922,14 @@ function buildWorkerManualInputCardHtml(focusWorker) {
   const manualInputTitleMap = {
     phone_number: '人工手机号输入',
     sms_code: '人工短信验证码输入',
+    email: '人工邮箱输入',
+    email_address: '人工邮箱输入',
+    email_code: '人工邮箱验证码输入',
+    mail_otp: '人工邮箱验证码输入',
   };
   const canRestartPhone = manualInput.kind === 'sms_code';
+  const isPhoneInput = manualInput.kind === 'phone_number';
+  const isEmailInput = manualInput.kind === 'email' || manualInput.kind === 'email_address';
   return `
     <div class="worker-manual-input-card">
       <div class="worker-manual-input-head">
@@ -1705,8 +1941,8 @@ function buildWorkerManualInputCardHtml(focusWorker) {
       <div class="worker-manual-input-row">
         <input
           class="worker-manual-input-field"
-          type="${manualInput.kind === 'phone_number' ? 'tel' : 'text'}"
-          inputmode="${manualInput.kind === 'phone_number' ? 'tel' : 'numeric'}"
+          type="${isPhoneInput ? 'tel' : 'text'}"
+          inputmode="${isPhoneInput ? 'tel' : (isEmailInput ? 'email' : 'numeric')}"
           data-manual-input-key="${escapeHtml(manualInputDraftKey)}"
           data-manual-input-worker="${escapeHtml(focusWorker.worker_id)}"
           data-manual-input-kind="${escapeHtml(manualInput.kind)}"
@@ -2526,18 +2762,22 @@ async function cleanupSub2ApiDuplicates() {
 // ==========================================
 function collectBrowserConfigForm() {
   const savedHeroSmsCountry = DOM.heroSmsCountry ? DOM.heroSmsCountry.dataset.selectedValue : '';
+  const parsedHeroSmsCountry = parseInt(String(savedHeroSmsCountry || DOM.heroSmsCountry?.value || '16').trim(), 10);
   return {
     register_mode: DOM.registerMode ? DOM.registerMode.value : 'browser',
     browser_headless: DOM.browserVisible ? !DOM.browserVisible.checked : true,
-    browser_block_media: DOM.browserBlockMedia ? DOM.browserBlockMedia.checked : true,
-    browser_realistic_profile: false,
+    browser_block_media: DOM.browserBlockMedia ? DOM.browserBlockMedia.checked : false,
+    browser_realistic_profile: true,
     browser_clear_runtime_state: true,
     browser_manual_v2_phone_mode: DOM.browserManualV2PhoneMode ? DOM.browserManualV2PhoneMode.value : 'manual',
+    browser_manual_v2_email_mode: DOM.browserManualV2EmailMode ? DOM.browserManualV2EmailMode.value : 'auto',
     browser_manual_v2_manual_restart_on_enter_password: DOM.browserManualV2ManualRestartOnEnterPassword ? DOM.browserManualV2ManualRestartOnEnterPassword.value === 'true' : false,
     hero_sms_api_key: DOM.heroSmsApiKey ? DOM.heroSmsApiKey.value.trim() : '',
-    hero_sms_service: DOM.heroSmsService ? DOM.heroSmsService.value.trim() : '',
-    hero_sms_country: DOM.heroSmsCountry ? (parseInt(savedHeroSmsCountry || DOM.heroSmsCountry.value, 10) || 16) : 16,
-    hero_sms_operator: DOM.heroSmsOperator ? DOM.heroSmsOperator.value.trim() : '',
+    hero_sms_service: getCurrentHeroSmsServiceValue(),
+    hero_sms_country: Number.isNaN(parsedHeroSmsCountry) ? 16 : parsedHeroSmsCountry,
+    hero_sms_operator: DOM.heroSmsOperator && !isSmsBowerAutoCountrySelected(savedHeroSmsCountry || DOM.heroSmsCountry?.value || '')
+      ? DOM.heroSmsOperator.value.trim()
+      : '',
     hero_sms_target_price: DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '',
     hero_sms_fixed_price: DOM.heroSmsFixedPrice ? DOM.heroSmsFixedPrice.value === 'true' : true,
     hero_sms_max_acquire_retries: DOM.heroSmsMaxAcquireRetries ? (parseInt(DOM.heroSmsMaxAcquireRetries.value, 10) || 5) : 5,
@@ -2561,12 +2801,18 @@ function applyBrowserConfig(cfg) {
   }
   if (DOM.browserBlockMedia) DOM.browserBlockMedia.checked = cfg.browser_block_media !== false;
   if (DOM.browserManualV2PhoneMode) DOM.browserManualV2PhoneMode.value = cfg.browser_manual_v2_phone_mode || 'manual';
+  if (DOM.browserManualV2EmailMode) DOM.browserManualV2EmailMode.value = cfg.browser_manual_v2_email_mode || 'auto';
   if (DOM.browserManualV2ManualRestartOnEnterPassword) {
     DOM.browserManualV2ManualRestartOnEnterPassword.value = String(cfg.browser_manual_v2_manual_restart_on_enter_password === true);
   }
   if (DOM.heroSmsApiKey) DOM.heroSmsApiKey.value = cfg.hero_sms_api_key || '';
-  if (DOM.heroSmsService) DOM.heroSmsService.value = cfg.hero_sms_service || '';
-  if (DOM.heroSmsCountry) DOM.heroSmsCountry.dataset.selectedValue = String(cfg.hero_sms_country || 16);
+  if (DOM.heroSmsService) {
+    const providerMode = String(cfg.browser_manual_v2_phone_mode || 'manual').trim().toLowerCase();
+    DOM.heroSmsService.value = providerMode === 'smsbower' ? (cfg.hero_sms_service || '') : (cfg.hero_sms_service || '');
+  }
+  if (DOM.heroSmsServiceSelect) DOM.heroSmsServiceSelect.value = cfg.hero_sms_service || '';
+  syncHeroSmsServiceFieldVisibility();
+  if (DOM.heroSmsCountry) DOM.heroSmsCountry.dataset.selectedValue = String(cfg.hero_sms_country ?? 16);
   if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = cfg.hero_sms_operator || '';
   if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = cfg.hero_sms_target_price || '';
   lastManualHeroSmsTargetPrice = cfg.hero_sms_target_price || '';
@@ -2619,9 +2865,11 @@ async function loadBrowserConfig() {
     if (!res.ok) return;
     const cfg = await res.json();
     applyBrowserConfig(cfg);
-    await loadHeroSmsCountries(cfg.hero_sms_country || 16);
-    await loadHeroSmsOperators(cfg.hero_sms_country || 16, cfg.hero_sms_operator || '');
-    await loadHeroSmsPriceTiers(cfg.hero_sms_country || 16, cfg.hero_sms_target_price || '', cfg.hero_sms_operator || '');
+    await loadHeroSmsServices(cfg.hero_sms_service || '');
+    const heroSmsCountry = normalizeHeroSmsCountryForProvider(String(cfg.hero_sms_country ?? 16), getCurrentAutoSmsProviderMode());
+    await loadHeroSmsCountries(heroSmsCountry);
+    await loadHeroSmsOperators(heroSmsCountry, cfg.hero_sms_operator || '');
+    await loadHeroSmsPriceTiers(heroSmsCountry, cfg.hero_sms_target_price || '', cfg.hero_sms_operator || '');
   } catch { }
 }
 
@@ -2783,22 +3031,24 @@ async function saveBrowserConfig(options = {}) {
   const silentSuccess = !!options.silentSuccess;
   const statusText = options.statusText || '浏览器注册配置已保存';
   const payload = collectBrowserConfigForm();
-  if (payload.browser_manual_v2_phone_mode === 'hero_sms') {
+  if (payload.browser_manual_v2_phone_mode === 'hero_sms' || payload.browser_manual_v2_phone_mode === 'smsbower') {
+    const providerLabel = payload.browser_manual_v2_phone_mode === 'smsbower' ? 'SMSBower' : 'HeroSMS';
     if (!payload.hero_sms_api_key) {
-      const msg = '启用 HeroSMS 全自动时必须填写 HeroSMS API Key';
+      const msg = `启用 ${providerLabel} 全自动时必须填写平台 API Key`;
       if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
       showToast(msg, 'error');
       return false;
     }
     if (!payload.hero_sms_service) {
-      const msg = '启用 HeroSMS 全自动时必须填写 HeroSMS 业务代码';
+      const msg = `启用 ${providerLabel} 全自动时必须填写平台业务代码`;
       if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
       showToast(msg, 'error');
       return false;
     }
     if (payload.hero_sms_fixed_price && payload.hero_sms_target_price) {
       const availablePrices = getHeroSmsAvailableTierPrices();
-      if (availablePrices.length && !availablePrices.includes(payload.hero_sms_target_price)) {
+      const isPriceRange = /[-–—~]/.test(String(payload.hero_sms_target_price || ''));
+      if (!isPriceRange && !isSmsBowerAutoCountrySelected(String(payload.hero_sms_country)) && availablePrices.length && !availablePrices.includes(payload.hero_sms_target_price)) {
         const msg = `固定价模式只能选择当前真实价档，当前可选: ${availablePrices.join(', ')}；如果你要手填 ${payload.hero_sms_target_price}，请改用“只作价格上限”。`;
         if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
         showToast(msg, 'error');
@@ -2823,12 +3073,19 @@ async function saveBrowserConfig(options = {}) {
       showToast(msg, 'error');
       return false;
     }
+    const expectedManualEmailMode = payload.browser_manual_v2_email_mode || 'auto';
+    const actualManualEmailMode = data.browser_manual_v2_email_mode || 'auto';
     applyBrowserConfig(data);
     const refreshHeroSmsUi = async () => {
-      await loadHeroSmsCountries(data.hero_sms_country || payload.hero_sms_country || 16);
-      await loadHeroSmsOperators(data.hero_sms_country || payload.hero_sms_country || 16, data.hero_sms_operator || payload.hero_sms_operator || '');
+      await loadHeroSmsServices(data.hero_sms_service || payload.hero_sms_service || '');
+      const resolvedCountry = normalizeHeroSmsCountryForProvider(
+        String(data.hero_sms_country ?? payload.hero_sms_country ?? 16),
+        payload.browser_manual_v2_phone_mode,
+      );
+      await loadHeroSmsCountries(resolvedCountry);
+      await loadHeroSmsOperators(resolvedCountry, data.hero_sms_operator || payload.hero_sms_operator || '');
       await loadHeroSmsPriceTiers(
-        data.hero_sms_country || payload.hero_sms_country || 16,
+        resolvedCountry,
         data.hero_sms_target_price || payload.hero_sms_target_price || '',
         data.hero_sms_operator || payload.hero_sms_operator || '',
       );
@@ -2837,6 +3094,12 @@ async function saveBrowserConfig(options = {}) {
       void refreshHeroSmsUi();
     } else {
       await refreshHeroSmsUi();
+    }
+    if (expectedManualEmailMode !== actualManualEmailMode) {
+      const msg = '浏览器配置未完整持久化：后端当前进程还没有保存“模式2邮箱来源”这个新字段。请重启后端服务后再保存一次。';
+      if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;
+      showToast(msg, 'error');
+      return false;
     }
     const msg = statusText;
     if (DOM.browserConfigStatus) DOM.browserConfigStatus.textContent = msg;

@@ -34,7 +34,7 @@ from .mail_providers import create_provider, create_provider_by_name, MultiMailR
 from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
 from .token_compat import normalize_token_data
 from .register import generate_oauth_url, submit_callback_url, _random_password, _random_profile_name, _random_profile_birthdate
-from .sms_providers import list_hero_sms_countries, list_hero_sms_operator_quotes, list_hero_sms_price_tiers
+from .sms_providers import HANDLER_API_PROVIDER_LABELS, SMSBOWER_AUTO_COUNTRY_ID, list_handler_api_services, list_hero_sms_countries, list_hero_sms_operator_quotes, list_hero_sms_price_tiers, normalize_handler_api_country
 
 # ==========================================
 # 同步配置（内存持久化到 data/sync_config.json）
@@ -113,6 +113,20 @@ def _normalize_register_mode(value: Any) -> str:
     return register_mode
 
 
+def _normalize_browser_manual_v2_email_mode(value: Any) -> str:
+    email_mode = str(value or "auto").strip().lower()
+    if email_mode not in ("auto", "manual"):
+        email_mode = "auto"
+    return email_mode
+
+
+def _normalize_auto_sms_provider_mode(value: Any) -> str:
+    phone_mode = str(value or "manual").strip().lower()
+    if phone_mode not in ("manual", "hero_sms", "smsbower"):
+        phone_mode = "manual"
+    return phone_mode
+
+
 def _get_browser_config_snapshot(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     config = cfg if cfg is not None else _get_sync_config()
     try:
@@ -134,14 +148,19 @@ def _get_browser_config_snapshot(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
         "browser_block_media": _as_bool(config.get("browser_block_media", True), default=True),
         "browser_realistic_profile": _as_bool(config.get("browser_realistic_profile", False), default=False),
         "browser_clear_runtime_state": _as_bool(config.get("browser_clear_runtime_state", True), default=True),
-        "browser_manual_v2_phone_mode": str(config.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() or "manual",
+        "browser_manual_v2_phone_mode": _normalize_auto_sms_provider_mode(config.get("browser_manual_v2_phone_mode", "manual")),
+        "browser_manual_v2_email_mode": _normalize_browser_manual_v2_email_mode(config.get("browser_manual_v2_email_mode", "auto")),
         "browser_manual_v2_manual_restart_on_enter_password": _as_bool(
             config.get("browser_manual_v2_manual_restart_on_enter_password", False),
             default=False,
         ),
         "hero_sms_api_key": str(config.get("hero_sms_api_key", "") or "").strip(),
         "hero_sms_service": str(config.get("hero_sms_service", "") or "").strip(),
-        "hero_sms_country": int(config.get("hero_sms_country", 16) or 16),
+        "hero_sms_country": normalize_handler_api_country(
+            config.get("hero_sms_country", 16),
+            default=16,
+            allow_zero=True,
+        ),
         "hero_sms_operator": str(config.get("hero_sms_operator", "") or "").strip(),
         "hero_sms_target_price": str(config.get("hero_sms_target_price", "") or "").strip(),
         "hero_sms_fixed_price": _as_bool(config.get("hero_sms_fixed_price", True), default=True),
@@ -325,7 +344,8 @@ def _load_sync_config() -> Dict[str, Any]:
         "browser_executable_path": "",
         "browser_locale": "en-US",
         "browser_timezone": "America/New_York",
-        "browser_block_media": True,
+        "browser_block_media": False,
+        "browser_realistic_profile": True,
         "hero_sms_target_price": "",
     }
 
@@ -403,14 +423,20 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["browser_locale"] = str(cfg.get("browser_locale", "en-US") or "en-US").strip() or "en-US"
     cfg["browser_timezone"] = str(cfg.get("browser_timezone", "America/New_York") or "America/New_York").strip() or "America/New_York"
     cfg["browser_block_media"] = _as_bool(cfg.get("browser_block_media", True), default=True)
-    phone_mode = str(cfg.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower()
-    if phone_mode not in ("manual", "hero_sms"):
-        phone_mode = "manual"
-    cfg["browser_manual_v2_phone_mode"] = phone_mode
+    cfg["browser_manual_v2_phone_mode"] = _normalize_auto_sms_provider_mode(
+        cfg.get("browser_manual_v2_phone_mode", "manual")
+    )
+    cfg["browser_manual_v2_email_mode"] = _normalize_browser_manual_v2_email_mode(
+        cfg.get("browser_manual_v2_email_mode", "auto")
+    )
     cfg["hero_sms_api_key"] = str(cfg.get("hero_sms_api_key", "") or "").strip()
     cfg["hero_sms_service"] = str(cfg.get("hero_sms_service", "") or "").strip()
     try:
-        cfg["hero_sms_country"] = max(1, int(cfg.get("hero_sms_country", 16) or 16))
+        cfg["hero_sms_country"] = normalize_handler_api_country(
+            cfg.get("hero_sms_country", 16),
+            default=16,
+            allow_zero=True,
+        )
     except (TypeError, ValueError):
         cfg["hero_sms_country"] = 16
     cfg["hero_sms_operator"] = str(cfg.get("hero_sms_operator", "") or "").strip()
@@ -906,6 +932,22 @@ class TaskState:
             if len(digits) >= 4:
                 return f"{digits[:2]}***{digits[-2:]}"
             return "***"
+        if normalized_kind in {"email", "email_address"}:
+            local_part, at, domain = text.partition("@")
+            if at and domain:
+                if len(local_part) >= 2:
+                    local_part = local_part[:2] + "***"
+                elif local_part:
+                    local_part = local_part[:1] + "***"
+                else:
+                    local_part = "***"
+                return f"{local_part}@{domain}"
+            return text[:2] + "***" if len(text) > 3 else "***"
+        if normalized_kind in {"email_code", "mail_otp"}:
+            digits = "".join(ch for ch in text if ch.isdigit())
+            if len(digits) >= 4:
+                return f"{digits[:2]}***{digits[-2:]}"
+            return "***"
         return text[:2] + "***" if len(text) > 3 else text
 
     def _emit_worker_runtime_locked(self, worker_id: int, *, bump_revision: bool = True) -> None:
@@ -987,7 +1029,14 @@ class TaskState:
                     runtime["manual_input"] = {}
                     runtime["updated_at"] = self._now_iso()
                     self._emit_worker_runtime_locked(int(worker_id), bump_revision=True)
-        timeout_label = "手机号" if normalized_kind == "phone_number" else "短信验证码"
+        timeout_label = {
+            "phone_number": "手机号",
+            "sms_code": "短信验证码",
+            "email": "邮箱",
+            "email_address": "邮箱",
+            "email_code": "邮箱验证码",
+            "mail_otp": "邮箱验证码",
+        }.get(normalized_kind, "当前输入")
         raise RuntimeError(f"等待人工输入{timeout_label}超时")
 
     def submit_worker_manual_input(
@@ -1921,10 +1970,17 @@ class TaskState:
                             "browser_block_media": bool(config_snapshot.get("browser_block_media", True)),
                             "browser_realistic_profile": bool(config_snapshot.get("browser_realistic_profile", True)),
                             "browser_clear_runtime_state": bool(config_snapshot.get("browser_clear_runtime_state", False)),
-                            "browser_manual_v2_phone_mode": str(config_snapshot.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() or "manual",
+                            "browser_manual_v2_phone_mode": _normalize_auto_sms_provider_mode(config_snapshot.get("browser_manual_v2_phone_mode", "manual")),
+                            "browser_manual_v2_email_mode": _normalize_browser_manual_v2_email_mode(
+                                config_snapshot.get("browser_manual_v2_email_mode", "auto")
+                            ),
                             "hero_sms_api_key": str(config_snapshot.get("hero_sms_api_key", "") or "").strip(),
                             "hero_sms_service": str(config_snapshot.get("hero_sms_service", "") or "").strip(),
-                            "hero_sms_country": int(config_snapshot.get("hero_sms_country", 16) or 16),
+                            "hero_sms_country": normalize_handler_api_country(
+                                config_snapshot.get("hero_sms_country", 16),
+                                default=16,
+                                allow_zero=True,
+                            ),
                             "hero_sms_operator": str(config_snapshot.get("hero_sms_operator", "") or "").strip(),
                             "hero_sms_target_price": str(config_snapshot.get("hero_sms_target_price", "") or "").strip(),
                             "hero_sms_fixed_price": _as_bool(config_snapshot.get("hero_sms_fixed_price", True), default=True),
@@ -1932,7 +1988,7 @@ class TaskState:
                         },
                         browser_manual_phone_input_func=(
                             None
-                            if str(config_snapshot.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() == "hero_sms"
+                            if _normalize_auto_sms_provider_mode(config_snapshot.get("browser_manual_v2_phone_mode", "manual")) in ("hero_sms", "smsbower")
                             else (lambda **kwargs: self.wait_for_worker_manual_input(
                                 worker_id,
                                 kind="phone_number",
@@ -1942,10 +1998,34 @@ class TaskState:
                         ),
                         browser_manual_sms_code_input_func=(
                             None
-                            if str(config_snapshot.get("browser_manual_v2_phone_mode", "manual") or "manual").strip().lower() == "hero_sms"
+                            if _normalize_auto_sms_provider_mode(config_snapshot.get("browser_manual_v2_phone_mode", "manual")) in ("hero_sms", "smsbower")
                             else (lambda **kwargs: self.wait_for_worker_manual_input(
                                 worker_id,
                                 kind="sms_code",
+                                stop_event=self.stop_event,
+                                **kwargs,
+                            ))
+                        ),
+                        browser_manual_email_input_func=(
+                            None
+                            if _normalize_browser_manual_v2_email_mode(
+                                config_snapshot.get("browser_manual_v2_email_mode", "auto")
+                            ) != "manual"
+                            else (lambda **kwargs: self.wait_for_worker_manual_input(
+                                worker_id,
+                                kind="email_address",
+                                stop_event=self.stop_event,
+                                **kwargs,
+                            ))
+                        ),
+                        browser_manual_email_code_input_func=(
+                            None
+                            if _normalize_browser_manual_v2_email_mode(
+                                config_snapshot.get("browser_manual_v2_email_mode", "auto")
+                            ) != "manual"
+                            else (lambda **kwargs: self.wait_for_worker_manual_input(
+                                worker_id,
+                                kind="email_code",
                                 stop_event=self.stop_event,
                                 **kwargs,
                             ))
@@ -2350,6 +2430,7 @@ class SyncConfigRequest(BaseModel):
     browser_realistic_profile: bool = False
     browser_clear_runtime_state: bool = True
     browser_manual_v2_phone_mode: str = "manual"
+    browser_manual_v2_email_mode: str = "auto"
     browser_manual_v2_manual_restart_on_enter_password: bool = False
     hero_sms_api_key: str = ""
     hero_sms_service: str = ""
@@ -2374,6 +2455,7 @@ class BrowserConfigRequest(BaseModel):
     browser_realistic_profile: bool = False
     browser_clear_runtime_state: bool = True
     browser_manual_v2_phone_mode: str = "manual"
+    browser_manual_v2_email_mode: str = "auto"
     browser_manual_v2_manual_restart_on_enter_password: bool = False
     hero_sms_api_key: str = ""
     hero_sms_service: str = ""
@@ -2598,10 +2680,12 @@ async def api_get_browser_config() -> Dict[str, Any]:
 
 
 @app.get("/api/browser-config/hero-sms-countries")
-async def api_get_hero_sms_countries() -> Dict[str, Any]:
+async def api_get_hero_sms_countries(provider_mode: str = "", service: str = "") -> Dict[str, Any]:
     cfg = _get_sync_config()
+    resolved_provider_mode = _normalize_auto_sms_provider_mode(provider_mode or cfg.get("browser_manual_v2_phone_mode", "manual"))
+    provider_label = HANDLER_API_PROVIDER_LABELS.get(resolved_provider_mode, "短信平台")
     api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
-    service = str(cfg.get("hero_sms_service", "") or "").strip()
+    service = str(service or cfg.get("hero_sms_service", "") or "").strip()
     if not api_key:
         return {"status": "missing_api_key", "countries": []}
     try:
@@ -2610,25 +2694,64 @@ async def api_get_hero_sms_countries() -> Dict[str, Any]:
             api_key=api_key,
             service=service,
             proxy="",
+            provider_mode=resolved_provider_mode,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"获取 HeroSMS 国家列表失败: {exc}")
+        raise HTTPException(status_code=400, detail=f"获取 {provider_label} 国家列表失败: {exc}")
+    if resolved_provider_mode == "smsbower":
+        countries = [{
+            "hero_sms_country": SMSBOWER_AUTO_COUNTRY_ID,
+            "name": "自动选择国家（按价格上限）",
+            "api_name": "",
+            "iso_code": "AUTO",
+            "dial_code": "",
+        }, *countries]
     return {"status": "ok", "countries": countries}
 
 
-@app.get("/api/browser-config/hero-sms-operators")
-async def api_get_hero_sms_operators(country: int) -> Dict[str, Any]:
+@app.get("/api/browser-config/hero-sms-services")
+async def api_get_hero_sms_services() -> Dict[str, Any]:
     cfg = _get_sync_config()
+    provider_mode = _normalize_auto_sms_provider_mode(cfg.get("browser_manual_v2_phone_mode", "manual"))
+    provider_label = HANDLER_API_PROVIDER_LABELS.get(provider_mode, "短信平台")
     api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
     service = str(cfg.get("hero_sms_service", "") or "").strip()
+    if not api_key:
+        return {"status": "missing_api_key", "services": []}
+    try:
+        services = await run_in_threadpool(
+            list_handler_api_services,
+            api_key=api_key,
+            service=service,
+            proxy="",
+            provider_mode=provider_mode,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"获取 {provider_label} 服务列表失败: {exc}")
+    return {"status": "ok", "services": services}
+
+
+@app.get("/api/browser-config/hero-sms-operators")
+async def api_get_hero_sms_operators(country: int, service: str = "", provider_mode: str = "") -> Dict[str, Any]:
+    cfg = _get_sync_config()
+    resolved_provider_mode = _normalize_auto_sms_provider_mode(provider_mode or cfg.get("browser_manual_v2_phone_mode", "manual"))
+    provider_label = HANDLER_API_PROVIDER_LABELS.get(resolved_provider_mode, "短信平台")
+    api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
+    service = str(service or cfg.get("hero_sms_service", "") or "").strip()
     if not api_key:
         return {"status": "missing_api_key", "operators": []}
     if not service:
         return {"status": "missing_service", "operators": []}
     try:
-        country_id = max(1, int(country or 0))
+        country_id = normalize_handler_api_country(
+            country,
+            default=16,
+            allow_zero=resolved_provider_mode == "smsbower",
+        )
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="国家 ID 非法")
+    if country_id == SMSBOWER_AUTO_COUNTRY_ID:
+        return {"status": "ok", "operators": []}
     try:
         operators = await run_in_threadpool(
             list_hero_sms_operator_quotes,
@@ -2636,23 +2759,30 @@ async def api_get_hero_sms_operators(country: int) -> Dict[str, Any]:
             service=service,
             country=country_id,
             proxy="",
+            provider_mode=resolved_provider_mode,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"获取 HeroSMS 运营商报价失败: {exc}")
+        raise HTTPException(status_code=400, detail=f"获取 {provider_label} 运营商报价失败: {exc}")
     return {"status": "ok", "operators": operators}
 
 
 @app.get("/api/browser-config/hero-sms-price-tiers")
-async def api_get_hero_sms_price_tiers(country: int, operator: str = "") -> Dict[str, Any]:
+async def api_get_hero_sms_price_tiers(country: int, operator: str = "", service: str = "", provider_mode: str = "") -> Dict[str, Any]:
     cfg = _get_sync_config()
+    resolved_provider_mode = _normalize_auto_sms_provider_mode(provider_mode or cfg.get("browser_manual_v2_phone_mode", "manual"))
+    provider_label = HANDLER_API_PROVIDER_LABELS.get(resolved_provider_mode, "短信平台")
     api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
-    service = str(cfg.get("hero_sms_service", "") or "").strip()
+    service = str(service or cfg.get("hero_sms_service", "") or "").strip()
     if not api_key:
         return {"status": "missing_api_key", "price_tiers": []}
     if not service:
         return {"status": "missing_service", "price_tiers": []}
     try:
-        country_id = max(1, int(country or 0))
+        country_id = normalize_handler_api_country(
+            country,
+            default=16,
+            allow_zero=resolved_provider_mode == "smsbower",
+        )
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="国家 ID 非法")
     try:
@@ -2663,9 +2793,10 @@ async def api_get_hero_sms_price_tiers(country: int, operator: str = "") -> Dict
             country=country_id,
             operator=str(operator or "").strip(),
             proxy="",
+            provider_mode=resolved_provider_mode,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"获取 HeroSMS 价格档失败: {exc}")
+        raise HTTPException(status_code=400, detail=f"获取 {provider_label} 价格档失败: {exc}")
     return {"status": "ok", "price_tiers": price_tiers}
 
 
@@ -2814,6 +2945,7 @@ def _verify_sub2api_token(base_url: str, bearer_token: str) -> Dict[str, Any]:
 @app.post("/api/browser-config")
 async def api_set_browser_config(req: BrowserConfigRequest) -> Dict[str, Any]:
     cfg = _get_sync_config()
+    normalized_phone_mode = _normalize_auto_sms_provider_mode(req.browser_manual_v2_phone_mode)
     cfg.update({
         "register_mode": _normalize_register_mode(req.register_mode),
         "browser_headless": bool(req.browser_headless),
@@ -2825,11 +2957,16 @@ async def api_set_browser_config(req: BrowserConfigRequest) -> Dict[str, Any]:
         "browser_block_media": bool(req.browser_block_media),
         "browser_realistic_profile": bool(req.browser_realistic_profile),
         "browser_clear_runtime_state": bool(req.browser_clear_runtime_state),
-        "browser_manual_v2_phone_mode": str(req.browser_manual_v2_phone_mode or "manual").strip().lower() or "manual",
+        "browser_manual_v2_phone_mode": normalized_phone_mode,
+        "browser_manual_v2_email_mode": _normalize_browser_manual_v2_email_mode(req.browser_manual_v2_email_mode),
         "browser_manual_v2_manual_restart_on_enter_password": bool(req.browser_manual_v2_manual_restart_on_enter_password),
         "hero_sms_api_key": req.hero_sms_api_key.strip(),
         "hero_sms_service": req.hero_sms_service.strip(),
-        "hero_sms_country": max(1, int(req.hero_sms_country or 16)),
+        "hero_sms_country": normalize_handler_api_country(
+            req.hero_sms_country,
+            default=16,
+            allow_zero=normalized_phone_mode == "smsbower",
+        ),
         "hero_sms_operator": req.hero_sms_operator.strip(),
         "hero_sms_target_price": req.hero_sms_target_price.strip(),
         "hero_sms_fixed_price": _as_bool(req.hero_sms_fixed_price, default=True),
@@ -3004,6 +3141,7 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
     hero_sms_api_key = req.hero_sms_api_key.strip() if req.hero_sms_api_key else ""
     if not hero_sms_api_key:
         hero_sms_api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
+    normalized_phone_mode = _normalize_auto_sms_provider_mode(req.browser_manual_v2_phone_mode)
     cfg.update({
         "base_url": new_base_url,
         "bearer_token": verified_token,
@@ -3029,11 +3167,16 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
         "browser_block_media": bool(req.browser_block_media),
         "browser_realistic_profile": bool(req.browser_realistic_profile),
         "browser_clear_runtime_state": bool(req.browser_clear_runtime_state),
-        "browser_manual_v2_phone_mode": str(req.browser_manual_v2_phone_mode or "manual").strip().lower() or "manual",
+        "browser_manual_v2_phone_mode": normalized_phone_mode,
+        "browser_manual_v2_email_mode": _normalize_browser_manual_v2_email_mode(req.browser_manual_v2_email_mode),
         "browser_manual_v2_manual_restart_on_enter_password": bool(req.browser_manual_v2_manual_restart_on_enter_password),
         "hero_sms_api_key": hero_sms_api_key,
         "hero_sms_service": req.hero_sms_service.strip(),
-        "hero_sms_country": max(1, int(req.hero_sms_country or 16)),
+        "hero_sms_country": normalize_handler_api_country(
+            req.hero_sms_country,
+            default=16,
+            allow_zero=normalized_phone_mode == "smsbower",
+        ),
         "hero_sms_operator": req.hero_sms_operator.strip(),
         "hero_sms_target_price": req.hero_sms_target_price.strip(),
         "hero_sms_fixed_price": _as_bool(req.hero_sms_fixed_price, default=True),

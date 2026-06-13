@@ -173,6 +173,14 @@
                     <select id="browserManualV2PhoneMode">
                       <option value="manual">人工输入</option>
                       <option value="hero_sms">HeroSMS 全自动</option>
+                      <option value="smsbower">SMSBower 全自动</option>
+                    </select>
+                  </div>
+                  <div class="config-field">
+                    <label>模式2邮箱来源</label>
+                    <select id="browserManualV2EmailMode">
+                      <option value="auto">后台域名邮箱自动补绑</option>
+                      <option value="manual">手动输入邮箱和验证码</option>
                     </select>
                   </div>
                   <div class="config-field">
@@ -206,7 +214,7 @@
               </div>
 
               <div class="sidebar-config-card">
-                <div class="sidebar-config-card-title">HeroSMS 配置</div>
+                <div class="sidebar-config-card-title">自动接码平台配置</div>
                 <div class="sidebar-config-grid">
                   <div class="config-field">
                     <label>固定国家</label>
@@ -229,12 +237,12 @@
                   </div>
                   <div class="config-field">
                     <label>目标价 / 上限价</label>
-                    <input type="text" id="heroSmsTargetPrice" value="" autocomplete="off" spellcheck="false" placeholder="如 0.04" />
+                    <input type="text" id="heroSmsTargetPrice" value="" autocomplete="off" spellcheck="false" placeholder="如 0.04 或 0.002-0.004" />
                   </div>
                   <div class="config-field">
                     <label>价格模式</label>
                     <select id="heroSmsFixedPrice">
-                      <option value="true">严格锁定选中价位</option>
+                      <option value="true">严格锁定选中价位/区间</option>
                       <option value="false">只作价格上限（不超过目标价）</option>
                     </select>
                   </div>
@@ -250,12 +258,19 @@
                 <div class="sidebar-config-card sidebar-config-card-plain">
                   <div class="sidebar-config-grid">
                     <div class="config-field span-2">
-                      <label>HeroSMS API Key</label>
+                      <label>平台 API Key</label>
                       <input type="password" id="heroSmsApiKey" value="" autocomplete="off" />
                     </div>
                     <div class="config-field">
-                      <label>HeroSMS 业务代码</label>
-                      <input type="text" id="heroSmsService" value="" autocomplete="off" spellcheck="false" placeholder="例如 dr" />
+                      <label>平台业务代码</label>
+                      <div id="heroSmsServiceInputWrap">
+                        <input type="text" id="heroSmsService" value="" autocomplete="off" spellcheck="false" placeholder="例如 dr" />
+                      </div>
+                      <div id="heroSmsServiceSelectWrap" style="margin-top:8px;">
+                        <select id="heroSmsServiceSelect">
+                          <option value="">从平台拉取服务列表后选择</option>
+                        </select>
+                      </div>
                     </div>
                     <div class="config-field">
                       <label>人工模式老号处理</label>
@@ -278,7 +293,7 @@
                     </div>
                   </div>
                   <div class="config-hint">
-                    模式2支持人工输入，也支持 HeroSMS 全自动接码。这里的改动在点击“保存浏览器配置”后立即生效，启动任务前也会自动同步一次。
+                    模式2支持人工输入，也支持 HeroSMS / SMSBower 全自动接码。这里的改动在点击“保存浏览器配置”后立即生效，启动任务前也会自动同步一次。
                   </div>
                 </div>
               </details>

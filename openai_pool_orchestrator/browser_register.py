@@ -24,9 +24,9 @@ try:
 except ImportError:
     from fingerprint_profile import FingerprintProfile, describe_fingerprint  # type: ignore
 try:
-    from .sms_providers import DEFAULT_PHONE_COUNTRIES, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, HeroSMSAcquireRetryableError, HeroSMSAcquireStoppedError, schedule_hero_sms_delayed_cancel
+    from .sms_providers import DEFAULT_PHONE_COUNTRIES, HANDLER_API_PROVIDER_LABELS, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, HeroSMSAcquireRetryableError, HeroSMSAcquireStoppedError, normalize_handler_api_country, schedule_hero_sms_delayed_cancel
 except ImportError:
-    from sms_providers import DEFAULT_PHONE_COUNTRIES, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, HeroSMSAcquireRetryableError, HeroSMSAcquireStoppedError, schedule_hero_sms_delayed_cancel  # type: ignore
+    from sms_providers import DEFAULT_PHONE_COUNTRIES, HANDLER_API_PROVIDER_LABELS, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, HeroSMSAcquireRetryableError, HeroSMSAcquireStoppedError, normalize_handler_api_country, schedule_hero_sms_delayed_cancel  # type: ignore
 
 
 DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
@@ -37,10 +37,11 @@ DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
     "browser_executable_path": "",
     "browser_locale": "en-US",
     "browser_timezone": "America/New_York",
-    "browser_block_media": True,
-    "browser_realistic_profile": False,
+    "browser_block_media": False,
+    "browser_realistic_profile": True,
     "browser_clear_runtime_state": True,
     "browser_manual_v2_phone_mode": "manual",
+    "browser_manual_v2_email_mode": "auto",
     "browser_manual_v2_manual_restart_on_enter_password": False,
     "hero_sms_api_key": "",
     "hero_sms_service": "",
@@ -52,6 +53,13 @@ DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
 }
 
 MANUAL_V2_RESTART_PHONE_SENTINEL = "__manual_v2_restart_phone__"
+
+
+def _normalize_manual_v2_email_mode(value: Any) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode not in {"auto", "manual"}:
+        mode = "auto"
+    return mode
 
 
 _PRESERVED_BROWSER_RESOURCES: list[BrowserLaunchResources] = []
@@ -304,13 +312,18 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
     except (TypeError, ValueError):
         slow_mo_ms = 0
     phone_mode = str(source.get("browser_manual_v2_phone_mode") or "manual").strip().lower() or "manual"
-    if phone_mode not in {"manual", "hero_sms"}:
+    if phone_mode not in {"manual", "hero_sms", "smsbower"}:
         phone_mode = "manual"
+    email_mode = _normalize_manual_v2_email_mode(source.get("browser_manual_v2_email_mode") or "auto")
     manual_restart_on_enter_password = _as_bool(source.get("browser_manual_v2_manual_restart_on_enter_password", False), default=False)
     hero_sms_api_key = str(source.get("hero_sms_api_key") or "").strip()
     hero_sms_service = str(source.get("hero_sms_service") or "").strip()
     try:
-        hero_sms_country = max(1, int(source.get("hero_sms_country") or 16))
+        hero_sms_country = normalize_handler_api_country(
+            source.get("hero_sms_country"),
+            default=16,
+            allow_zero=True,
+        )
     except (TypeError, ValueError):
         hero_sms_country = 16
     hero_sms_operator = str(source.get("hero_sms_operator") or "").strip()
@@ -337,6 +350,7 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
         "browser_realistic_profile": _as_bool(source.get("browser_realistic_profile", False), default=False),
         "browser_clear_runtime_state": _as_bool(source.get("browser_clear_runtime_state", True), default=True),
         "browser_manual_v2_phone_mode": phone_mode,
+        "browser_manual_v2_email_mode": email_mode,
         "browser_manual_v2_manual_restart_on_enter_password": manual_restart_on_enter_password,
         "hero_sms_api_key": hero_sms_api_key,
         "hero_sms_service": hero_sms_service,
@@ -509,6 +523,26 @@ def _detect_cloudflare_blocker(page: Any, url_text: str, body_value: str) -> str
     ):
         return title or "Cloudflare 校验页"
     return ""
+
+
+def _simulate_human_idle(page: Any) -> None:
+    """在 CF 校验等待期间模拟更保守的人类空闲行为。"""
+    try:
+        vw = page.viewport_size.get("width", 1440) if page.viewport_size else 1440
+        vh = page.viewport_size.get("height", 900) if page.viewport_size else 900
+        x = random.randint(int(vw * 0.2), int(vw * 0.8))
+        y = random.randint(int(vh * 0.2), int(vh * 0.6))
+        page.mouse.move(x, y, steps=random.randint(12, 28))
+        time.sleep(random.uniform(0.6, 1.4))
+        if random.random() < 0.25:
+            page.mouse.wheel(0, random.choice([-40, -20, 20, 40]))
+            time.sleep(random.uniform(0.3, 0.8))
+        if random.random() < 0.2:
+            x2 = x + random.randint(-80, 80)
+            y2 = y + random.randint(-40, 40)
+            page.mouse.move(max(10, x2), max(10, y2), steps=random.randint(8, 18))
+    except Exception:
+        pass
 
 
 def _wait_for_load(page: Any, timeout_ms: int = 2500) -> None:
@@ -1601,6 +1635,44 @@ def _is_phone_sms_send_failed_error(url: str, body_text: str, page: Any = None) 
     if any(hint in alert_lower for hint in english_hints):
         return True
     if any(hint in alert_text for hint in chinese_hints):
+        return True
+    return False
+
+
+def _is_virtual_phone_number_error(url: str, body_text: str, page: Any = None) -> bool:
+    text = str(body_text or "")
+    text_lower = text.lower()
+    english_hints = (
+        "virtual phone number",
+        "non-virtual phone number",
+        "non virtual phone number",
+        "valid, non-virtual phone number",
+        "valid non-virtual phone number",
+        "also known as voip",
+        "also known as a voip",
+        "voip phone number",
+        "this is a virtual phone number",
+    )
+    chinese_hints = (
+        "虚拟号码",
+        "虚拟手机号",
+        "虚拟电话号码",
+        "网络电话",
+        "voip 号码",
+        "非虚拟手机号",
+        "非虚拟电话号码",
+    )
+    if any(hint in text_lower for hint in english_hints):
+        return True
+    if any(hint in text for hint in chinese_hints):
+        return True
+    if page is None:
+        return False
+    raw_text = _get_body_raw_text(page)
+    raw_lower = str(raw_text or "").lower()
+    if any(hint in raw_lower for hint in english_hints):
+        return True
+    if any(hint in str(raw_text or "") for hint in chinese_hints):
         return True
     return False
 
@@ -4121,6 +4193,80 @@ def _locator_value(locator: Any, *, timeout_ms: int = 300) -> str:
             return ""
 
 
+def _digits_only(value: Any) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _clear_locator_text(locator: Any, *, timeout_ms: int = 1200) -> None:
+    if locator is None:
+        return
+    try:
+        locator.click(timeout=timeout_ms)
+    except Exception:
+        pass
+    try:
+        locator.fill("", timeout=timeout_ms)
+        return
+    except Exception:
+        pass
+    for key in ("Control+A", "Meta+A"):
+        try:
+            locator.press(key, timeout=timeout_ms)
+        except Exception:
+            pass
+    try:
+        locator.press("Backspace", timeout=timeout_ms)
+    except Exception:
+        pass
+
+
+def _write_phone_text_to_locator(locator: Any, value: str, *, timeout_ms: int = 1400) -> bool:
+    text = str(value or "").strip()
+    expected_digits = _digits_only(text)
+    if locator is None or not text or not expected_digits:
+        return False
+
+    def _confirm_written() -> bool:
+        for _ in range(3):
+            current_digits = _digits_only(_locator_value(locator, timeout_ms=500))
+            if current_digits == expected_digits:
+                return True
+            time.sleep(0.12)
+        return False
+
+    if _write_text_to_locator(locator, text, timeout_ms=timeout_ms) and _confirm_written():
+        return True
+
+    _clear_locator_text(locator, timeout_ms=timeout_ms)
+    try:
+        locator.press_sequentially(text, timeout=timeout_ms)
+    except Exception:
+        pass
+    if _confirm_written():
+        return True
+
+    _clear_locator_text(locator, timeout_ms=timeout_ms)
+    try:
+        locator.evaluate(
+            """(el, newValue) => {
+                el.focus?.();
+                if ('value' in el) {
+                    el.value = '';
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.value = newValue;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+                return false;
+            }""",
+            text,
+        )
+    except Exception:
+        pass
+    return _confirm_written()
+
+
 def _manual_phone_input_ready(page: Any) -> bool:
     locator = _first_visible_locator(
         page,
@@ -4404,16 +4550,6 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
     normalized_phone_text = str(phone_meta.get("canonical_phone") or phone_text).strip()
     local_phone_text = str(phone_meta.get("local_number") or "").strip()
     dial_code = str(phone_meta.get("country_dial_code") or "").strip()
-    country_selected = False
-    if dial_code:
-        country_selected = _ensure_manual_v2_phone_country(
-            page,
-            dial_code=dial_code,
-            country_iso=str(phone_meta.get("country_iso") or "").strip(),
-            country_hint=str(phone_meta.get("country_hint") or "").strip(),
-        )
-        if country_selected:
-            _sleep_with_page(page, 250)
     phone_input = _first_visible_locator(
         page,
         [
@@ -4430,18 +4566,130 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
     )
     if phone_input is None:
         return False
-    input_phone_text = local_phone_text if country_selected and local_phone_text else normalized_phone_text
-    if not _write_text_to_locator(phone_input, input_phone_text):
+    # 先直接写完整国际号码，让站点自己识别区号；只有失败时才回退到手动切国家+本地号。
+    if normalized_phone_text.startswith("+") and _write_phone_text_to_locator(phone_input, normalized_phone_text):
+        try:
+            phone_input.click(timeout=1200)
+        except Exception:
+            pass
+        phone_form_submitted = False
+        try:
+            phone_form_submitted = bool(
+                phone_input.evaluate(
+                    """(el) => {
+                        const isVisible = (node) => {
+                            if (!node) return false;
+                            const rect = node.getBoundingClientRect();
+                            const style = window.getComputedStyle(node);
+                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                        };
+                        const safeTexts = new Set(['继续', 'Continue', 'Next', '下一步']);
+                        const rejectTokens = ['google', 'apple', 'microsoft', 'email', '邮箱'];
+                        const clickButton = (button) => {
+                            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
+                                button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                            });
+                        };
+                        const normalizedText = (node) => String(
+                            node?.innerText
+                            || node?.textContent
+                            || node?.value
+                            || node?.getAttribute?.('aria-label')
+                            || ''
+                        ).replace(/\\s+/g, ' ').trim();
+                        const isSafeSubmitButton = (button) => {
+                            const text = normalizedText(button);
+                            if (!text || !safeTexts.has(text)) return false;
+                            const lower = text.toLowerCase();
+                            if (rejectTokens.some(token => lower.includes(token))) return false;
+                            if (!isVisible(button) || button.disabled) return false;
+                            const ariaDisabled = String(button.getAttribute?.('aria-disabled') || '').trim().toLowerCase();
+                            return ariaDisabled !== 'true';
+                        };
+                        const scopes = [];
+                        const seen = new Set();
+                        const pushScope = (node) => {
+                            if (!node || seen.has(node)) return;
+                            seen.add(node);
+                            scopes.push(node);
+                        };
+                        pushScope(el.closest('form'));
+                        pushScope(el.closest('[role="dialog"]'));
+                        let current = el.parentElement;
+                        let depth = 0;
+                        while (current && depth < 8) {
+                            pushScope(current);
+                            current = current.parentElement;
+                            depth += 1;
+                        }
+                        for (const scope of scopes) {
+                            const strictButtons = Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"]'));
+                            for (const button of strictButtons) {
+                                if (!isSafeSubmitButton(button)) continue;
+                                clickButton(button);
+                                return true;
+                            }
+                            const fallbackButtons = Array.from(scope.querySelectorAll('button, [role="button"]'));
+                            for (const button of fallbackButtons) {
+                                if (!isSafeSubmitButton(button)) continue;
+                                clickButton(button);
+                                return true;
+                            }
+                        }
+                        const form = el.closest('form');
+                        if (form && typeof form.requestSubmit === 'function') {
+                            form.requestSubmit();
+                            return true;
+                        }
+                        if (form && typeof form.submit === 'function') {
+                            form.submit();
+                            return true;
+                        }
+                        return false;
+                    }"""
+                )
+            )
+        except Exception:
+            phone_form_submitted = False
+        if phone_form_submitted:
+            _sleep_with_page(page, 800)
+            return True
+        if _request_submit_with_button(phone_input):
+            return True
+
+    country_selected = False
+    if dial_code:
+        country_selected = _ensure_manual_v2_phone_country(
+            page,
+            dial_code=dial_code,
+            country_iso=str(phone_meta.get("country_iso") or "").strip(),
+            country_hint=str(phone_meta.get("country_hint") or "").strip(),
+        )
+        if country_selected:
+            _sleep_with_page(page, 250)
+
+    input_candidates: list[str] = []
+    if country_selected and local_phone_text:
+        input_candidates.append(local_phone_text)
+    if normalized_phone_text and normalized_phone_text not in input_candidates:
+        input_candidates.append(normalized_phone_text)
+    if (
+        country_selected
+        and local_phone_text
+        and not local_phone_text.startswith("0")
+        and str(phone_meta.get("country_iso") or "").strip().upper() not in {"GB"}
+    ):
+        trunk_candidate = "0" + local_phone_text
+        if trunk_candidate not in input_candidates:
+            input_candidates.append(trunk_candidate)
+
+    write_ok = False
+    for candidate_text in input_candidates:
+        if _write_phone_text_to_locator(phone_input, candidate_text):
+            write_ok = True
+            break
+    if not write_ok:
         return False
-    expected_digits = "".join(ch for ch in input_phone_text if ch.isdigit())
-    filled_digits = "".join(ch for ch in _locator_value(phone_input, timeout_ms=500) if ch.isdigit())
-    if expected_digits and filled_digits and filled_digits != expected_digits:
-        if not _write_text_to_locator(phone_input, normalized_phone_text):
-            return False
-        canonical_digits = "".join(ch for ch in normalized_phone_text if ch.isdigit())
-        retry_digits = "".join(ch for ch in _locator_value(phone_input, timeout_ms=500) if ch.isdigit())
-        if retry_digits and retry_digits not in {expected_digits, canonical_digits}:
-            return False
     try:
         phone_input.click(timeout=1200)
     except Exception:
@@ -4989,10 +5237,89 @@ def _cleanup_stale_temp_user_data_dirs(emitter: Any) -> None:
             pass
 
 
+def _seed_user_data_dir_profile(user_data_dir: str) -> None:
+    """在临时 user-data-dir 中预写 Chrome profile 文件，模拟有使用历史的老浏览器。"""
+    default_dir = os.path.join(user_data_dir, "Default")
+    os.makedirs(default_dir, exist_ok=True)
+    now_ts = int(time.time())
+    install_age_days = random.randint(30, 180)
+    install_ts = now_ts - install_age_days * 86400
+    last_session_ts = now_ts - random.randint(3600, 86400)
+    preferences = {
+        "profile": {
+            "last_engagement_time": str(last_session_ts * 1000000),
+            "exit_type": "Normal",
+            "exited_cleanly": True,
+            "default_content_setting_values": {
+                "notifications": 2,
+                "geolocation": 2,
+            },
+            "password_manager_enabled": False,
+            "creation_time": str(install_ts * 1000000),
+            "name": "Person 1",
+            "avatar_index": 0,
+        },
+        "session": {
+            "restore_on_startup": 1,
+        },
+        "browser": {
+            "has_seen_welcome_page": True,
+            "check_default_browser": False,
+            "should_reset_check_default_browser": False,
+        },
+        "credentials_enable_service": False,
+        "credentials_enable_autosign_in": False,
+        "autofill": {
+            "profile_enabled": False,
+            "credit_card_enabled": False,
+        },
+        "translate": {
+            "enabled": False,
+        },
+        "search": {
+            "suggest_enabled": False,
+        },
+        "safebrowsing": {
+            "enabled": True,
+            "enhanced": False,
+        },
+    }
+    local_state = {
+        "profile": {
+            "info_cache": {
+                "Default": {
+                    "active_time": last_session_ts,
+                    "name": "Person 1",
+                    "is_using_default_name": True,
+                }
+            },
+            "profiles_created": 1,
+        },
+        "browser": {
+            "enabled_labs_experiments": [],
+            "has_seen_welcome_page": True,
+        },
+        "user_experience_metrics": {
+            "reporting_enabled": False,
+        },
+    }
+    try:
+        with open(os.path.join(default_dir, "Preferences"), "w", encoding="utf-8") as f:
+            json.dump(preferences, f, separators=(",", ":"))
+        with open(os.path.join(user_data_dir, "Local State"), "w", encoding="utf-8") as f:
+            json.dump(local_state, f, separators=(",", ":"))
+        first_run_path = os.path.join(user_data_dir, "First Run")
+        with open(first_run_path, "w") as f:
+            pass
+    except Exception:
+        pass
+
+
 def _resolve_uc_user_data_dir(cfg: Dict[str, Any], emitter: Any) -> tuple[str, bool]:
     register_mode = str(cfg.get("register_mode") or "").strip().lower()
     temp_user_data_dir = tempfile.mkdtemp(prefix="opo_uc_")
     _register_active_temp_user_data_dir(temp_user_data_dir)
+    _seed_user_data_dir_profile(temp_user_data_dir)
     return temp_user_data_dir, False
 
 
@@ -5302,8 +5629,6 @@ def _launch_via_local_uc_bridge(playwright: Any, ctx: BrowserRunContext, cfg: Di
         options.add_argument(f"--window-size={profile.screen_width},{profile.screen_height}")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--disable-dev-shm-usage")
-        if cfg["browser_headless"]:
-            options.add_argument("--disable-gpu")
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
         options.add_argument("--ignore-certificate-errors")
@@ -5314,6 +5639,7 @@ def _launch_via_local_uc_bridge(playwright: Any, ctx: BrowserRunContext, cfg: Di
         options.add_argument("--enforce-webrtc-ip-permission-check")
         options.add_argument(f"--user-data-dir={temp_user_data_dir}")
         try:
+            fake_engagement_time = int(time.time()) - random.randint(7, 30) * 24 * 60 * 60
             options.add_experimental_option(
                 "prefs",
                 {
@@ -5324,6 +5650,16 @@ def _launch_via_local_uc_bridge(playwright: Any, ctx: BrowserRunContext, cfg: Di
                     "profile.block_third_party_cookies": False if cfg.get("browser_realistic_profile", True) else True,
                     "profile.cookie_controls_mode": 0 if cfg.get("browser_realistic_profile", True) else 1,
                     "profile.default_content_setting_values.popups": 1,
+                    "profile.default_content_setting_values.notifications": 2,
+                    "profile.default_content_setting_values.geolocation": 2,
+                    "profile.password_manager_enabled": False,
+                    "profile.last_engagement_time": fake_engagement_time,
+                    "profile.exit_type": "Normal",
+                    "profile.exited_cleanly": True,
+                    "session.restore_on_startup": 1,
+                    "intl.accept_languages": str(profile.accept_language or "en-US,en"),
+                    "credentials_enable_service": False,
+                    "credentials_enable_autosign_in": False,
                 },
             )
         except Exception:
@@ -5473,6 +5809,8 @@ def run_browser_registration(
     fallback_wait_for_otp_func: Optional[Callable[..., str]] = None,
     wait_manual_phone_input_func: Optional[Callable[..., str]] = None,
     wait_manual_sms_code_input_func: Optional[Callable[..., str]] = None,
+    wait_manual_email_input_func: Optional[Callable[..., str]] = None,
+    wait_manual_email_code_input_func: Optional[Callable[..., str]] = None,
     sms_provider: Optional[Any] = None,
     random_password_func: Optional[Callable[[int], str]] = None,
     random_profile_name_func: Optional[Callable[[], str]] = None,
@@ -5538,7 +5876,14 @@ def run_browser_registration(
     is_manual_v2_mode = register_mode == "browser_manual_v2"
     manual_v2_expected_auto_phone_mode = (
         is_manual_v2_mode
-        and str(cfg.get("browser_manual_v2_phone_mode") or "").strip().lower() == "hero_sms"
+        and str(cfg.get("browser_manual_v2_phone_mode") or "").strip().lower() in {"hero_sms", "smsbower"}
+    )
+    manual_v2_auto_phone_mode_name = str(cfg.get("browser_manual_v2_phone_mode") or "").strip().lower()
+    manual_v2_auto_phone_provider_label = HANDLER_API_PROVIDER_LABELS.get(manual_v2_auto_phone_mode_name, "短信平台")
+    manual_v2_email_mode = (
+        _normalize_manual_v2_email_mode(cfg.get("browser_manual_v2_email_mode", "auto"))
+        if is_manual_v2_mode
+        else "auto"
     )
     manual_v2_manual_restart_on_enter_password = (
         is_manual_v2_mode
@@ -5559,6 +5904,18 @@ def run_browser_registration(
         is_manual_v2_mode
         and not manual_v2_expected_auto_phone_mode
         and callable(wait_manual_sms_code_input_func)
+    )
+    manual_v2_manual_email_mode = (
+        is_manual_v2_mode
+        and manual_v2_email_mode == "manual"
+    )
+    manual_v2_email_panel_input_mode = (
+        manual_v2_manual_email_mode
+        and callable(wait_manual_email_input_func)
+    )
+    manual_v2_email_code_panel_input_mode = (
+        manual_v2_manual_email_mode
+        and callable(wait_manual_email_code_input_func)
     )
     use_plain_browser_env = False
     otp_wait_timeout_seconds = 20
@@ -6378,6 +6735,7 @@ def run_browser_registration(
                     step=step,
                 )
             _wait_for_load(page, timeout_ms=1200)
+            _simulate_human_idle(page)
             _sleep_with_page(page, 1200)
         latest_url, latest_body = _wait_for_page_stabilize(
             previous_url,
@@ -6583,7 +6941,7 @@ def run_browser_registration(
         previous_body: str,
         *,
         step: str = "create_password",
-        timeout_ms: int = 20000,
+        timeout_ms: int = 12000,
     ) -> tuple[str, str]:
         nonlocal page, manual_v2_contact_network_seen
         previous_url_lower = str(previous_url or "").lower()
@@ -6592,6 +6950,7 @@ def run_browser_registration(
         wait_logged = False
         latest_url = previous_url
         latest_body = previous_body
+        register_send_wait_started_at = 0.0
         while time.time() < deadline_local:
             if stop_event is not None and stop_event.is_set():
                 return latest_url, latest_body
@@ -6636,6 +6995,7 @@ def run_browser_registration(
                         step=step,
                     )
                 _wait_for_load(page, timeout_ms=1200)
+                _simulate_human_idle(page)
                 _sleep_with_page(page, 1200)
                 continue
             if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
@@ -6666,7 +7026,14 @@ def run_browser_registration(
                     "api/accounts/phone-otp/send",
                     within_seconds=20.0,
                 )
+                if recent_phone_otp_send:
+                    manual_v2_contact_network_seen = True
+                    return latest_url, latest_body
                 if recent_register_request or recent_phone_otp_send:
+                    if register_send_wait_started_at <= 0.0:
+                        register_send_wait_started_at = time.time()
+                    if time.time() - register_send_wait_started_at >= 3.5:
+                        return latest_url, latest_body
                     if not wait_logged:
                         wait_logged = True
                         emitter.info(
@@ -6674,7 +7041,7 @@ def run_browser_registration(
                             step=step,
                         )
                     _wait_for_load(page, timeout_ms=1200)
-                    _sleep_with_page(page, 600)
+                    _sleep_with_page(page, 300)
                     continue
             if latest_state != previous_state:
                 return latest_url, latest_body
@@ -7111,6 +7478,36 @@ def run_browser_registration(
             or ""
         ).strip()
 
+    def _wait_manual_v2_email_input(*, step: str, prompt: str, timeout_seconds: int = 3600) -> str:
+        if not callable(wait_manual_email_input_func):
+            raise RuntimeError("浏览器模式2 当前未配置邮箱人工输入通道")
+        return str(
+            wait_manual_email_input_func(
+                prompt=prompt,
+                step=step,
+                timeout_seconds=timeout_seconds,
+                placeholder="请输入要绑定的邮箱地址",
+                button_text="提交邮箱",
+                helper_text="其他流程保持自动，只有补邮箱和邮箱验证码改为手动输入。",
+            )
+            or ""
+        ).strip()
+
+    def _wait_manual_v2_email_code(*, step: str, prompt: str, timeout_seconds: int = 3600) -> str:
+        if not callable(wait_manual_email_code_input_func):
+            raise RuntimeError("浏览器模式2 当前未配置邮箱验证码人工输入通道")
+        return str(
+            wait_manual_email_code_input_func(
+                prompt=prompt,
+                step=step,
+                timeout_seconds=timeout_seconds,
+                placeholder="请输入邮箱收到的 6 位验证码",
+                button_text="提交邮箱验证码",
+                helper_text="提交后程序会自动填入当前页面并继续后续授权流程。",
+            )
+            or ""
+        ).strip()
+
     def _ensure_manual_v2_auto_phone(*, step: str, prompt: str) -> str:
         nonlocal manual_v2_phone_number, manual_v2_sms_activation_id, manual_v2_sms_provider_done, manual_v2_sms_purchased_at
         if manual_v2_phone_number:
@@ -7121,6 +7518,8 @@ def run_browser_registration(
         sms_order = sms_provider.acquire_number(proxy=ctx.proxy, stop_event=ctx.stop_event)
         price_tier_options = sms_order.get("price_tier_options") if isinstance(sms_order.get("price_tier_options"), list) else []
         operator_options = sms_order.get("operator_options") if isinstance(sms_order.get("operator_options"), list) else []
+        auto_country_mode = bool(sms_order.get("auto_country_mode"))
+        candidate_country_total = int(sms_order.get("country_candidates_total") or 0)
         if price_tier_options:
             preview_rows = []
             for item in price_tier_options[:8]:
@@ -7143,7 +7542,11 @@ def run_browser_registration(
                     + (f"/{'/'.join(extra_flags)}" if extra_flags else "")
                 )
             emitter.info(
-                "浏览器模式2 HeroSMS 当前国家价格档: "
+                (
+                    f"浏览器模式2 {manual_v2_auto_phone_provider_label} 自动国家候选首个国家价档："
+                    if auto_country_mode
+                    else f"浏览器模式2 {manual_v2_auto_phone_provider_label} 当前国家可选价格档："
+                )
                 + ", ".join(preview_rows),
                 step=step,
             )
@@ -7156,28 +7559,33 @@ def run_browser_registration(
                     + f"/stock={item.get('count') if item.get('count') is not None else '-'}"
                 )
             emitter.info(
-                "浏览器模式2 HeroSMS 运营商报价(兼容接口): "
+                f"浏览器模式2 {manual_v2_auto_phone_provider_label} 运营商报价（兼容接口）："
                 + ", ".join(preview_rows),
                 step=step,
             )
         else:
             emitter.info(
-                "浏览器模式2 HeroSMS 本轮未拿到细分价格档，直接使用国家聚合池取号；"
-                + f" aggregate=${sms_order.get('aggregate_price') if sms_order.get('aggregate_price') is not None else '-'}"
-                + f", stock={sms_order.get('aggregate_count') if sms_order.get('aggregate_count') is not None else '-'}",
+                (
+                    f"浏览器模式2 {manual_v2_auto_phone_provider_label} 自动国家模式本轮没有拿到细分价格档，直接按候选国家聚合价取号；"
+                    if auto_country_mode
+                    else f"浏览器模式2 {manual_v2_auto_phone_provider_label} 本轮没有拿到细分价格档，直接按国家聚合池取号；"
+                )
+                + f"参考价 ${sms_order.get('aggregate_price') if sms_order.get('aggregate_price') is not None else '-'}"
+                + f"，库存 {sms_order.get('aggregate_count') if sms_order.get('aggregate_count') is not None else '-'}。",
                 step=step,
             )
         debug_events = sms_order.get("debug_events") if isinstance(sms_order.get("debug_events"), list) else []
         if debug_events:
             emitter.info(
-                "浏览器模式2 HeroSMS 取号轨迹: " + " || ".join(str(item) for item in debug_events[:12]),
+                f"浏览器模式2 {manual_v2_auto_phone_provider_label} 取号过程："
+                + " || ".join(str(item) for item in debug_events[:12]),
                 step=step,
             )
         if sms_order.get("used_hidden_ceiling_fallback"):
             emitter.info(
-                "浏览器模式2 HeroSMS 当前可见价档里没有命中上限的低价档；"
-                + f"本轮改为直接探测隐藏低价池 <=${sms_order.get('max_price') if sms_order.get('max_price') is not None else sms_order.get('target_price')}"
-                + "，因此实际成交价可能低于当前展示档位。",
+                f"浏览器模式2 {manual_v2_auto_phone_provider_label} 当前页面展示的价档里，没有不超过你设置上限的低价档；"
+                + f"本轮改为直接探测隐藏低价池（不超过 ${sms_order.get('max_price') if sms_order.get('max_price') is not None else sms_order.get('target_price')}）"
+                + "，所以实际成交价可能低于当前页面展示的最低档。",
                 step=step,
             )
         manual_v2_phone_number = str(sms_order.get("phone_number") or "").strip()
@@ -7187,72 +7595,83 @@ def run_browser_registration(
         if not manual_v2_phone_number or not manual_v2_sms_activation_id:
             raise RuntimeError("浏览器模式2 自动取号失败：缺少手机号或 activation_id")
         sms_provider.mark_ready(manual_v2_sms_activation_id, proxy=ctx.proxy)
+        price_mode_label = ""
+        if str(sms_order.get("price_mode") or "") == "ceiling":
+            price_mode_label = "按价格上限模式"
+        elif str(sms_order.get("price_mode") or "") == "fixed":
+            price_mode_label = "按固定价模式"
+        elif str(sms_order.get("price_mode") or "") == "range":
+            price_mode_label = "按价格区间模式"
+        elif str(sms_order.get("price_mode") or "") == "auto":
+            price_mode_label = "按自动最低价模式"
         emitter.info(
-            "浏览器模式2 已从 HeroSMS 自动获取手机号并标记 ready: "
+            f"浏览器模式2 已从 {manual_v2_auto_phone_provider_label} 成功取到手机号："
             + manual_v2_phone_number
-            + f" (masked={_mask_secret(manual_v2_phone_number, head=8, tail=4)})"
-            + f", country={str(sms_order.get('country_name') or '').strip() or sms_order.get('country') or '-'}"
+            + f"（隐藏显示 {_mask_secret(manual_v2_phone_number, head=8, tail=4)}）"
+            + f"，国家 {str(sms_order.get('country_name') or '').strip() or sms_order.get('country') or '-'}"
             + (
-                f", price_mode={sms_order.get('price_mode')}"
-                if sms_order.get("price_mode")
+                f"，{price_mode_label}"
+                if price_mode_label
                 else ""
             )
             + (
-                f", max_price=${sms_order.get('max_price')}"
-                if sms_order.get("max_price") is not None
+                f"，价格区间 ${sms_order.get('min_price')}-${sms_order.get('max_price')}"
+                if sms_order.get("price_mode") == "range" and sms_order.get("min_price") is not None and sms_order.get("max_price") is not None
                 else ""
             )
             + (
-                ", ceiling_source=hidden_pool"
+                f"，价格上限 ${sms_order.get('max_price')}"
+                if sms_order.get("price_mode") != "range" and sms_order.get("max_price") is not None
+                else ""
+            )
+            + (
+                "，本次来自隐藏低价池"
                 if sms_order.get("used_hidden_ceiling_fallback")
                 else ""
             )
             + (
-                f", target_price=${sms_order.get('target_price')}"
+                f"，目标价 ${sms_order.get('target_price')}"
                 if sms_order.get("target_price") is not None and sms_order.get("max_price") is None
                 else ""
             )
             + (
-                f", aggregate=${sms_order.get('aggregate_price')}"
-                if sms_order.get("aggregate_price") is not None
+                f"，自动国家候选 {candidate_country_total} 个"
+                if auto_country_mode and candidate_country_total > 0
                 else ""
             )
             + (
-                f", aggregate_stock={sms_order.get('aggregate_count') if sms_order.get('aggregate_count') is not None else '-'}"
+                f"，参考聚合价 ${sms_order.get('aggregate_price')}"
+                if sms_order.get("aggregate_price") is not None
+                else ""
             )
+            + f"，参考库存 {sms_order.get('aggregate_count') if sms_order.get('aggregate_count') is not None else '-'}"
+            + f"，运营商 {str(sms_order.get('operator') or '').strip() or '任何运营商'}"
             + (
-                f", operator={str(sms_order.get('operator') or '').strip() or '任何运营商'}"
-            )
-            + (
-                ", operator_fallback=aggregate"
+                "（已从运营商报价回退到国家聚合池）"
                 if sms_order.get("operator_fallback_to_aggregate")
                 else ""
             )
             + (
-                f", operator_quote=${sms_order.get('selected_operator_price')}"
+                f"，运营商报价 ${sms_order.get('selected_operator_price')}"
                 if sms_order.get("selected_operator_price") is not None
                 else ""
             )
             + (
-                f", actual=${sms_order.get('activation_cost')}"
+                f"，实际成交价 ${sms_order.get('activation_cost')}"
                 if sms_order.get("activation_cost") is not None
                 else ""
             )
             + (
-                f", balance_before=${sms_order.get('balance_before')}"
-                if sms_order.get("balance_before") is not None
+                f"，余额从 ${sms_order.get('balance_before')} 变为 ${sms_order.get('balance_after')}"
+                if sms_order.get("balance_before") is not None and sms_order.get("balance_after") is not None
                 else ""
             )
-            + (
-                f", balance_after=${sms_order.get('balance_after')}"
-                if sms_order.get("balance_after") is not None
-                else ""
-            ),
+            + "，并已标记为可接收短信。",
             step=step,
         )
         emitter.info(
-            "浏览器模式2 HeroSMS API 探测结果: balance=getBalance 可用, prices=getPrices 可用, "
-            + "operators=getOperators 可用, getPricesVerification=BAD_ACTION",
+            f"浏览器模式2 {manual_v2_auto_phone_provider_label} 接口探测结果：余额接口可用，价格接口可用，运营商接口可用；"
+            + "价格校验接口返回 BAD_ACTION（当前按兼容方式处理）。",
             step=step,
         )
         return manual_v2_phone_number
@@ -7266,7 +7685,7 @@ def run_browser_registration(
         if manual_v2_cached_sms_code:
             code = manual_v2_cached_sms_code
             manual_v2_cached_sms_code = ""
-            emitter.success(f"浏览器模式2 已直接复用此前收到的 HeroSMS 短信验证码: {code}", step=step)
+            emitter.success(f"浏览器模式2 已直接复用此前收到的 {manual_v2_auto_phone_provider_label} 短信验证码: {code}", step=step)
             return code
         emitter.info(prompt, step=step)
         code = str(
@@ -7279,7 +7698,7 @@ def run_browser_registration(
             or ""
         ).strip()
         if code:
-            emitter.success(f"浏览器模式2 已从 HeroSMS 自动收到短信验证码: {code}", step=step)
+            emitter.success(f"浏览器模式2 已从 {manual_v2_auto_phone_provider_label} 自动收到短信验证码: {code}", step=step)
         return code
 
     def _probe_manual_v2_auto_sms_code() -> str:
@@ -7304,6 +7723,8 @@ def run_browser_registration(
         nonlocal manual_v2_sms_provider_done
         stall_state = _classify_page_state(current_url, body_text, page)
         manual_v2_phone_submit_stall_attempts += 1
+        if manual_v2_auto_phone_mode:
+            manual_v2_phone_submit_stall_attempts = 2
         if manual_v2_phone_submit_stall_attempts < 2:
             emitter.warn(
                 "浏览器模式2 步骤1手机号提交后站点仍未真正离开当前桥接/手机号页，"
@@ -7331,8 +7752,8 @@ def run_browser_registration(
             manual_v2_sms_purchased_at = 0.0
             manual_v2_sms_provider_done = False
             _prepare_manual_v2_signup_flow(
-                "浏览器模式2 步骤1手机号提交后连续两次仍卡在首页桥接弹层/手机号页；"
-                + "已判定当前 HeroSMS 号码无效，立即废弃并回到步骤1重新取号..."
+                "浏览器模式2 步骤1手机号提交后仍卡在首页桥接弹层/手机号页；"
+                + f"自动模式下不再等待同号重试，已立即废弃当前 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取号..."
             )
         else:
             manual_v2_phone_number = ""
@@ -7350,7 +7771,7 @@ def run_browser_registration(
             if success:
                 sms_provider.complete(manual_v2_sms_activation_id, proxy=ctx.proxy)
                 emitter.info(
-                    "浏览器模式2 已在 Token/流程成功后完成 HeroSMS 激活，避免号码继续占用。"
+                    f"浏览器模式2 已在 Token/流程成功后完成 {manual_v2_auto_phone_provider_label} 激活，避免号码继续占用。"
                     + f" activation_id={manual_v2_sms_activation_id}, phone={manual_v2_phone_number or '-'}",
                     step="get_token",
                 )
@@ -7359,30 +7780,39 @@ def run_browser_registration(
                 cancel_code = str((cancel_result or {}).get("code") or "").strip()
                 if cancel_result and cancel_result.get("ok"):
                     emitter.info(
-                        "浏览器模式2 因流程失败/退出已取消 HeroSMS 激活，避免继续扣占资源。"
+                        f"浏览器模式2 因流程失败/退出已取消 {manual_v2_auto_phone_provider_label} 激活，避免继续扣占资源。"
                         + f" activation_id={manual_v2_sms_activation_id}, phone={manual_v2_phone_number or '-'}"
                         + (f", code={cancel_code}" if cancel_code else ""),
                         step="runtime",
                     )
                 elif cancel_code == "EARLY_CANCEL_DENIED":
                     waited_seconds = max(0, int(time.time() - float(manual_v2_sms_purchased_at or 0.0)))
+                    retry_after_seconds = HERO_SMS_CANCEL_MIN_WAIT_SECONDS
+                    try:
+                        retry_after_seconds = max(
+                            1,
+                            int((cancel_result or {}).get("retry_after_seconds") or HERO_SMS_CANCEL_MIN_WAIT_SECONDS),
+                        )
+                    except (TypeError, ValueError):
+                        retry_after_seconds = HERO_SMS_CANCEL_MIN_WAIT_SECONDS
                     schedule_hero_sms_delayed_cancel(
                         provider=sms_provider,
                         activation_id=manual_v2_sms_activation_id,
                         purchased_at=manual_v2_sms_purchased_at,
                         proxy=ctx.proxy,
-                        min_wait_seconds=HERO_SMS_CANCEL_MIN_WAIT_SECONDS,
+                        min_wait_seconds=retry_after_seconds,
+                        provider_label=manual_v2_auto_phone_provider_label,
                         logger=lambda message: emitter.info(message, step="runtime"),
                     )
                     emitter.warn(
-                        "浏览器模式2 当前流程已结束，但 HeroSMS 尚未到可取消窗口；已转后台延迟取消。"
+                        f"浏览器模式2 当前流程已结束，但 {manual_v2_auto_phone_provider_label} 尚未到可取消窗口；已转后台延迟取消。"
                         + f" activation_id={manual_v2_sms_activation_id}, phone={manual_v2_phone_number or '-'}"
-                        + f", waited={waited_seconds}s, min_wait={HERO_SMS_CANCEL_MIN_WAIT_SECONDS}s",
+                        + f", waited={waited_seconds}s, min_wait={retry_after_seconds}s",
                         step="runtime",
                     )
                 else:
                     emitter.warn(
-                        "浏览器模式2 HeroSMS 取消未成功，本地流程直接结束。"
+                        f"浏览器模式2 {manual_v2_auto_phone_provider_label} 取消未成功，本地流程直接结束。"
                         + f" activation_id={manual_v2_sms_activation_id}, phone={manual_v2_phone_number or '-'}"
                         + f", code={cancel_code or '-'}"
                         + f", message={str((cancel_result or {}).get('message') or '-')}",
@@ -7391,7 +7821,7 @@ def run_browser_registration(
         except Exception as exc:
             try:
                 emitter.warn(
-                    "浏览器模式2 HeroSMS 激活收尾调用失败: "
+                    f"浏览器模式2 {manual_v2_auto_phone_provider_label} 激活收尾调用失败: "
                     + f"success={'是' if success else '否'}, "
                     + f"activation_id={manual_v2_sms_activation_id}, "
                     + f"phone={manual_v2_phone_number or '-'}, "
@@ -7588,14 +8018,14 @@ def run_browser_registration(
     )
     if manual_v2_expected_auto_phone_mode and not manual_v2_auto_phone_mode:
         emitter.warn(
-            "浏览器模式2 配置为 HeroSMS 全自动，但运行时未成功初始化短信 provider；"
-            + "当前不会回退成人工输入，请优先检查 HeroSMS API Key / 业务代码 / 保存是否生效。",
+            f"浏览器模式2 配置为 {manual_v2_auto_phone_provider_label} 全自动，但运行时未成功初始化短信 provider；"
+            + f"当前不会回退成人工输入，请优先检查 {manual_v2_auto_phone_provider_label} API Key / 业务代码 / 保存是否生效。",
             step="oauth_init",
         )
     if manual_v2_hidden_input_mode:
         if manual_v2_auto_phone_mode:
             emitter.info(
-                "浏览器模式2 当前启用无头全自动接码模式：手机号与短信验证码将通过 HeroSMS 自动获取；浏览器窗口不会显示。",
+                f"浏览器模式2 当前启用无头全自动接码模式：手机号与短信验证码将通过 {manual_v2_auto_phone_provider_label} 自动获取；浏览器窗口不会显示。",
                 step="oauth_init",
             )
         else:
@@ -7610,7 +8040,12 @@ def run_browser_registration(
         )
     elif manual_v2_auto_phone_mode:
         emitter.info(
-            "浏览器模式2 当前启用可见全自动接码模式：手机号与短信验证码将通过 HeroSMS 自动获取；浏览器窗口仅用于观察流程。",
+            f"浏览器模式2 当前启用可见全自动接码模式：手机号与短信验证码将通过 {manual_v2_auto_phone_provider_label} 自动获取；浏览器窗口仅用于观察流程。",
+            step="oauth_init",
+        )
+    if manual_v2_manual_email_mode:
+        emitter.info(
+            "浏览器模式2 当前补邮箱阶段已切换为人工输入：第二步 add-email 与邮箱验证码都将在任务控制卡片中手动提交。",
             step="oauth_init",
         )
     emitter.info(f"本次浏览器指纹: {describe_fingerprint(ctx.fingerprint_profile)}", step="oauth_init")
@@ -7630,8 +8065,8 @@ def run_browser_registration(
         page = launch_resources.page
         if not use_plain_browser_env:
             try:
-                # 可见浏览器下避免把每个请求都绕进 Python，减少模式2人工交互时的卡顿。
-                if cfg.get("browser_block_media", True) and cfg["browser_headless"]:
+                # 只有用户明确要拦媒体，且未启用拟真档案时，才在无头模式下拦截资源。
+                if cfg.get("browser_block_media", False) and cfg["browser_headless"] and not cfg.get("browser_realistic_profile", True):
                     context.route("**/*", _handle_route)
             except Exception:
                 pass
@@ -7867,8 +8302,9 @@ def run_browser_registration(
                             + _preview_text(cloudflare_blocker, 120),
                             step="oauth_init",
                         )
-                    _wait_for_load(page, timeout_ms=1200)
-                    _sleep_with_page(page, 1800)
+                    _wait_for_load(page, timeout_ms=2200)
+                    _simulate_human_idle(page)
+                    _sleep_with_page(page, random.randint(2600, 5200))
                     continue
                 otp_route_locked = ("email-verification" in current_url_lower or "email-otp" in current_url_lower)
                 callback_candidate = _extract_callback_url_from_page(current_url, body_text)
@@ -8042,7 +8478,7 @@ def run_browser_registration(
                             manual_v2_require_phone_resubmit = False
                             emitter.info(
                                 (
-                                    "浏览器模式2 检测到 HeroSMS 已收到短信验证码，页面即使尚未完成切换，也直接进入验证码处理阶段..."
+                                    f"浏览器模式2 检测到 {manual_v2_auto_phone_provider_label} 已收到短信验证码，页面即使尚未完成切换，也直接进入验证码处理阶段..."
                                     if hero_sms_code_ready
                                     else "浏览器模式2 检测到密码提交后已进入短信验证码链路，立即切换到验证码输入阶段..."
                                 ),
@@ -8154,7 +8590,7 @@ def run_browser_registration(
                             manual_v2_require_phone_resubmit = False
                             emitter.info(
                                 (
-                                    "浏览器模式2 create-account/password 提交后，HeroSMS 已经收到验证码；"
+                                    f"浏览器模式2 create-account/password 提交后，{manual_v2_auto_phone_provider_label} 已经收到验证码；"
                                     + "即使当前页面快照仍停留在密码页，也直接切换到验证码输入阶段..."
                                     if hero_sms_code_ready
                                     else "浏览器模式2 create-account/password 提交后已通过网络跳转检测到短信验证码页，"
@@ -8172,6 +8608,26 @@ def run_browser_registration(
                                 + "回到步骤1重新输入手机号..."
                             )
                             continue
+                        if _is_virtual_phone_number_error(current_url, body_text, page):
+                            password_submitted = False
+                            manual_v2_password_page_logged = False
+                            manual_v2_create_password_submit_attempts = 0
+                            if manual_v2_auto_phone_mode:
+                                _finish_manual_v2_sms_provider(success=False)
+                                manual_v2_phone_number = ""
+                                manual_v2_sms_activation_id = ""
+                                manual_v2_sms_purchased_at = 0.0
+                                manual_v2_sms_provider_done = False
+                                _prepare_manual_v2_signup_flow(
+                                    "浏览器模式2 create-account/password 提交后，站点明确提示当前手机号属于虚拟号/VoIP；"
+                                    + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                                )
+                            else:
+                                _prepare_manual_v2_signup_flow(
+                                    "浏览器模式2 create-account/password 提交后，站点明确提示当前手机号属于虚拟号/VoIP；"
+                                    + "回到步骤1重新输入新的非虚拟手机号..."
+                                )
+                            continue
                         if _is_phone_number_existing_account_error(current_url, body_text, page):
                             password_submitted = False
                             manual_v2_password_page_logged = False
@@ -8184,7 +8640,7 @@ def run_browser_registration(
                                 manual_v2_sms_provider_done = False
                                 _prepare_manual_v2_signup_flow(
                                     "浏览器模式2 create-account/password 提交后，站点明确提示当前手机号已存在账号；"
-                                    + "已立即废弃本轮 HeroSMS 号码并回到步骤1重新取新号..."
+                                    + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
                                 )
                             else:
                                 _prepare_manual_v2_signup_flow(
@@ -8204,7 +8660,7 @@ def run_browser_registration(
                                 manual_v2_sms_provider_done = False
                                 _prepare_manual_v2_signup_flow(
                                     "浏览器模式2 create-account/password 提交后，站点明确提示 Failed to create account；"
-                                    + "已立即废弃本轮 HeroSMS 号码并回到步骤1重新取号..."
+                                    + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取号..."
                                 )
                             else:
                                 _prepare_manual_v2_signup_flow(
@@ -8221,7 +8677,7 @@ def run_browser_registration(
                                     step="create_password",
                                 )
                                 _wait_for_load(page, timeout_ms=1800)
-                                _sleep_with_page(page, 1200)
+                                _sleep_with_page(page, 500)
                                 continue
                             refreshed_retryable = False
                             for _ in range(4):
@@ -8251,7 +8707,7 @@ def run_browser_registration(
                                     manual_v2_contact_network_seen = True
                                     break
                                 _wait_for_load(page, timeout_ms=600)
-                                _sleep_with_page(page, 350)
+                                _sleep_with_page(page, 180)
                             if _is_create_account_failed_error(current_url, body_text, page):
                                 password_submitted = False
                                 manual_v2_password_page_logged = False
@@ -8293,7 +8749,7 @@ def run_browser_registration(
                                 manual_v2_require_phone_resubmit = False
                                 emitter.info(
                                     (
-                                        "浏览器模式2 当前页面快照仍显示密码页，但 HeroSMS 已经收到验证码，"
+                                        f"浏览器模式2 当前页面快照仍显示密码页，但 {manual_v2_auto_phone_provider_label} 已经收到验证码，"
                                         + "直接按短信验证码阶段继续，跳过多余的密码重试..."
                                         if hero_sms_code_ready
                                         else "浏览器模式2 当前页面快照仍显示密码页，但最近网络已进入发码/短信验证码链路，"
@@ -8406,24 +8862,24 @@ def run_browser_registration(
                                 try:
                                     _ensure_manual_v2_auto_phone(
                                         step="add_phone",
-                                        prompt="浏览器模式2 已进入步骤1手机号页，准备通过 HeroSMS 自动获取本轮注册手机号...",
+                                        prompt=f"浏览器模式2 已进入步骤1手机号页，准备通过 {manual_v2_auto_phone_provider_label} 自动获取本轮注册手机号...",
                                     )
                                 except HeroSMSAcquireStoppedError:
                                     emitter.info(
-                                        "浏览器模式2 HeroSMS 取号过程中收到停止请求，当前流程立即收尾退出...",
+                                        f"浏览器模式2 {manual_v2_auto_phone_provider_label} 取号过程中收到停止请求，当前流程立即收尾退出...",
                                         step="add_phone",
                                     )
                                     return None
                                 except HeroSMSAcquireRetryableError as exc:
                                     emitter.warn(str(exc), step="add_phone")
                                     emitter.info(
-                                        "浏览器模式2 HeroSMS 当前取号失败，但不结束本轮浏览器流程；等待后继续在当前手机号页重试取号...",
+                                        f"浏览器模式2 {manual_v2_auto_phone_provider_label} 当前取号失败，但不结束本轮浏览器流程；等待后继续在当前手机号页重试取号...",
                                         step="add_phone",
                                     )
                                     _wait_for_load(page, timeout_ms=1200)
                                     if _sleep_with_page_until(page, 3000, ctx.stop_event):
                                         emitter.info(
-                                            "浏览器模式2 HeroSMS 重试等待期间收到停止请求，当前流程立即收尾退出...",
+                                            f"浏览器模式2 {manual_v2_auto_phone_provider_label} 重试等待期间收到停止请求，当前流程立即收尾退出...",
                                             step="add_phone",
                                         )
                                         return None
@@ -8432,7 +8888,7 @@ def run_browser_registration(
                             manual_v2_wait_phone_last_url = current_url
                             if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="add_phone"):
                                 raise RuntimeError("浏览器模式2 自动模式提交步骤1手机号失败")
-                            emitter.info("浏览器模式2 已自动提交 HeroSMS 手机号，等待进入创建密码页...", step="add_phone")
+                            emitter.info(f"浏览器模式2 已自动提交 {manual_v2_auto_phone_provider_label} 手机号，等待进入创建密码页...", step="add_phone")
                             current_url, body_text = _wait_for_manual_v2_phone_submit_transition(
                                 previous_url,
                                 previous_body,
@@ -8559,7 +9015,7 @@ def run_browser_registration(
                             manual_v2_sms_provider_done = False
                             _prepare_manual_v2_signup_flow(
                                 "浏览器模式2 自动接码模式在步骤1命中 Enter your password，"
-                                + "判定当前手机号已是老号；已废弃本轮 HeroSMS 号码并回到步骤1重新取新号..."
+                                + f"判定当前手机号已是老号；已废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
                             )
                             continue
                         if _click_first(
@@ -8601,6 +9057,23 @@ def run_browser_registration(
                                     + "回到步骤1重新输入手机号..."
                                 )
                                 continue
+                            if _is_virtual_phone_number_error(current_url, body_text, page):
+                                if manual_v2_auto_phone_mode:
+                                    _finish_manual_v2_sms_provider(success=False)
+                                    manual_v2_phone_number = ""
+                                    manual_v2_sms_activation_id = ""
+                                    manual_v2_sms_purchased_at = 0.0
+                                    manual_v2_sms_provider_done = False
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 reset-password 点击继续后，站点明确提示当前手机号属于虚拟号/VoIP；"
+                                        + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                                    )
+                                else:
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 reset-password 点击继续后，站点明确提示当前手机号属于虚拟号/VoIP；"
+                                        + "回到步骤1重新输入新的非虚拟手机号..."
+                                    )
+                                continue
                             continue
 
                     if (
@@ -8613,6 +9086,28 @@ def run_browser_registration(
                             "浏览器模式2 reset-password 当前手机号无法发送短信验证码，"
                             + "回到步骤1重新输入手机号..."
                         )
+                        continue
+                    if (
+                        not manual_v2_login_flow_started
+                        and manual_v2_reset_password_flow_started
+                        and manual_v2_reset_password_continue_clicked
+                        and _is_virtual_phone_number_error(current_url, body_text, page)
+                    ):
+                        if manual_v2_auto_phone_mode:
+                            _finish_manual_v2_sms_provider(success=False)
+                            manual_v2_phone_number = ""
+                            manual_v2_sms_activation_id = ""
+                            manual_v2_sms_purchased_at = 0.0
+                            manual_v2_sms_provider_done = False
+                            _prepare_manual_v2_signup_flow(
+                                "浏览器模式2 reset-password 当前手机号被站点判定为虚拟号/VoIP；"
+                                + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                            )
+                        else:
+                            _prepare_manual_v2_signup_flow(
+                                "浏览器模式2 reset-password 当前手机号被站点判定为虚拟号/VoIP；"
+                                + "回到步骤1重新输入新的非虚拟手机号..."
+                            )
                         continue
 
                     if _is_contact_verification_page(current_url, body_text, page):
@@ -8685,12 +9180,12 @@ def run_browser_registration(
                             if not manual_v2_wait_contact_logged:
                                 manual_v2_wait_contact_logged = True
                                 emitter.info(
-                                    "浏览器模式2 已进入短信验证码页，准备通过 HeroSMS 自动轮询短信验证码并提交...",
+                                    f"浏览器模式2 已进入短信验证码页，准备通过 {manual_v2_auto_phone_provider_label} 自动轮询短信验证码并提交...",
                                     step="phone_verification",
                                 )
                             sms_code = _wait_manual_v2_auto_sms_code(
                                 step="phone_verification",
-                                prompt="浏览器模式2 当前需要短信验证码，开始通过 HeroSMS 轮询本轮号码的 6 位短信码；若 60 秒仍未收到，将结束本地流程，并在满足取消窗口后后台补发取消...",
+                                prompt=f"浏览器模式2 当前需要短信验证码，开始通过 {manual_v2_auto_phone_provider_label} 轮询本轮号码的 6 位短信码；若 60 秒仍未收到，将结束本地流程，并在满足取消窗口后后台补发取消...",
                                 timeout_seconds=60,
                             )
                             if not sms_code:
@@ -8711,7 +9206,7 @@ def run_browser_registration(
                                 manual_v2_sms_purchased_at = 0.0
                                 manual_v2_sms_provider_done = False
                                 _prepare_manual_v2_signup_flow(
-                                    "浏览器模式2 HeroSMS 在短信验证码阶段等待 60 秒仍未收到短信；"
+                                    f"浏览器模式2 {manual_v2_auto_phone_provider_label} 在短信验证码阶段等待 60 秒仍未收到短信；"
                                     + "本地已放弃当前号码，若未到 2 分钟取消窗口将转后台延迟取消，然后回到步骤1重新取号..."
                                 )
                                 continue
@@ -8723,7 +9218,7 @@ def run_browser_registration(
                                 raise RuntimeError("浏览器模式2 自动模式提交短信验证码失败")
                             manual_v2_wait_contact_logged = False
                             manual_v2_sms_code_submitted = True
-                            emitter.info("浏览器模式2 已自动提交 HeroSMS 短信验证码，等待后续跳转...", step="phone_verification")
+                            emitter.info(f"浏览器模式2 已自动提交 {manual_v2_auto_phone_provider_label} 短信验证码，等待后续跳转...", step="phone_verification")
                             current_url, body_text = _wait_for_manual_v2_contact_submit_transition(
                                 current_url,
                                 body_text,
@@ -9217,7 +9712,7 @@ def run_browser_registration(
                             if not manual_v2_phone_number and manual_v2_auto_phone_mode:
                                 manual_v2_phone_number = _ensure_manual_v2_auto_phone(
                                     step="create_email",
-                                    prompt="浏览器模式2 reset-password 后的补资料登录流已到手机号输入页，准备复用本轮 HeroSMS 手机号自动继续...",
+                                    prompt=f"浏览器模式2 reset-password 后的补资料登录流已到手机号输入页，准备复用本轮 {manual_v2_auto_phone_provider_label} 手机号自动继续...",
                                 )
                             if manual_v2_phone_number:
                                 if not _submit_manual_v2_phone_input(page, manual_v2_phone_number, step="create_email"):
@@ -9447,7 +9942,7 @@ def run_browser_registration(
                                 if manual_v2_auto_phone_mode:
                                     manual_v2_phone_number = _ensure_manual_v2_auto_phone(
                                         step="create_email",
-                                        prompt="浏览器模式2 当前位于第二步手机号输入页，准备复用本轮 HeroSMS 手机号自动继续登录...",
+                                        prompt=f"浏览器模式2 当前位于第二步手机号输入页，准备复用本轮 {manual_v2_auto_phone_provider_label} 手机号自动继续登录...",
                                     )
                                 if not manual_v2_wait_phone_logged or manual_v2_wait_phone_last_url != current_url:
                                     manual_v2_wait_phone_logged = True
@@ -9498,6 +9993,15 @@ def run_browser_registration(
                         manual_v2_bridge_entered_at = 0.0
                         manual_v2_bridge_logged = False
                         manual_v2_email_verification_logged = False
+                        if manual_v2_manual_email_mode:
+                            emitter.info("浏览器模式2 已进入 add-email 页面，等待你手动提供本次要绑定的邮箱...", step="create_email")
+                            manual_email = _wait_manual_v2_email_input(
+                                step="create_email",
+                                prompt="模式2第二步需要绑定邮箱，请输入你这次要补绑的邮箱地址。",
+                            )
+                            if not manual_email or "@" not in manual_email:
+                                raise RuntimeError("浏览器模式2 手动邮箱输入为空或格式不正确")
+                            ctx.email = manual_email.strip()
                         emitter.info(f"浏览器模式2 已进入 add-email 页面，准备绑定邮箱: {ctx.email}", step="create_email")
                         emitter.info(
                             "进入 add-email 前会话诊断: cookies="
@@ -9662,7 +10166,7 @@ def run_browser_registration(
                                 manual_v2_sms_provider_done = False
                                 _prepare_manual_v2_signup_flow(
                                     "浏览器模式2 密码提交后等待后续页面时，站点已出现 Failed to create account；"
-                                    + "已立即废弃本轮 HeroSMS 号码并回到步骤1重新取号..."
+                                    + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取号..."
                                 )
                             else:
                                 _prepare_manual_v2_signup_flow(
@@ -9692,7 +10196,7 @@ def run_browser_registration(
                                         step="create_password",
                                     )
                                 _wait_for_load(page, timeout_ms=1800)
-                                _sleep_with_page(page, 1200)
+                                _sleep_with_page(page, 500)
                                 continue
                             recent_register_request = _has_recent_network_url(
                                 recent_network_events,
@@ -9716,7 +10220,7 @@ def run_browser_registration(
                                     manual_v2_wait_phone_logged = False
                                     manual_v2_wait_phone_last_url = ""
                                     emitter.info(
-                                        "浏览器模式2 密码提交后 HeroSMS 已提前收到验证码，"
+                                        f"浏览器模式2 密码提交后 {manual_v2_auto_phone_provider_label} 已提前收到验证码，"
                                         + "不再继续等待页面切换，直接进入短信验证码处理阶段...",
                                         step="phone_verification",
                                     )
@@ -9731,7 +10235,7 @@ def run_browser_registration(
                                         step="create_password",
                                     )
                                 _wait_for_load(page, timeout_ms=1200)
-                                _sleep_with_page(page, 800)
+                                _sleep_with_page(page, 250)
                                 continue
                             password_submitted = False
                             manual_v2_password_page_logged = False
@@ -9753,7 +10257,7 @@ def run_browser_registration(
                                     + _mask_secret(current_url, head=56, tail=12),
                                     step="phone_verification",
                                 )
-                        _sleep_with_page(page, 800)
+                        _sleep_with_page(page, 250)
                         continue
 
                 if (
@@ -10134,6 +10638,19 @@ def run_browser_registration(
                             _page_shown_email = _email_match.group(1).strip().lower()
                     except Exception:
                         pass
+                    if manual_v2_manual_email_mode:
+                        if _page_shown_email:
+                            ctx.email = _page_shown_email
+                        email_submitted = True
+                        manual_v2_post_login_pending_email = False
+                        manual_v2_bridge_entered_at = 0.0
+                        manual_v2_bridge_logged = False
+                        emitter.info(
+                            "浏览器模式2 第二步登录后已直接进入 email-verification；当前为手动邮箱模式，"
+                            + "直接接管页面显示的目标邮箱并等待你手动输入邮箱验证码...",
+                            step="send_otp",
+                        )
+                        continue
                     _our_email = str(ctx.email or "").strip().lower()
                     if _page_shown_email and _our_email and _page_shown_email != _our_email:
                         # 收集 mail_provider 的所有 custom_domains
@@ -10286,26 +10803,42 @@ def run_browser_registration(
                                     "浏览器模式2 在 email-verification 页面不再主动点击重发，先等待当前验证码邮件到达...",
                                     step="send_otp",
                                 )
-                        emitter.info("浏览器流程进入邮箱 OTP 阶段，页面已就绪，开始轮询邮箱...", step="send_otp")
+                        if manual_v2_manual_email_mode:
+                            emitter.info("浏览器模式2 邮箱验证码页已就绪，等待你在任务控制卡片中手动提交邮箱验证码...", step="send_otp")
+                        else:
+                            emitter.info("浏览器流程进入邮箱 OTP 阶段，页面已就绪，开始轮询邮箱...", step="send_otp")
                         otp_wait_started = True
                     otp_page_ready_logged = False
                     current_wait_timeout = otp_wait_timeout_seconds
-                    emitter.info(
-                        f"浏览器正在等待邮箱 {ctx.email} 的验证码... "
-                        + f"(timeout={current_wait_timeout}s, resend={otp_resend_attempts}/{otp_max_resend_attempts})",
-                        step="wait_otp",
-                    )
-                    otp_code = _wait_for_mail_otp(
-                        ctx,
-                        timeout_seconds=current_wait_timeout,
-                    )
-                    if not otp_code:
-                        if _schedule_otp_resend(
-                            f"浏览器等待邮箱 OTP 超时（{current_wait_timeout}s）",
+                    otp_code = ""
+                    if manual_v2_manual_email_mode:
+                        emitter.info(
+                            "浏览器模式2 当前需要邮箱验证码，请在任务控制卡片中输入邮箱收到的 6 位验证码并提交...",
                             step="wait_otp",
-                        ):
-                            continue
-                        raise RuntimeError("浏览器模式等待邮箱 OTP 超时，且重发验证码仍未成功收到新验证码")
+                        )
+                        otp_code = _wait_manual_v2_email_code(
+                            step="wait_otp",
+                            prompt=f"模式2当前正在验证邮箱 {ctx.email}，请输入该邮箱收到的验证码。",
+                        )
+                        if not otp_code:
+                            raise RuntimeError("浏览器模式2 未收到手动输入的邮箱验证码")
+                    else:
+                        emitter.info(
+                            f"浏览器正在等待邮箱 {ctx.email} 的验证码... "
+                            + f"(timeout={current_wait_timeout}s, resend={otp_resend_attempts}/{otp_max_resend_attempts})",
+                            step="wait_otp",
+                        )
+                        otp_code = _wait_for_mail_otp(
+                            ctx,
+                            timeout_seconds=current_wait_timeout,
+                        )
+                        if not otp_code:
+                            if _schedule_otp_resend(
+                                f"浏览器等待邮箱 OTP 超时（{current_wait_timeout}s）",
+                                step="wait_otp",
+                            ):
+                                continue
+                            raise RuntimeError("浏览器模式等待邮箱 OTP 超时，且重发验证码仍未成功收到新验证码")
                     submit_attempt_count = int(otp_code_submit_attempts.get(otp_code, 0) or 0)
                     if submit_attempt_count >= otp_same_code_retry_limit:
                         emitter.info(

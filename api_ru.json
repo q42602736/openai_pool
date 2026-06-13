@@ -1,0 +1,5046 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "API protocol for working with HEROSMS",
+    "description": "Do you use software for registrations? HeroSMS is compatible with former SMS-Activate partners\n\n1. Choose any software that includes SMS-Activate among its SMS reception services.\n2. Select SMS-Activate as the service for receiving SMS.\n3. Replace the host from https://api.sms-activate.ae to https://hero-sms.com in your software settings.\n4. Enter the API key from your HeroSMS account (request it on our website).\n\nIf you face any difficulties, contact our tech support, please. We will deal with everything.",
+    "version": "1.0"
+  },
+  "servers": [
+    {
+      "url": "https://hero-sms.com/api/v1",
+      "description": "HeroSMS API server"
+    },
+    {
+      "url": "https://hero-sms.com/stubs/handler_api.php",
+      "description": "SMS-Activate API-compatible server"
+    }
+  ],
+  "paths": {
+    "/activations/offers": {
+      "get": {
+        "tags": [
+          "Activations"
+        ],
+        "summary": "Предложения активаций",
+        "description": "Сервисы заданы в произвольном порядке, страны отсортированы по популярности",
+        "operationId": "434f72d594d60aac33007f802a61b90d",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/servicesPath"
+          },
+          {
+            "$ref": "#/components/parameters/countriesPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ActivationsOffersSchema"
+                      }
+                    }
+                  },
+                  "type": "object"
+                },
+                "examples": {
+                  "noFilters": {
+                    "$ref": "#/components/examples/ActivationsOffersExample"
+                  },
+                  "services=tg,go": {
+                    "$ref": "#/components/examples/ActivationsOffersServicesFilterExample"
+                  },
+                  "countries=6,48": {
+                    "$ref": "#/components/examples/ActivationsOffersCountriesFilterExample"
+                  },
+                  "services=tg,ig&countries=6,50": {
+                    "$ref": "#/components/examples/ActivationsOffersServicesCountriesFiltersExample"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/OfferNotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntityResponse"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequestsResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/emails": {
+      "get": {
+        "tags": [
+          "Emails"
+        ],
+        "summary": "Получить список активных покупок",
+        "operationId": "7f17119e77aad0c154d2f5e600ef092a",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/search"
+          },
+          {
+            "$ref": "#/components/parameters/size"
+          },
+          {
+            "$ref": "#/components/parameters/page"
+          },
+          {
+            "$ref": "#/components/parameters/sort"
+          },
+          {
+            "parameter": "status",
+            "name": "status",
+            "in": "query",
+            "description": "Фильтр по статусам",
+            "required": false,
+            "style": "deepObject",
+            "explode": true,
+            "schema": {
+              "properties": {
+                "id": {
+                  "description": "Статусы",
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "enum": [
+                      3,
+                      4,
+                      5,
+                      6
+                    ]
+                  }
+                }
+              },
+              "type": "object"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/from"
+          },
+          {
+            "$ref": "#/components/parameters/to"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/EmailActivation"
+                      }
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Emails"
+        ],
+        "summary": "Купить активацию по почте",
+        "operationId": "22164e5067a27560b8fbf28b2ac1f019",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "required": [
+                  "site",
+                  "domain"
+                ],
+                "properties": {
+                  "site": {
+                    "$ref": "#/components/schemas/EmailSite"
+                  },
+                  "domain": {
+                    "$ref": "#/components/schemas/EmailDomain"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/EmailActivationSuccessResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/emails/batch": {
+      "post": {
+        "tags": [
+          "Emails"
+        ],
+        "summary": "Купить активацию по почте пачками",
+        "operationId": "7892a59d83e6e38d154854fe1f1b065f",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "required": [
+                  "site",
+                  "domain",
+                  "count"
+                ],
+                "properties": {
+                  "site": {
+                    "$ref": "#/components/schemas/EmailSite"
+                  },
+                  "domain": {
+                    "$ref": "#/components/schemas/EmailDomain"
+                  },
+                  "count": {
+                    "description": "Количество почт для активации (от 1 до 10)",
+                    "type": "integer",
+                    "maximum": 10,
+                    "minimum": 1,
+                    "example": 5
+                  },
+                  "service": {
+                    "$ref": "#/components/schemas/ServiceId"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/EmailActivationBatchSuccessResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/emails/{emailId}": {
+      "get": {
+        "tags": [
+          "Emails"
+        ],
+        "summary": "Проверить состояние активации по почте",
+        "operationId": "c57ebd15edbfa8625b8a60984b76e3c6",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/emailId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/EmailActivationSuccessResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Emails"
+        ],
+        "summary": "Отменить покупку активации по почте",
+        "operationId": "20dae8daa691db1282f0d1d268dbac44",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/emailId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/emails/{emailId}/reorder": {
+      "post": {
+        "tags": [
+          "Emails"
+        ],
+        "summary": "Перезаказать активацию по почте",
+        "operationId": "bb0d53e0557982f130c1540ed663e831",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/emailId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/EmailActivationSuccessResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/emails/domains": {
+      "get": {
+        "tags": [
+          "Emails"
+        ],
+        "summary": "Получить список доступных доменов",
+        "operationId": "59f271906bdbc81b6b2cdd4213b01775",
+        "parameters": [
+          {
+            "name": "site",
+            "in": "query",
+            "description": "Сайт для которого берётся активация",
+            "schema": {
+              "type": "string",
+              "example": "telegram.com"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "properties": {
+                          "name": {
+                            "description": "Наименование домена",
+                            "type": "string"
+                          },
+                          "cost": {
+                            "description": "Цена",
+                            "type": "number",
+                            "format": "float"
+                          },
+                          "count": {
+                            "description": "Количество доступных почт",
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      }
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "?action=getBalance": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить баланс аккаунта",
+        "description": "Возвращает текущий баланс в формате `ACCESS_BALANCE:<сумма>`",
+        "operationId": "getBalance",
+        "responses": {
+          "200": {
+            "description": "Результат запроса баланса",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                },
+                "examples": {
+                  "successfulBalanceExample": {
+                    "$ref": "#/components/examples/successfulBalanceExample"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/methodNotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getNumber": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить номер",
+        "description": "Запрашивает телефонный номер для указанного сервиса и страны. Возвращает строку вида `ACCESS_NUMBER:<id_активации>:<номер>`",
+        "operationId": "getNumber",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredService"
+          },
+          {
+            "$ref": "#/components/parameters/qpSARequiredCountry"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalOperator"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalMaxPrice"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalFixedPrice"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalRef"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalPhoneException"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат запроса номера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                },
+                "examples": {
+                  "successfulNumberExample": {
+                    "$ref": "#/components/examples/successfulNumberExample"
+                  },
+                  "numbersNotFoundExample": {
+                    "$ref": "#/components/examples/numbersNotFoundExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/getNumberBadRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "402": {
+            "$ref": "#/components/responses/paymentRequiredResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/methodNotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getNumberV2": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить номер V2",
+        "description": "Аналогичен getNumber, но возвращает больше информации об активации (JSON-объект)",
+        "operationId": "getNumberV2",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredService"
+          },
+          {
+            "$ref": "#/components/parameters/qpSARequiredCountry"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalOperator"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalMaxPrice"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalFixedPrice"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalRef"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalPhoneException"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат запроса номера (V2)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                },
+                "examples": {
+                  "successfulNumberv2Example": {
+                    "$ref": "#/components/examples/successfulNumberv2Example"
+                  },
+                  "numbersNotFoundExample": {
+                    "$ref": "#/components/examples/numbersNotFoundExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/getNumberBadRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "402": {
+            "$ref": "#/components/responses/paymentRequiredResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/methodNotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=setStatus": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Изменить статус активации",
+        "description": "Управление жизненным циклом активации.\nВозможные статусы:\n- 3  — запросить повторную отправку SMS\n- 6  — завершить активацию (код получен и подтверждён)\n- 8  — отменить активацию (вернуть деньги)",
+        "operationId": "setStatus",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          },
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationStatus"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат изменения статуса",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                },
+                "examples": {
+                  "successfulRetryGetExample": {
+                    "$ref": "#/components/examples/successfulRetryGetExample"
+                  },
+                  "successfulAccessActivationExample": {
+                    "$ref": "#/components/examples/successfulAccessActivationExample"
+                  },
+                  "successfulAccessCancelExample": {
+                    "$ref": "#/components/examples/successfulAccessCancelExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/badRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/activationCancelConflictResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getStatus": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить статус активации",
+        "description": "Возвращает текущий статус активации в текстовом виде (STATUS_WAIT_CODE, STATUS_OK и т.д.) + код при наличии",
+        "operationId": "getStatus",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Текущий статус активации",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                },
+                "examples": {
+                  "successfulWaitCodeExample": {
+                    "$ref": "#/components/examples/successfulWaitCodeExample"
+                  },
+                  "successfulWaitRetryExample": {
+                    "$ref": "#/components/examples/successfulWaitRetryExample"
+                  },
+                  "successfulWaitResendExample": {
+                    "$ref": "#/components/examples/successfulWaitResendExample"
+                  },
+                  "successfulCancelExample": {
+                    "$ref": "#/components/examples/successfulCancelExample"
+                  },
+                  "successfulOKExample": {
+                    "$ref": "#/components/examples/successfulOKExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/badRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "402": {
+            "$ref": "#/components/responses/paymentRequiredResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getStatusV2": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить состояние активации V2",
+        "description": "Возвращает статус активации в структурированном виде (JSON)",
+        "operationId": "getStatusV2",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Текущий статус активации (V2)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivationStatusV2"
+                },
+                "examples": {
+                  "correctActivationStatusExample": {
+                    "$ref": "#/components/examples/successfulActivationV2Example"
+                  },
+                  "successfulCancelExample": {
+                    "summary": "Активация отменена",
+                    "value": "STATUS_CANCEL"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/badRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "402": {
+            "$ref": "#/components/responses/paymentRequiredResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getActiveActivations": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить список активных активации",
+        "description": "Возвращает список активных активаций",
+        "operationId": "getActiveActivations",
+        "parameters": [
+          {
+            "name": "start",
+            "in": "query",
+            "description": "Смещение (по умолчанию 0)",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Лимит записей (макс. 100)",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат получения активных активаций",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActiveActivations"
+                },
+                "examples": {
+                  "activationsSuccessfulExample": {
+                    "$ref": "#/components/examples/activationsSuccessfulExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/badRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "402": {
+            "$ref": "#/components/responses/paymentRequiredResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/methodNotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getHistory": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить историю активаций",
+        "description": "Возвращает историю активаций",
+        "operationId": "getHistory",
+        "parameters": [
+          {
+            "name": "start",
+            "in": "query",
+            "description": "Начало периода (Unix Timestamp)",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "description": "Конец периода (Unix Timestamp)",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Смещение (по умолчанию 0)",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "description": "Лимит записей (макс. 100)",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат получения истории активаций",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivationsHistory"
+                },
+                "examples": {
+                  "successfulActivationsHistoryExample": {
+                    "$ref": "#/components/examples/successfulActivationsHistoryExample"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/methodNotFoundResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=reactivate": {
+      "post": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить реактивацию номера",
+        "description": "Запрашивает успешно использованный телефонный номер",
+        "operationId": "reactivate",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат реактивации номера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/successfulNumberv2Response"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "402": {
+            "$ref": "#/components/responses/paymentRequiredResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/reactivationForbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=reactivationPrice": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить стоимость реактивации номера",
+        "description": "Запрашивает стоимость реактивации номера",
+        "operationId": "reactivationPrice",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Стоимость реактивации номера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/reactivationPriceResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/reactivationForbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=prolong": {
+      "post": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Продлить номер",
+        "description": "Продлевает работу с телефонным номером. Работает только для активаций с типом 'Аренда'",
+        "operationId": "prolong",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          },
+          {
+            "$ref": "#/components/parameters/qpSARequiredDuration"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат продления номера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/successfulNumberv2Response"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/prolongationBadRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "402": {
+            "$ref": "#/components/responses/paymentRequiredResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=prolongPrice": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить стоимость продления номера",
+        "description": "Запрашивает стоимость продления номера",
+        "operationId": "prolongPrice",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Стоимость продления номера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/prolongationPriceListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/prolongationInfoBadRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=prolongHistory": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить историю продлений номера",
+        "description": "Запрашивает историю продлений номера",
+        "operationId": "prolongHistory",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "История продлений номера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/prolongationHistoryListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/prolongationInfoBadRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getCountries": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить список стран",
+        "description": "Возвращает список стран",
+        "operationId": "getCountries",
+        "responses": {
+          "200": {
+            "description": "Результат запроса списка стран",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Country"
+                },
+                "examples": {
+                  "successGetCountriesExample": {
+                    "$ref": "#/components/examples/successGetCountriesExample"
+                  },
+                  "missingKeyExample": {
+                    "$ref": "#/components/examples/missingKeyExample"
+                  },
+                  "incorrectKeyExample": {
+                    "$ref": "#/components/examples/incorrectKeyExample"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getServicesList": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить список сервисов",
+        "description": "Возвращает список сервисов",
+        "operationId": "getServicesList",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSAOptionalCountry"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalLang"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат запроса списка сервисов",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Service"
+                },
+                "examples": {
+                  "successGetServicesListExample": {
+                    "$ref": "#/components/examples/successGetServicesListExample"
+                  },
+                  "missingKeyExample": {
+                    "$ref": "#/components/examples/missingKeyExample"
+                  },
+                  "incorrectKeyExample": {
+                    "$ref": "#/components/examples/incorrectKeyExample"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getOperators": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить доступных операторов",
+        "description": "Возвращает список операторов",
+        "operationId": "getOperators",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSAOptionalCountry"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат запроса списка операторов",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operators"
+                },
+                "examples": {
+                  "successfulGetOperatorsExample": {
+                    "$ref": "#/components/examples/successfulGetOperatorsExample"
+                  },
+                  "operatorsNotFoundExample": {
+                    "$ref": "#/components/examples/operatorsNotFoundExample"
+                  },
+                  "sqlServerErrorExample": {
+                    "$ref": "#/components/examples/sqlServerErrorExample"
+                  },
+                  "missingKeyExample": {
+                    "$ref": "#/components/examples/missingKeyExample"
+                  },
+                  "incorrectKeyExample": {
+                    "$ref": "#/components/examples/incorrectKeyExample"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getPrices": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить актуальные цены",
+        "description": "Возвращает цены и количество доступных номеров по странам и сервисам",
+        "operationId": "getPrices",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSAOptionalService"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalCountry"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат получения актуальных цен",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PricesByCountry"
+                },
+                "examples": {
+                  "successGetPrices": {
+                    "$ref": "#/components/examples/successGetPrices"
+                  },
+                  "incorrectServiceExample": {
+                    "$ref": "#/components/examples/incorrectServiceExample"
+                  },
+                  "incorrectCountryExample": {
+                    "$ref": "#/components/examples/incorrectCountryExample"
+                  },
+                  "badActionExample": {
+                    "$ref": "#/components/examples/badActionExample"
+                  },
+                  "missingKeyExample": {
+                    "$ref": "#/components/examples/missingKeyExample"
+                  },
+                  "incorrectKeyExample": {
+                    "$ref": "#/components/examples/incorrectKeyExample"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getTopCountriesByService": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить топ стран по сервису",
+        "description": "Метод устарел. Используйте метод GET activations/offers",
+        "operationId": "getTopCountriesByService",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSAOptionalService"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalFreePrice"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат получения топа стран по сервису",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopCountriesByService"
+                },
+                "examples": {
+                  "topCountriesAllServicesExample": {
+                    "$ref": "#/components/examples/topCountriesAllServicesExample"
+                  },
+                  "topCountriesOneServiceExample": {
+                    "$ref": "#/components/examples/topCountriesOneServiceExample"
+                  },
+                  "missingKeyExample": {
+                    "$ref": "#/components/examples/missingKeyExample"
+                  },
+                  "incorrectKeyExample": {
+                    "$ref": "#/components/examples/incorrectKeyExample"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getTopCountriesByServiceRank": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить топ стран по сервису с учетом ранга пользователя",
+        "description": "Метод устарел. Используйте метод GET activations/offers",
+        "operationId": "getTopCountriesByServiceRank",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSAOptionalService"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalFreePrice"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат получения топа стран по сервису",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopCountriesByService"
+                },
+                "examples": {
+                  "topCountriesAllServicesExample": {
+                    "$ref": "#/components/examples/topCountriesAllServicesExample"
+                  },
+                  "topCountriesOneServiceExample": {
+                    "$ref": "#/components/examples/topCountriesOneServiceExample"
+                  },
+                  "missingKeyExample": {
+                    "$ref": "#/components/examples/missingKeyExample"
+                  },
+                  "incorrectKeyExample": {
+                    "$ref": "#/components/examples/incorrectKeyExample"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=serviceCountRent": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить актуальные цены и количество по аренде по сервису",
+        "description": "Возвращает цены и количество доступных номеров по выбранному сервису для аренды",
+        "operationId": "serviceCountRent",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredService"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalCountry"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalOperator"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalCurrency"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат получения актуальных цен и количества по аренде",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RentCountByService"
+                },
+                "examples": {
+                  "successServiceCountRent": {
+                    "$ref": "#/components/examples/successServiceCountRent"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/rentParamsBadRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getRentServicesAndCountries": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить актуальные цены и количество для аренды по стране",
+        "description": "Возвращает цены и количество доступных номеров по сервисам, а также список операторов",
+        "operationId": "getRentServicesAndCountries",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredCountry"
+          },
+          {
+            "$ref": "#/components/parameters/qpSARequiredDuration"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Успешный результат",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/getRentServicesAndCountries"
+                },
+                "examples": {
+                  "successGetRentServicesAndCountriesExample": {
+                    "$ref": "#/components/examples/successGetRentServicesAndCountriesExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/rentParamsBadRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "422": {
+            "$ref": "#/components/responses/unprocessableEntityResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "?action=getRentNumber": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Запросить номер для аренды",
+        "description": "Запрашивает телефонный номер для указанного сервиса и страны на заданный срок.",
+        "operationId": "getRentNumber",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredService"
+          },
+          {
+            "$ref": "#/components/parameters/qpSARequiredCountry"
+          },
+          {
+            "$ref": "#/components/parameters/qpSARequiredDuration"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalOperator"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalCurrency"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalRef"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат запроса аренды номера",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/successfulNumberv2Response"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/rentParamsBadRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "402": {
+            "$ref": "#/components/responses/paymentRequiredResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/noNumbersResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=getAllSms": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Получить все смс для указанной активации",
+        "description": "Запрашивает все смс для указанной активации.",
+        "operationId": "getAllSms",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalSize"
+          },
+          {
+            "$ref": "#/components/parameters/qpSAOptionalPage"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Результат запроса всех otp",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "required": [
+                    "data",
+                    "meta"
+                  ],
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/OtpListResponse"
+                    },
+                    "meta": {
+                      "schema": "ResponseMeta",
+                      "description": "Мета-данные ответа",
+                      "properties": {
+                        "total": {
+                          "description": "Общее количество записей",
+                          "type": "integer",
+                          "example": 42
+                        },
+                        "service": {
+                          "description": "Код сервиса",
+                          "type": "string",
+                          "example": "full"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/badRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/activationNotActiveResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=finishActivation": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Завершить работу с активацией",
+        "operationId": "finishActivation",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "OK"
+          },
+          "400": {
+            "$ref": "#/components/responses/badRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/activationFinishConflictResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    },
+    "?action=cancelActivation": {
+      "get": {
+        "tags": [
+          "SMS-Activate"
+        ],
+        "summary": "Отменить покупку активации",
+        "operationId": "cancelActivation",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/qpSARequiredActivationID"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "OK"
+          },
+          "400": {
+            "$ref": "#/components/responses/badRequestResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/unauthorizedResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/forbiddenResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/activationNotFoundResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/activationCancelConflictResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/SAServerErrorResponse"
+          }
+        },
+        "security": [
+          {
+            "apiKeyQuery": []
+          }
+        ],
+        "servers": [
+          {
+            "url": "https://hero-sms.com/stubs/handler_api.php",
+            "description": "SMS-Activate API-compatible server"
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ActivationsOffersSchema": {
+        "additionalProperties": {
+          "title": "service",
+          "type": "object",
+          "additionalProperties": {
+            "title": "countryId",
+            "properties": {
+              "prices": {
+                "properties": {
+                  "default": {
+                    "type": "number",
+                    "format": "float",
+                    "example": 1.1
+                  },
+                  "retail": {
+                    "type": "number",
+                    "format": "float",
+                    "example": 1.1
+                  },
+                  "min": {
+                    "$ref": "#/components/schemas/MinPrice"
+                  }
+                },
+                "type": "object"
+              },
+              "counts": {
+                "properties": {
+                  "total": {
+                    "type": "integer",
+                    "example": 101
+                  },
+                  "physical": {
+                    "type": "integer",
+                    "example": 51
+                  },
+                  "defaultPrice": {
+                    "type": "integer",
+                    "example": 50
+                  }
+                },
+                "type": "object"
+              },
+              "map": {
+                "type": "object",
+                "additionalProperties": {
+                  "title": "price",
+                  "type": "int"
+                }
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "EmailActivationCreateDTO": {
+        "required": [
+          "userId",
+          "site",
+          "email",
+          "status",
+          "cost",
+          "domain",
+          "rank"
+        ],
+        "properties": {
+          "userId": {
+            "type": "integer",
+            "example": 123
+          },
+          "site": {
+            "type": "string",
+            "example": "example.com"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "example": "test@example.com"
+          },
+          "status": {
+            "type": "integer",
+            "example": 1
+          },
+          "cost": {
+            "type": "number",
+            "format": "float",
+            "example": 0.25
+          },
+          "domain": {
+            "type": "string",
+            "example": "gmail.com"
+          }
+        },
+        "type": "object"
+      },
+      "EmailActivation": {
+        "description": "Активация по почте",
+        "required": [
+          "id",
+          "status",
+          "cost",
+          "currency",
+          "date"
+        ],
+        "properties": {
+          "id": {
+            "description": "ID",
+            "type": "integer"
+          },
+          "site": {
+            "description": "Сайт для которого берётся активация",
+            "type": "string"
+          },
+          "email": {
+            "description": "Почта",
+            "type": "string"
+          },
+          "status": {
+            "description": "Статус активации",
+            "type": "string",
+            "enum": [
+              "WAIT",
+              "CANCEL",
+              "SUCCESS"
+            ]
+          },
+          "value": {
+            "description": "Код",
+            "type": "string"
+          },
+          "cost": {
+            "description": "Цена",
+            "type": "number",
+            "format": "float"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "date": {
+            "$ref": "#/components/schemas/dateISO8601",
+            "description": "Дата создания"
+          },
+          "message": {
+            "description": "Полное письмо",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "EmailActivationFavorite": {
+        "description": "Избранная активация по почте",
+        "required": [
+          "id",
+          "status",
+          "cost",
+          "currency",
+          "date"
+        ],
+        "properties": {
+          "id": {
+            "description": "ID",
+            "type": "integer"
+          },
+          "site": {
+            "description": "Сайт для которого берётся активация",
+            "type": "string"
+          },
+          "domain": {
+            "description": "Почтовый домен",
+            "type": "string"
+          },
+          "service": {
+            "$ref": "#/components/schemas/ServiceId"
+          }
+        },
+        "type": "object"
+      },
+      "EmailSite": {
+        "description": "Сайт для которого берётся активация",
+        "type": "string",
+        "example": "telegram.com"
+      },
+      "EmailDomain": {
+        "description": "Домен почты",
+        "type": "string",
+        "example": "gmail.com"
+      },
+      "CountryId": {
+        "description": "ID страны",
+        "type": "integer",
+        "maximum": 999,
+        "minimum": 0,
+        "example": 2
+      },
+      "CountryName": {
+        "description": "Название страны согласно выбранному языку",
+        "type": "string",
+        "examples": {
+          "Казахстан": {
+            "summary": null
+          },
+          "Kazakhstan": {
+            "summary": null
+          },
+          "哈萨克斯坦": {
+            "summary": null
+          }
+        }
+      },
+      "ServiceId": {
+        "description": "Код сервиса",
+        "type": "string",
+        "maxLength": 4,
+        "minLength": 2,
+        "example": "tg"
+      },
+      "OperatorId": {
+        "description": "Код оператора",
+        "type": "string",
+        "default": "any",
+        "example": "axis"
+      },
+      "MaxPrice": {
+        "description": "Максимальная стоимость активации",
+        "type": "number",
+        "format": "float",
+        "example": 0.4321
+      },
+      "MinPrice": {
+        "description": "Минимально возможная персональная цена",
+        "type": "float",
+        "example": 0.4321
+      },
+      "ActivationId": {
+        "description": "ID активации",
+        "type": "string",
+        "example": "123456"
+      },
+      "Currency": {
+        "description": "ISO код валюты",
+        "type": "integer",
+        "default": 840,
+        "enum": [
+          840,
+          978,
+          156
+        ],
+        "example": 840
+      },
+      "SMSText": {
+        "description": "SMS Текст",
+        "type": [
+          "string",
+          "null"
+        ],
+        "example": "Your code is 12345"
+      },
+      "SMSCode": {
+        "description": "SMS Код",
+        "type": [
+          "string",
+          "null"
+        ],
+        "example": "12345"
+      },
+      "dateISO8601": {
+        "description": "Дата в формате ISO 8601",
+        "type": "string",
+        "format": "date-time",
+        "example": "2025-12-16T10:30:00.000000Z"
+      },
+      "dateRFC3339": {
+        "description": "Дата в формате RFC3339",
+        "type": "string",
+        "format": "date-time",
+        "example": "2026-02-19T10:37:46+00:00"
+      },
+      "ActivationStatusV2": {
+        "properties": {
+          "verificationType": {
+            "type": "integer",
+            "example": 2
+          },
+          "sms": {
+            "properties": {
+              "dateTime": {
+                "type": "string",
+                "format": "date-time",
+                "example": "0000-00-00 00:00:00"
+              },
+              "code": {
+                "type": "string",
+                "example": "code"
+              },
+              "text": {
+                "type": "string",
+                "example": "sms text"
+              }
+            },
+            "type": "object"
+          },
+          "call": {
+            "properties": {
+              "from": {
+                "type": "string",
+                "example": "phone"
+              },
+              "text": {
+                "type": "string",
+                "example": "voice text"
+              },
+              "code": {
+                "type": "string",
+                "example": "12345"
+              },
+              "dateTime": {
+                "type": "string",
+                "format": "date-time",
+                "example": "0000-00-00 00:00:00"
+              },
+              "url": {
+                "type": "string",
+                "example": "voice file url"
+              },
+              "parsingCount": {
+                "type": "integer",
+                "example": 1
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "ActiveActivation": {
+        "properties": {
+          "activationId": {
+            "$ref": "#/components/schemas/ActivationId"
+          },
+          "serviceCode": {
+            "$ref": "#/components/schemas/ServiceId"
+          },
+          "phoneNumber": {
+            "type": "string",
+            "example": "79********1"
+          },
+          "activationCost": {
+            "type": "number",
+            "example": 12.5
+          },
+          "activationStatus": {
+            "type": "string",
+            "example": "4"
+          },
+          "smsCode": {
+            "$ref": "#/components/schemas/SMSCode"
+          },
+          "smsText": {
+            "$ref": "#/components/schemas/SMSText"
+          },
+          "activationTime": {
+            "$ref": "#/components/schemas/dateISO8601"
+          },
+          "discount": {
+            "type": "string",
+            "example": "0.00"
+          },
+          "repeated": {
+            "type": "string",
+            "example": "0"
+          },
+          "countryCode": {
+            "$ref": "#/components/schemas/CountryId"
+          },
+          "countryName": {
+            "type": "string",
+            "example": "Kazakhstan"
+          },
+          "canGetAnotherSms": {
+            "type": "string",
+            "example": "1"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          }
+        },
+        "type": "object"
+      },
+      "ActiveActivations": {
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActiveActivation"
+            },
+            "minItems": 0
+          }
+        },
+        "type": "object"
+      },
+      "ActivationsHistory": {
+        "type": "array",
+        "items": {
+          "properties": {
+            "id": {
+              "type": "string",
+              "example": "635468024"
+            },
+            "date": {
+              "type": "string",
+              "format": "date-time",
+              "example": "0000-00-00 00:00:00"
+            },
+            "phone": {
+              "type": "string",
+              "example": "7*********0"
+            },
+            "sms": {
+              "type": "string",
+              "example": "Your code is ****"
+            },
+            "cost": {
+              "type": "number",
+              "example": 0
+            },
+            "status": {
+              "type": "string",
+              "example": "4"
+            },
+            "currency": {
+              "$ref": "#/components/schemas/Currency"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "TopCountriesOneService": {
+        "properties": {
+          "physicalTotalCount": {
+            "type": "integer",
+            "example": 9405
+          },
+          "physicalCountForDefaultPrice": {
+            "type": "integer",
+            "example": 4066
+          },
+          "physicalPriceMap": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "example": 0.018
+            }
+          },
+          "retail_price": {
+            "type": "number",
+            "example": 0.2
+          },
+          "country": {
+            "type": "integer",
+            "example": 6
+          },
+          "price": {
+            "type": "number",
+            "example": 0.045
+          },
+          "count": {
+            "type": "integer",
+            "example": 4528
+          }
+        },
+        "type": "object"
+      },
+      "TopCountriesAllServices": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/TopCountriesOneService"
+        }
+      },
+      "TopCountriesByService": {
+        "type": "object",
+        "additionalProperties": {
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/TopCountriesAllServices"
+            },
+            {
+              "$ref": "#/components/schemas/TopCountriesOneService"
+            }
+          ]
+        }
+      },
+      "PricesByCountry": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": {
+            "properties": {
+              "cost": {
+                "type": "number",
+                "example": 0.5
+              },
+              "count": {
+                "type": "integer",
+                "example": 10
+              },
+              "physicalCount": {
+                "type": "integer",
+                "example": 10
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "RentCountByService": {
+        "type": "object",
+        "additionalProperties": {
+          "description": "Страна (ключ — числовой идентификатор)",
+          "type": "object",
+          "pattern": "^[0-9]+$",
+          "additionalProperties": {
+            "description": "Длительность (ключ — числовой идентификатор)",
+            "required": [
+              "count",
+              "price"
+            ],
+            "properties": {
+              "price": {
+                "description": "Стоимость аренды",
+                "type": "number",
+                "example": 0.5432
+              },
+              "count": {
+                "description": "Количество доступных номеров",
+                "type": "integer",
+                "example": 10
+              }
+            },
+            "type": "object",
+            "pattern": "^[0-9]+$"
+          }
+        }
+      },
+      "getRentServicesAndCountries": {
+        "properties": {
+          "operators": {
+            "description": "Операторы",
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "services": {
+            "description": "Сервисы",
+            "type": "object",
+            "additionalProperties": {
+              "type": "string",
+              "example": "tg",
+              "additionalProperties": {
+                "properties": {
+                  "quantity": {
+                    "type": "number",
+                    "example": 2
+                  },
+                  "price": {
+                    "type": "integer",
+                    "example": 0.6
+                  },
+                  "retail_price": {
+                    "type": "integer",
+                    "example": 0.6
+                  }
+                },
+                "type": "object"
+              }
+            }
+          }
+        },
+        "type": "object"
+      },
+      "Country": {
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/CountryId"
+          },
+          "rus": {
+            "description": "Название страны на русском",
+            "type": "string",
+            "example": "Казахстан"
+          },
+          "eng": {
+            "description": "Название страны на английском",
+            "type": "string",
+            "example": "Kazakhstan"
+          },
+          "chn": {
+            "description": "Название страны на китайском",
+            "type": "string",
+            "example": "Kazakhstan"
+          },
+          "visible": {
+            "description": "1 - доступно, 0 - недоступно",
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ],
+            "example": 1
+          },
+          "retry": {
+            "description": "1 - доступно, 0 - недоступно",
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ],
+            "example": 1
+          }
+        },
+        "type": "object"
+      },
+      "Service": {
+        "properties": {
+          "code": {
+            "description": "ID сервиса",
+            "type": "string",
+            "example": "aoo"
+          },
+          "name": {
+            "description": "Название сервиса",
+            "type": "string",
+            "example": "Pegasus Airlines"
+          }
+        },
+        "type": "object"
+      },
+      "Operators": {
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "countryOperators": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "type": "object"
+      },
+      "AccountBannedInfo": {
+        "required": [
+          "scope",
+          "banned_until",
+          "retry_after_seconds"
+        ],
+        "properties": {
+          "scope": {
+            "description": "Область блокировки: на всё или на конкретную позицию",
+            "type": "string",
+            "enum": [
+              "global",
+              "specific"
+            ]
+          },
+          "banned_until": {
+            "description": "Unix Timestamp окончания бана",
+            "type": "integer"
+          },
+          "retry_after_seconds": {
+            "description": "Через сколько секунд можно повторить запрос",
+            "type": "integer"
+          },
+          "readable_date": {
+            "$ref": "#/components/schemas/dateRFC3339"
+          }
+        },
+        "type": "object"
+      },
+      "successfulNumberv2Response": {
+        "properties": {
+          "activationId": {
+            "$ref": "#/components/schemas/ActivationId"
+          },
+          "phoneNumber": {
+            "description": "Номер телефона без знака +",
+            "type": "string",
+            "example": "79991234567"
+          },
+          "activationCost": {
+            "description": "Стоимость активации",
+            "type": "number",
+            "format": "float",
+            "example": 15.5
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "countryCode": {
+            "$ref": "#/components/schemas/CountryId"
+          },
+          "countryPhoneCode": {
+            "description": "Телефонный код страны",
+            "type": "number",
+            "example": 62
+          },
+          "canGetAnotherSms": {
+            "description": "Повторное смс",
+            "type": "boolean",
+            "example": true
+          },
+          "activationTime": {
+            "$ref": "#/components/schemas/dateRFC3339",
+            "description": "Дата и время начала"
+          },
+          "activationEndTime": {
+            "$ref": "#/components/schemas/dateRFC3339",
+            "description": "Дата и время истечения"
+          },
+          "activationOperator": {
+            "description": "Оператор связи",
+            "type": "string",
+            "example": "tele2"
+          }
+        },
+        "type": "object",
+        "examples": {
+          "successfulNumberv2Example": {
+            "$ref": "#/components/examples/successfulNumberv2Example"
+          }
+        }
+      },
+      "reactivationPriceResponse": {
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "required": [
+              "price"
+            ],
+            "properties": {
+              "price": {
+                "type": "number",
+                "format": "float",
+                "example": 1.4522
+              },
+              "currency": {
+                "$ref": "#/components/schemas/Currency"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object",
+        "examples": {
+          "success": {
+            "$ref": "#/components/examples/successfulReactivationPriceExample"
+          }
+        }
+      },
+      "prolongationPriceListResponse": {
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "description": "Стоимость продления аренды: часы - цена",
+            "type": "object",
+            "additionalProperties": {
+              "description": "Стоимость для указанного кол-ва часов",
+              "type": "number",
+              "format": "float",
+              "example": 0.2134
+            }
+          }
+        },
+        "type": "object",
+        "examples": {
+          "success": {
+            "$ref": "#/components/examples/successfulProlongationPriceExample"
+          }
+        }
+      },
+      "prolongationHistoryListResponse": {
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "description": "Массив продлений. Может быть пустым.",
+            "type": "array",
+            "items": {
+              "required": [
+                "userPrice",
+                "hours",
+                "createDate",
+                "payerType"
+              ],
+              "properties": {
+                "userPrice": {
+                  "description": "Стоимость",
+                  "type": "number",
+                  "format": "float",
+                  "example": 0.4621
+                },
+                "hours": {
+                  "description": "The duration of rent",
+                  "type": "number",
+                  "example": 2
+                },
+                "createDate": {
+                  "$ref": "#/components/schemas/dateRFC3339",
+                  "description": "Дата создания"
+                },
+                "payerType": {
+                  "description": "Тип продления",
+                  "type": "string",
+                  "enum": [
+                    "client",
+                    "partner"
+                  ],
+                  "example": "client"
+                }
+              },
+              "type": "object"
+            },
+            "minItems": 0
+          }
+        },
+        "type": "object",
+        "examples": {
+          "success": {
+            "$ref": "#/components/examples/successfulProlongationHistoryExample"
+          }
+        }
+      },
+      "OtpListResponse": {
+        "description": "Массив сообщений. Может быть пустым.",
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/OtpItem"
+        },
+        "minItems": 0,
+        "examples": {
+          "successfulOtpListExample": {
+            "$ref": "#/components/examples/successfulOtpListExample"
+          }
+        }
+      },
+      "OtpItem": {
+        "required": [
+          "id",
+          "phoneFrom",
+          "service",
+          "date",
+          "type"
+        ],
+        "properties": {
+          "id": {
+            "description": "ID otp",
+            "type": "string",
+            "example": "3416693217"
+          },
+          "phoneFrom": {
+            "description": "Источник otp",
+            "type": "string",
+            "example": "Telegram"
+          },
+          "code": {
+            "$ref": "#/components/schemas/SMSCode"
+          },
+          "text": {
+            "$ref": "#/components/schemas/SMSText"
+          },
+          "service": {
+            "$ref": "#/components/schemas/ServiceId"
+          },
+          "date": {
+            "$ref": "#/components/schemas/dateRFC3339",
+            "description": "Дата создания"
+          },
+          "type": {
+            "description": "Тип otp",
+            "type": "string",
+            "enum": [
+              "sms",
+              "call"
+            ],
+            "example": "sms"
+          }
+        },
+        "type": "object"
+      },
+      "BaseErrorResponse": {
+        "description": "Базовая структура ответа об ошибке",
+        "required": [
+          "title",
+          "details"
+        ],
+        "properties": {
+          "title": {
+            "description": "Код ошибки",
+            "type": "string"
+          },
+          "details": {
+            "description": "Детали ошибки",
+            "type": "string"
+          },
+          "info": {
+            "description": "Расширенная информация",
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "type": "object"
+      }
+    },
+    "responses": {
+      "EmailActivationSuccessResponse": {
+        "description": "OK",
+        "content": {
+          "application/json": {
+            "schema": {
+              "required": [
+                "data"
+              ],
+              "properties": {
+                "data": {
+                  "$ref": "#/components/schemas/EmailActivation"
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "EmailActivationBatchSuccessResponse": {
+        "description": "OK",
+        "content": {
+          "application/json": {
+            "schema": {
+              "properties": {
+                "data": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EmailActivationCreateDTO"
+                  }
+                },
+                "meta": {
+                  "properties": {
+                    "info": {
+                      "type": "string",
+                      "example": "Активация email успешна"
+                    },
+                    "count": {
+                      "type": "integer",
+                      "example": 3
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "EmailActivationFavoriteSuccessResponse": {
+        "description": "OK",
+        "content": {
+          "application/json": {
+            "schema": {
+              "required": [
+                "data"
+              ],
+              "properties": {
+                "data": {
+                  "$ref": "#/components/schemas/EmailActivationFavorite"
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "ServerErrorResponse": {
+        "description": "SERVER_ERROR",
+        "content": {
+          "application/json": {
+            "schema": {
+              "required": [
+                "title",
+                "details"
+              ],
+              "properties": {
+                "title": {
+                  "description": "Код ошибки",
+                  "type": "string",
+                  "enum": [
+                    "SERVER_ERROR"
+                  ]
+                },
+                "details": {
+                  "description": "Детали ошибки",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "TooManyRequestsResponse": {
+        "description": "TOO_MANY_REQUESTS",
+        "headers": {
+          "Retry-After": {
+            "description": "Значение в секундах",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "required": [
+                "title",
+                "details"
+              ],
+              "properties": {
+                "title": {
+                  "description": "Код ошибки",
+                  "type": "string",
+                  "enum": [
+                    "RATE_LIMIT"
+                  ]
+                },
+                "details": {
+                  "description": "Детали ошибки",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "UnprocessableEntityResponse": {
+        "description": "UNPROCESSABLE_ENTITY",
+        "content": {
+          "application/json": {
+            "schema": {
+              "required": [
+                "title",
+                "details",
+                "errors"
+              ],
+              "properties": {
+                "title": {
+                  "description": "Код ошибки",
+                  "type": "string"
+                },
+                "details": {
+                  "description": "Детали ошибки",
+                  "type": "string"
+                },
+                "errors": {
+                  "type": "object",
+                  "example": {
+                    "parameter1": [
+                      "The parameter1 is required.",
+                      "The parameter1 must be a number."
+                    ],
+                    "parameter2": [
+                      "The parameter2 must be a number."
+                    ]
+                  },
+                  "additionalProperties": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "NotFoundResponse": {
+        "description": "NOT_FOUND",
+        "content": {
+          "application/json": {
+            "schema": {
+              "required": [
+                "title",
+                "details"
+              ],
+              "properties": {
+                "title": {
+                  "description": "Код ошибки",
+                  "type": "string"
+                },
+                "details": {
+                  "description": "Детали ошибки",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "UnauthorizedResponse": {
+        "description": "UNAUTHORIZED",
+        "content": {
+          "application/json": {
+            "schema": {
+              "required": [
+                "title",
+                "details"
+              ],
+              "properties": {
+                "title": {
+                  "description": "Код ошибки",
+                  "type": "string",
+                  "enum": [
+                    "Unauthenticated"
+                  ]
+                },
+                "details": {
+                  "description": "Детали ошибки",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "OfferNotFoundResponse": {
+        "description": "NOT_FOUND",
+        "content": {
+          "application/json": {
+            "schema": {
+              "required": [
+                "title",
+                "details"
+              ],
+              "properties": {
+                "title": {
+                  "description": "Код ошибки",
+                  "type": "string",
+                  "enum": [
+                    "OFFER_NOT_FOUND"
+                  ]
+                },
+                "details": {
+                  "description": "Детали ошибки",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          }
+        }
+      },
+      "SAServerErrorResponse": {
+        "description": "Внутренняя ошибка сервиса",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "SAServerErrorExample": {
+                "$ref": "#/components/examples/SAServerErrorExample"
+              }
+            }
+          }
+        }
+      },
+      "methodNotFoundResponse": {
+        "description": "Метод не найден",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "methodNotFoundExample": {
+                "$ref": "#/components/examples/methodNotFoundExample"
+              }
+            }
+          }
+        }
+      },
+      "activationNotFoundResponse": {
+        "description": "Активация не найдена",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "activationNotFoundExample": {
+                "$ref": "#/components/examples/activationNotFoundExample"
+              },
+              "methodNotFoundExample": {
+                "$ref": "#/components/examples/methodNotFoundExample"
+              }
+            }
+          }
+        }
+      },
+      "unauthorizedResponse": {
+        "description": "Неверный апи-ключ",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "unauthorizedExample": {
+                "$ref": "#/components/examples/unauthorizedExample"
+              }
+            }
+          }
+        }
+      },
+      "rentParamsBadRequestResponse": {
+        "description": "Неверные параметры запроса",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "badDurationExample": {
+                "$ref": "#/components/examples/badDurationExample"
+              },
+              "wrongCountryIdExample": {
+                "$ref": "#/components/examples/wrongCountryIdExample"
+              },
+              "wrongServiceExample": {
+                "$ref": "#/components/examples/wrongServiceExample"
+              },
+              "wrongCurrencyExample": {
+                "$ref": "#/components/examples/wrongCurrencyExample"
+              }
+            }
+          }
+        }
+      },
+      "reactivationForbiddenResponse": {
+        "description": "Доступ запрещён",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "serviceUnavailableExample": {
+                "$ref": "#/components/examples/serviceUnavailableExample"
+              },
+              "simOfflineExample": {
+                "$ref": "#/components/examples/simOfflineExample"
+              },
+              "simTemporaryOfflineExample": {
+                "$ref": "#/components/examples/simTemporaryOfflineExample"
+              }
+            }
+          }
+        }
+      },
+      "prolongationBadRequestResponse": {
+        "description": "Доступ запрещён",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "simOfflineExample": {
+                "$ref": "#/components/examples/simOfflineExample"
+              },
+              "simTemporaryOfflineExample": {
+                "$ref": "#/components/examples/simTemporaryOfflineExample"
+              },
+              "maxHoursExceedExample": {
+                "$ref": "#/components/examples/maxHoursExceedExample"
+              },
+              "badDurationExample": {
+                "$ref": "#/components/examples/badDurationExample"
+              },
+              "activationNotAvailableExample": {
+                "$ref": "#/components/examples/activationNotAvailableExample"
+              }
+            }
+          }
+        }
+      },
+      "prolongationInfoBadRequestResponse": {
+        "description": "Доступ запрещён",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "simOfflineExample": {
+                "$ref": "#/components/examples/simOfflineExample"
+              },
+              "simTemporaryOfflineExample": {
+                "$ref": "#/components/examples/simTemporaryOfflineExample"
+              },
+              "maxHoursExceedExample": {
+                "$ref": "#/components/examples/maxHoursExceedExample"
+              },
+              "activationNotAvailableExample": {
+                "$ref": "#/components/examples/activationNotAvailableExample"
+              }
+            }
+          }
+        }
+      },
+      "badRequestResponse": {
+        "description": "Неверные параметры запроса",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "badStatusExampleJson": {
+                "$ref": "#/components/examples/badStatusExampleJson"
+              }
+            }
+          }
+        }
+      },
+      "getNumberBadRequestResponse": {
+        "description": "Неверные параметры запроса",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "wrongMaxPriceExampleJson": {
+                "$ref": "#/components/examples/wrongMaxPriceExampleJson"
+              }
+            }
+          }
+        }
+      },
+      "unprocessableEntityResponse": {
+        "description": "Неверные параметры запроса",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "unprocessableEntityExample": {
+                "$ref": "#/components/examples/unprocessableEntityExample"
+              }
+            }
+          }
+        }
+      },
+      "forbiddenResponse": {
+        "description": "Доступ запрещён",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "threadsReachedExample": {
+                "$ref": "#/components/examples/threadsReachedExample"
+              },
+              "serviceRestrictedExample": {
+                "$ref": "#/components/examples/serviceRestrictedExample"
+              },
+              "globalBanExample": {
+                "$ref": "#/components/examples/globalBanExample"
+              },
+              "specificBanExample": {
+                "$ref": "#/components/examples/specificBanExample"
+              },
+              "inactiveAccountExample": {
+                "$ref": "#/components/examples/inactiveAccountExample"
+              }
+            }
+          }
+        }
+      },
+      "paymentRequiredResponse": {
+        "description": "Недостаточно средств",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "paymentRequiredExample": {
+                "$ref": "#/components/examples/paymentRequiredExample"
+              }
+            }
+          }
+        }
+      },
+      "noNumbersResponse": {
+        "description": "Нет номеров в продаже",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "noNumbersExample": {
+                "$ref": "#/components/examples/noNumbersExample"
+              }
+            }
+          }
+        }
+      },
+      "activationNotActiveResponse": {
+        "description": "Активация неактивна. Действие невозможно",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "activationNotActiveExample": {
+                "$ref": "#/components/examples/activationNotActiveExample"
+              }
+            }
+          }
+        }
+      },
+      "activationFinishConflictResponse": {
+        "description": "Невозможно завершить активацию",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "activationNewOtpReceivedExample": {
+                "$ref": "#/components/examples/activationNewOtpReceivedExample"
+              },
+              "activationNotActiveExample": {
+                "$ref": "#/components/examples/activationNotActiveExample"
+              }
+            }
+          }
+        }
+      },
+      "activationCancelConflictResponse": {
+        "description": "Невозможно отменить активацию",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/BaseErrorResponse"
+            },
+            "examples": {
+              "activationNewOtpReceivedExample": {
+                "$ref": "#/components/examples/activationNewOtpReceivedExample"
+              },
+              "freeCancellationExpiredExample": {
+                "$ref": "#/components/examples/freeCancellationExpiredExample"
+              },
+              "activationOtpReceivedExample": {
+                "$ref": "#/components/examples/activationOtpReceivedExample"
+              },
+              "activationNotActiveExample": {
+                "$ref": "#/components/examples/activationNotActiveExample"
+              },
+              "earlyCancellationExample": {
+                "$ref": "#/components/examples/earlyCancellationExample"
+              }
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "emailId": {
+        "name": "emailId",
+        "in": "path",
+        "description": "ID email активации",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        },
+        "example": 123456789
+      },
+      "search": {
+        "name": "search",
+        "in": "query",
+        "description": "Строка поиска",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "size": {
+        "name": "size",
+        "in": "query",
+        "description": "Размер страницы с данными",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "page": {
+        "name": "page",
+        "in": "query",
+        "description": "Номер страницы с данными",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "sort": {
+        "name": "sort",
+        "in": "query",
+        "description": "Сортировка данных по нескольким полям",
+        "required": false,
+        "style": "deepObject",
+        "explode": true,
+        "schema": {
+          "properties": {
+            "id": {
+              "description": "Параметры, используемые для фильтрации и навигации в списках",
+              "type": "string",
+              "default": "desc",
+              "enum": [
+                "asc",
+                "desc"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "from": {
+        "name": "from",
+        "in": "query",
+        "description": "Дата начала периода в формате ISO 8601 YYYY-MM-DDTHH:MM:SSZ",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "to": {
+        "name": "to",
+        "in": "query",
+        "description": "Дата до периода в формате ISO 8601 YYYY-MM-DDTHH:MM:SSZ",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "servicesPath": {
+        "name": "services",
+        "in": "query",
+        "description": "Коды сервисов",
+        "schema": {
+          "type": "string",
+          "example": "tg,go,ig"
+        }
+      },
+      "countriesPath": {
+        "name": "countries",
+        "in": "query",
+        "description": "ID стран",
+        "schema": {
+          "type": "string",
+          "example": "6,33,50"
+        }
+      },
+      "qpSARequiredService": {
+        "name": "service",
+        "in": "query",
+        "description": "[ID сервиса](https://hero-sms.com/stubs/handler_api.php?action=getServicesList)",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "example": "tg"
+      },
+      "qpSAOptionalService": {
+        "name": "service",
+        "in": "query",
+        "description": "[ID сервиса](https://hero-sms.com/stubs/handler_api.php?action=getServicesList)",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "example": "tg"
+      },
+      "qpSARequiredCountry": {
+        "name": "country",
+        "in": "query",
+        "description": "[ID страны](https://hero-sms.com/stubs/handler_api.php?action=getCountries)",
+        "required": true,
+        "schema": {
+          "type": "number"
+        },
+        "example": 2
+      },
+      "qpSAOptionalCountry": {
+        "name": "country",
+        "in": "query",
+        "description": "[ID страны](https://hero-sms.com/stubs/handler_api.php?action=getCountries)",
+        "required": false,
+        "schema": {
+          "type": "number"
+        },
+        "example": 2
+      },
+      "qpSAOptionalFreePrice": {
+        "name": "freePrice",
+        "in": "query",
+        "description": "Использовать FreePrice",
+        "required": false,
+        "schema": {
+          "type": "boolean"
+        },
+        "example": true
+      },
+      "qpSAOptionalLang": {
+        "name": "lang",
+        "in": "query",
+        "description": "ID языка",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "default": "en",
+          "enum": [
+            "cn",
+            "de",
+            "en",
+            "es",
+            "fr",
+            "pt",
+            "ru"
+          ]
+        },
+        "example": "en"
+      },
+      "qpSAOptionalOperator": {
+        "name": "operator",
+        "in": "query",
+        "description": "[Список](https://hero-sms.com/stubs/handler_api.php?action=getOperators) желаемых операторов связи (через запятую без пробелов)",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "example": "tele2,beeline"
+      },
+      "qpSARequiredDuration": {
+        "name": "duration",
+        "in": "query",
+        "description": "Время аренды в часах",
+        "required": true,
+        "schema": {
+          "type": "number"
+        },
+        "example": 2
+      },
+      "qpSAOptionalCurrency": {
+        "name": "currency",
+        "in": "query",
+        "description": "Валюта отображения",
+        "required": false,
+        "schema": {
+          "type": "number",
+          "default": 840,
+          "enum": [
+            643,
+            840,
+            978,
+            156
+          ]
+        },
+        "example": 840
+      },
+      "qpSAOptionalSize": {
+        "name": "size",
+        "in": "query",
+        "description": "Размер страницы с данными",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "qpSAOptionalPage": {
+        "name": "page",
+        "in": "query",
+        "description": "Номер страницы с данными",
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "qpSAOptionalMaxPrice": {
+        "name": "maxPrice",
+        "in": "query",
+        "description": "Максимальная цена",
+        "required": false,
+        "schema": {
+          "type": "number"
+        },
+        "example": 2
+      },
+      "qpSAOptionalFixedPrice": {
+        "name": "fixedPrice",
+        "in": "query",
+        "description": "Покупка строго за переданную максимальную цену. Использовать вместе с параметром maxPrice.",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "example": "true"
+      },
+      "qpSAOptionalRef": {
+        "name": "ref",
+        "in": "query",
+        "description": "Реферальный идентификатор",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "example": "123456789"
+      },
+      "qpSAOptionalPhoneException": {
+        "name": "phoneException",
+        "in": "query",
+        "description": "Исключающие префиксы. Вам не будут выдаваться номера с переданными префиксами. Максимум 20 префиксов.",
+        "required": false,
+        "schema": {
+          "type": "string"
+        },
+        "example": "7934,7900"
+      },
+      "qpSARequiredActivationID": {
+        "name": "id",
+        "in": "query",
+        "description": "ID активации",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        },
+        "example": 123456789
+      },
+      "qpSARequiredActivationStatus": {
+        "name": "status",
+        "in": "query",
+        "description": "Статус активации",
+        "required": true,
+        "schema": {
+          "default": 3,
+          "oneOf": [
+            {
+              "title": "Запросить код",
+              "type": "integer",
+              "enum": [
+                3
+              ]
+            },
+            {
+              "title": "Завершить активацию",
+              "type": "integer",
+              "enum": [
+                6
+              ]
+            },
+            {
+              "title": "Отменить активацию",
+              "type": "integer",
+              "enum": [
+                8
+              ]
+            }
+          ]
+        },
+        "example": 1
+      }
+    },
+    "examples": {
+      "ActivationsOffersExample": {
+        "summary": "Без фильтров",
+        "value": {
+          "data": {
+            "go": {
+              "6": {
+                "prices": {
+                  "default": 0.03,
+                  "retail": 0.03,
+                  "min": 0.03
+                },
+                "counts": {
+                  "total": 19459,
+                  "physical": 10221,
+                  "defaultPrice": 13610
+                },
+                "map": {
+                  "0.0300": 1171867,
+                  "0.0589": 3453473,
+                  "0.1510": 3771610
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.15,
+                  "retail": 0.15,
+                  "min": 0.15
+                },
+                "counts": {
+                  "total": 10446,
+                  "physical": 1821,
+                  "defaultPrice": 4654
+                },
+                "map": {
+                  "0.1500": 14460,
+                  "0.1553": 28887,
+                  "0.6143": 670031
+                }
+              },
+              "50": {
+                "prices": {
+                  "default": 0.35,
+                  "retail": 0.35,
+                  "min": 0.35
+                },
+                "counts": {
+                  "total": 31871,
+                  "physical": 14454,
+                  "defaultPrice": 14206
+                },
+                "map": {
+                  "0.3500": 14306,
+                  "0.8226": 612179,
+                  "0.9308": 817343
+                }
+              }
+            },
+            "ig": {
+              "6": {
+                "prices": {
+                  "default": 0.0334,
+                  "retail": 0.0334,
+                  "min": 0.0334
+                },
+                "counts": {
+                  "total": 39166,
+                  "physical": 25787,
+                  "defaultPrice": 31838
+                },
+                "map": {
+                  "0.0334": 10184181,
+                  "0.0335": 10976322,
+                  "0.0338": 11802947
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.06,
+                  "retail": 0.06,
+                  "min": 0.06
+                },
+                "counts": {
+                  "total": 5266,
+                  "physical": 197,
+                  "defaultPrice": 1509
+                },
+                "map": {
+                  "0.0600": 7524,
+                  "0.0725": 12963,
+                  "0.2942": 204854
+                }
+              },
+              "50": {
+                "prices": {
+                  "default": 0.075,
+                  "retail": 0.075,
+                  "min": 0.075
+                },
+                "counts": {
+                  "total": 36384,
+                  "physical": 8404,
+                  "defaultPrice": 8211
+                },
+                "map": {
+                  "0.0750": 8211,
+                  "0.0942": 24639,
+                  "0.0948": 49334
+                }
+              }
+            },
+            "tg": {
+              "6": {
+                "prices": {
+                  "default": 0.15,
+                  "retail": 0.15,
+                  "min": 0.15
+                },
+                "counts": {
+                  "total": 22598,
+                  "physical": 12352,
+                  "defaultPrice": 4787
+                },
+                "map": {
+                  "0.1500": 286896,
+                  "0.1765": 327454,
+                  "1.7648": 5814269
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.9,
+                  "retail": 0.9,
+                  "min": 0.9
+                },
+                "counts": {
+                  "total": 4076,
+                  "physical": 896,
+                  "defaultPrice": 0
+                },
+                "map": {
+                  "1.0483": 204,
+                  "1.1593": 793,
+                  "2.4831": 46024
+                }
+              },
+              "50": {
+                "prices": {
+                  "default": 1,
+                  "retail": 1,
+                  "min": 1
+                },
+                "counts": {
+                  "total": 48641,
+                  "physical": 15336,
+                  "defaultPrice": 183
+                },
+                "map": {
+                  "1.0000": 183,
+                  "1.2504": 15885,
+                  "2.9412": 1411078
+                }
+              }
+            }
+          }
+        }
+      },
+      "ActivationsOffersServicesFilterExample": {
+        "summary": "services=tg,go",
+        "value": {
+          "data": {
+            "go": {
+              "6": {
+                "prices": {
+                  "default": 0.03,
+                  "retail": 0.03,
+                  "min": 0.03
+                },
+                "counts": {
+                  "total": 19459,
+                  "physical": 10221,
+                  "defaultPrice": 13610
+                },
+                "map": {
+                  "0.0300": 1171867,
+                  "0.0589": 3453473,
+                  "0.1510": 3771610
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.15,
+                  "retail": 0.15,
+                  "min": 0.15
+                },
+                "counts": {
+                  "total": 10446,
+                  "physical": 1821,
+                  "defaultPrice": 4654
+                },
+                "map": {
+                  "0.1500": 14460,
+                  "0.1553": 28887,
+                  "0.6143": 670031
+                }
+              },
+              "50": {
+                "prices": {
+                  "default": 0.35,
+                  "retail": 0.35,
+                  "min": 0.35
+                },
+                "counts": {
+                  "total": 31871,
+                  "physical": 14454,
+                  "defaultPrice": 14206
+                },
+                "map": {
+                  "0.3500": 14306,
+                  "0.8226": 612179,
+                  "0.9308": 817343
+                }
+              }
+            },
+            "tg": {
+              "6": {
+                "prices": {
+                  "default": 0.15,
+                  "retail": 0.15,
+                  "min": 0.15
+                },
+                "counts": {
+                  "total": 22598,
+                  "physical": 12352,
+                  "defaultPrice": 4787
+                },
+                "map": {
+                  "0.1500": 286896,
+                  "0.1765": 327454,
+                  "1.7648": 5814269
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.9,
+                  "retail": 0.9,
+                  "min": 0.9
+                },
+                "counts": {
+                  "total": 4076,
+                  "physical": 896,
+                  "defaultPrice": 0
+                },
+                "map": {
+                  "1.0483": 204,
+                  "1.1593": 793,
+                  "2.4831": 46024
+                }
+              },
+              "50": {
+                "prices": {
+                  "default": 1,
+                  "retail": 1,
+                  "min": 1
+                },
+                "counts": {
+                  "total": 48641,
+                  "physical": 15336,
+                  "defaultPrice": 183
+                },
+                "map": {
+                  "1.0000": 183,
+                  "1.2504": 15885,
+                  "2.9412": 1411078
+                }
+              }
+            }
+          }
+        }
+      },
+      "ActivationsOffersCountriesFilterExample": {
+        "summary": "countries=6,48",
+        "value": {
+          "data": {
+            "go": {
+              "6": {
+                "prices": {
+                  "default": 0.03,
+                  "retail": 0.03,
+                  "min": 0.03
+                },
+                "counts": {
+                  "total": 19459,
+                  "physical": 10221,
+                  "defaultPrice": 13610
+                },
+                "map": {
+                  "0.0300": 1171867,
+                  "0.0589": 3453473,
+                  "0.1510": 3771610
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.15,
+                  "retail": 0.15,
+                  "min": 0.15
+                },
+                "counts": {
+                  "total": 10446,
+                  "physical": 1821,
+                  "defaultPrice": 4654
+                },
+                "map": {
+                  "0.1500": 14460,
+                  "0.1553": 28887,
+                  "0.6143": 670031
+                }
+              }
+            },
+            "ig": {
+              "6": {
+                "prices": {
+                  "default": 0.0334,
+                  "retail": 0.0334,
+                  "min": 0.0334
+                },
+                "counts": {
+                  "total": 39166,
+                  "physical": 25787,
+                  "defaultPrice": 31838
+                },
+                "map": {
+                  "0.0334": 10184181,
+                  "0.0335": 10976322,
+                  "0.0338": 11802947
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.06,
+                  "retail": 0.06,
+                  "min": 0.06
+                },
+                "counts": {
+                  "total": 5266,
+                  "physical": 197,
+                  "defaultPrice": 1509
+                },
+                "map": {
+                  "0.0600": 7524,
+                  "0.0725": 12963,
+                  "0.2942": 204854
+                }
+              }
+            },
+            "tg": {
+              "6": {
+                "prices": {
+                  "default": 0.15,
+                  "retail": 0.15,
+                  "min": 0.15
+                },
+                "counts": {
+                  "total": 22598,
+                  "physical": 12352,
+                  "defaultPrice": 4787
+                },
+                "map": {
+                  "0.1500": 286896,
+                  "0.1765": 327454,
+                  "1.7648": 5814269
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.9,
+                  "retail": 0.9,
+                  "min": 0.9
+                },
+                "counts": {
+                  "total": 4076,
+                  "physical": 896,
+                  "defaultPrice": 0
+                },
+                "map": {
+                  "1.0483": 204,
+                  "1.1593": 793,
+                  "2.4831": 46024
+                }
+              }
+            }
+          }
+        }
+      },
+      "ActivationsOffersServicesCountriesFiltersExample": {
+        "summary": "services=tg,ig&countries=6,50",
+        "value": {
+          "data": {
+            "ig": {
+              "6": {
+                "prices": {
+                  "default": 0.0334,
+                  "retail": 0.0334,
+                  "min": 0.0334
+                },
+                "counts": {
+                  "total": 39166,
+                  "physical": 25787,
+                  "defaultPrice": 31838
+                },
+                "map": {
+                  "0.0334": 10184181,
+                  "0.0335": 10976322,
+                  "0.0338": 11802947
+                }
+              },
+              "50": {
+                "prices": {
+                  "default": 0.075,
+                  "retail": 0.075,
+                  "min": 0.075
+                },
+                "counts": {
+                  "total": 36384,
+                  "physical": 8404,
+                  "defaultPrice": 8211
+                },
+                "map": {
+                  "0.0750": 8211,
+                  "0.0942": 24639,
+                  "0.0948": 49334
+                }
+              }
+            },
+            "tg": {
+              "6": {
+                "prices": {
+                  "default": 0.15,
+                  "retail": 0.15,
+                  "min": 0.15
+                },
+                "counts": {
+                  "total": 22598,
+                  "physical": 12352,
+                  "defaultPrice": 4787
+                },
+                "map": {
+                  "0.1500": 286896,
+                  "0.1765": 327454,
+                  "1.7648": 5814269
+                }
+              },
+              "48": {
+                "prices": {
+                  "default": 0.9,
+                  "retail": 0.9,
+                  "min": 0.9
+                },
+                "counts": {
+                  "total": 4076,
+                  "physical": 896,
+                  "defaultPrice": 0
+                },
+                "map": {
+                  "1.0483": 204,
+                  "1.1593": 793,
+                  "2.4831": 46024
+                }
+              }
+            }
+          }
+        }
+      },
+      "badActionExample": {
+        "summary": "Неправильно указано действие",
+        "value": "BAD_ACTION"
+      },
+      "sqlServerErrorExample": {
+        "summary": "Ошибка сервера",
+        "value": "ERROR_SQL"
+      },
+      "bannedExample": {
+        "summary": "Пользователь заблокирован до указанной даты",
+        "value": "BANNED:'YYYY-m-d H-i-s'"
+      },
+      "channelsLimitExample": {
+        "summary": "Аккаунт заблокирован",
+        "value": "CHANNELS_LIMIT"
+      },
+      "missingKeyExample": {
+        "summary": "Нет апи-ключа",
+        "value": "NO_KEY"
+      },
+      "incorrectKeyExample": {
+        "summary": "Неправильный апи-ключ",
+        "value": "BAD_KEY"
+      },
+      "badStatusExample": {
+        "summary": "Некорректный статус",
+        "value": "BAD_STATUS"
+      },
+      "numbersNotFoundExample": {
+        "summary": "Номера не найдены",
+        "value": "NO_NUMBERS"
+      },
+      "badServiceExample": {
+        "summary": "Неправильно указан сервис",
+        "value": "BAD_SERVICE"
+      },
+      "wrongMaxPriceExample": {
+        "summary": "Указанное максимальное значение меньше допустимого. В ответе указана минимальная цена",
+        "value": "WRONG_MAX_PRICE:0.025"
+      },
+      "wrongMaxPriceExampleJson": {
+        "summary": "Указанное максимальное значение меньше допустимого. В ответе указана минимальная цена",
+        "value": {
+          "title": "WRONG_MAX_PRICE",
+          "details": "The maximum price is less than the permitted price",
+          "info": {
+            "min": 0.1234
+          }
+        }
+      },
+      "wrongActivationIdExample": {
+        "summary": "Неверный ID активации",
+        "value": "WRONG_ACTIVATION_ID"
+      },
+      "badStatusExampleJson": {
+        "summary": "Некорректный статус",
+        "value": {
+          "title": "BAD_STATUS",
+          "details": "Wrong status code"
+        }
+      },
+      "unprocessableEntityExample": {
+        "summary": "Некорректный запрос",
+        "value": {
+          "title": "UNPROCESSABLE_ENTITY",
+          "details": "Validation failed",
+          "info": {
+            "field": "service",
+            "code": "REQUIRED",
+            "message": "Param 'service' is required."
+          }
+        }
+      },
+      "wrongCountryIdExample": {
+        "summary": "Неверный ID страны",
+        "value": {
+          "title": "WRONG_COUNTRY",
+          "details": ""
+        }
+      },
+      "wrongServiceExample": {
+        "summary": "Неправильное имя сервиса",
+        "value": {
+          "title": "WRONG_SERVICE",
+          "details": "Unsupported service"
+        }
+      },
+      "wrongCurrencyExample": {
+        "summary": "Неподдерживаемая валюта",
+        "value": {
+          "title": "WRONG_CURRENCY",
+          "details": "Unsupported Currency"
+        }
+      },
+      "globalBanExample": {
+        "summary": "Глобальная временная блокировка",
+        "value": {
+          "title": "BANNED",
+          "details": "Your account is temporarily suspended from making any purchases.",
+          "info": {
+            "scope": "global",
+            "banned_until": 1739448000,
+            "retry_after_seconds": 3600,
+            "readable_date": "2026-02-13T12:00:00+00:00"
+          }
+        }
+      },
+      "specificBanExample": {
+        "summary": "Временная блокировка на переданную позицию",
+        "value": {
+          "title": "BANNED",
+          "details": "Account temporarily suspended for this specific country/service pair.",
+          "info": {
+            "scope": "specific",
+            "banned_until": 1739448000,
+            "retry_after_seconds": 3600,
+            "readable_date": "2026-02-20T15:00:00+00:00"
+          }
+        }
+      },
+      "successfulAccessReadyExample": {
+        "summary": "Готовность номера подтверждена",
+        "value": "ACCESS_READY"
+      },
+      "successfulRetryGetExample": {
+        "summary": "Ожидание нового смс",
+        "value": "ACCESS_RETRY_GET"
+      },
+      "successfulAccessActivationExample": {
+        "summary": "Сервис успешно активирован",
+        "value": "ACCESS_ACTIVATION"
+      },
+      "successfulAccessCancelExample": {
+        "summary": "Активация отменена",
+        "value": "ACCESS_CANCEL"
+      },
+      "earlyCancelDeniedExample": {
+        "summary": "Нельзя отменить номер в первые 2 минуты",
+        "value": "EARLY_CANCEL_DENIED"
+      },
+      "noActivationExample": {
+        "summary": "ID активации не существует",
+        "value": "NO_ACTIVATION"
+      },
+      "successfulWaitCodeExample": {
+        "summary": "Ожидание смс",
+        "value": "STATUS_WAIT_CODE"
+      },
+      "successfulWaitRetryExample": {
+        "summary": "Ожидание уточнения кода",
+        "value": "STATUS_WAIT_RETRY:100001"
+      },
+      "successfulWaitResendExample": {
+        "summary": "Ожидание повторной отправки смс",
+        "value": "STATUS_WAIT_RESEND"
+      },
+      "successfulCancelExample": {
+        "summary": "Активация отменена",
+        "value": "STATUS_CANCEL"
+      },
+      "successfulOKExample": {
+        "summary": "Код получен",
+        "value": "STATUS_OK:100001"
+      },
+      "incorrectServiceExample": {
+        "summary": "Неправильно введен сервис",
+        "value": {
+          "status": "false",
+          "msg": "service is incorrect"
+        }
+      },
+      "incorrectCountryExample": {
+        "summary": "Неправильно введена страна",
+        "value": {
+          "status": "false",
+          "msg": "country is incorrect"
+        }
+      },
+      "successfulBalanceExample": {
+        "summary": "Баланс успешно получен",
+        "value": "ACCESS_BALANCE:100.5"
+      },
+      "successfulNumberExample": {
+        "summary": "Номер успешно получен",
+        "value": "ACCESS_NUMBER:123456789:7*********0"
+      },
+      "successfulNumberv2Example": {
+        "summary": "Номер успешно получен",
+        "value": {
+          "activationId": "635468024",
+          "phoneNumber": "79584******",
+          "activationCost": 12.5,
+          "currency": 840,
+          "countryCode": 6,
+          "countryPhoneCode": 62,
+          "canGetAnotherSms": true,
+          "activationTime": "2026-02-18T16:11:33+00:00",
+          "activationEndTime": "2026-02-18T18:11:23+00:00",
+          "activationOperator": "any"
+        }
+      },
+      "successfulReactivationPriceExample": {
+        "summary": "Стоимость получена успешна",
+        "value": {
+          "data": {
+            "price": 0.1234
+          }
+        }
+      },
+      "successfulProlongationPriceExample": {
+        "summary": "Стоимость получена успешно",
+        "value": {
+          "data": {
+            "2": 0.1234,
+            "4": 0.2234,
+            "24": 1.2234,
+            "168": 3.6432
+          }
+        }
+      },
+      "successfulProlongationHistoryExample": {
+        "summary": "История продлений получена успешна",
+        "value": {
+          "data": [
+            {
+              "hours": 2,
+              "userPrice": 0.1442,
+              "createDate": "2026-04-01T22:00:58+3:00",
+              "payerType": "client"
+            },
+            {
+              "hours": 24,
+              "userPrice": 0,
+              "createDate": "2026-04-02T00:00:58+3:00",
+              "payerType": "partner"
+            }
+          ]
+        }
+      },
+      "successfulActivationV2Example": {
+        "summary": "Статус активации успешно получен",
+        "value": {
+          "verificationType": 2,
+          "sms": {
+            "dateTime": "0000-00-00 00:00:00",
+            "code": "code",
+            "text": "sms text"
+          },
+          "call": {
+            "from": "phone",
+            "text": "voice text",
+            "code": "12345",
+            "dateTime": "0000-00-00 00:00:00",
+            "url": "voice file url",
+            "parsingCount": 1
+          }
+        }
+      },
+      "activationsSuccessfulExample": {
+        "summary": "Список активаций успешно получен",
+        "value": {
+          "status": "success",
+          "data": [
+            {
+              "activationId": "635468021",
+              "serviceCode": "vk",
+              "phoneNumber": "79********1",
+              "activationCost": 12.5,
+              "activationStatus": "4",
+              "smsCode": "12345",
+              "smsText": "Your code is 12345",
+              "activationTime": "2022-06-01 16:59:16",
+              "discount": "0.00",
+              "repeated": "0",
+              "countryCode": "2",
+              "countryName": "Kazakhstan",
+              "canGetAnotherSms": "1",
+              "currency": 840
+            }
+          ]
+        }
+      },
+      "successfulActivationsHistoryExample": {
+        "summary": "История активаций успешно получена",
+        "value": [
+          {
+            "id": "635468024",
+            "date": "0000-00-00 00:00:00",
+            "phone": "7*********0",
+            "sms": "Your code is ****",
+            "cost": 0,
+            "status": "4",
+            "currency": 840
+          }
+        ]
+      },
+      "successGetPrices": {
+        "summary": "Актуальные цены успешно получены",
+        "value": [
+          {
+            "baa": {
+              "cost": 0.08,
+              "count": 25370,
+              "physicalCount": 14528
+            }
+          }
+        ]
+      },
+      "topCountriesAllServicesExample": {
+        "summary": "Топ стран по сервису без указания параметров успешно получен",
+        "value": [
+          {
+            "ig": [
+              {
+                "physicalTotalCount": 7933,
+                "physicalCountForDefaultPrice": 5198,
+                "physicalPriceMap": {
+                  "0.04": 24,
+                  "0.0415": 439,
+                  "0.0419": 3229
+                },
+                "retail_price": 0.2,
+                "country": 6,
+                "price": 0.045,
+                "count": 5477
+              }
+            ]
+          }
+        ]
+      },
+      "topCountriesOneServiceExample": {
+        "summary": "Топ стран по сервису с указанием параметра \"service\" успешно получен",
+        "value": [
+          {
+            "physicalTotalCount": 7933,
+            "physicalCountForDefaultPrice": 5198,
+            "physicalPriceMap": {
+              "0.04": 24,
+              "0.0415": 439,
+              "0.0419": 3229
+            },
+            "retail_price": 0.2,
+            "country": 6,
+            "price": 0.045,
+            "count": 5477
+          }
+        ]
+      },
+      "successServiceCountRent": {
+        "summary": "Актуальные цены и количество по аренде успешно получены",
+        "value": {
+          "6": {
+            "2": {
+              "price": 0.18,
+              "count": 25370
+            },
+            "12": {
+              "price": 0.4568,
+              "count": 400
+            },
+            "48": {
+              "price": 0.8575,
+              "count": 4523
+            }
+          }
+        }
+      },
+      "successGetRentServicesAndCountriesExample": {
+        "summary": "Данные успешно получены",
+        "value": {
+          "operators": {
+            "1": "tmobile",
+            "2": "three"
+          },
+          "services": {
+            "abc": {
+              "quantity": 2,
+              "price": 0.6,
+              "retail_price": 0.6
+            },
+            "tg": {
+              "quantity": 2,
+              "price": 1.2,
+              "retail_price": 1.2
+            }
+          }
+        }
+      },
+      "successGetCountriesExample": {
+        "summary": "Список стран",
+        "value": [
+          {
+            "id": 2,
+            "rus": "Казахстан",
+            "eng": "Kazakhstan",
+            "chn": "哈萨克斯坦",
+            "visible": 1,
+            "retry": 1
+          }
+        ]
+      },
+      "successGetServicesListExample": {
+        "summary": "Список сервисов",
+        "value": {
+          "status": "success",
+          "services": [
+            {
+              "code": "aoo",
+              "name": "Pegasus Airlines"
+            }
+          ]
+        }
+      },
+      "successfulGetOperatorsExample": {
+        "summary": "Список операторов",
+        "value": {
+          "status": "success",
+          "countryOperators": {
+            "175": [
+              "optus",
+              "vodafone",
+              "telstra",
+              "lebara"
+            ]
+          }
+        }
+      },
+      "operatorsNotFoundExample": {
+        "summary": "Операторы не найдены",
+        "value": "OPERATORS_NOT_FOUND"
+      },
+      "successfulRentNumberExample": {
+        "summary": "Номер для аренды успешно получен",
+        "value": {
+          "id": "635468024",
+          "phoneNumber": "79584******",
+          "cost": 1.5333,
+          "currency": 840,
+          "lockCancelTime": 120,
+          "endDate": "2022-06-01T22:00:58+30:00",
+          "operator": "mtt"
+        }
+      },
+      "successfulOtpListExample": {
+        "summary": "Список otp успешно получен",
+        "value": {
+          "data": [
+            {
+              "id": "3416693217",
+              "phoneFrom": "Telegram",
+              "code": "123456",
+              "text": "Telegram code 123456",
+              "service": "tg",
+              "date": "2026-02-16T12:36:59+03:00",
+              "type": "sms"
+            },
+            {
+              "id": "3416693218",
+              "phoneFrom": "213421421431",
+              "service": "tg",
+              "date": "2026-02-16T12:36:59+03:00",
+              "type": "call"
+            }
+          ]
+        }
+      },
+      "badDurationExample": {
+        "summary": "Недопустимое время аренды",
+        "value": {
+          "title": "BAD_DURATION",
+          "details": "Duration must be integer.",
+          "info": {
+            "min": 2,
+            "max": 720,
+            "intraday": [
+              2,
+              4,
+              12
+            ],
+            "byDays": 24
+          }
+        }
+      },
+      "serviceUnavailableExample": {
+        "summary": "Сервис недоступен",
+        "value": {
+          "title": "SERVICE_NOT_AVAILABLE",
+          "details": "Service not available for sale. Contact the technical support."
+        }
+      },
+      "simOfflineExample": {
+        "summary": "Номер больше недоступен",
+        "value": {
+          "title": "SIM_OFFLINE",
+          "details": "Sim offline."
+        }
+      },
+      "simTemporaryOfflineExample": {
+        "summary": "Номер временно недоступен. Попробуйте позже.",
+        "value": {
+          "title": "SIM_TEMPORARY_OFFLINE",
+          "details": "Sim temporary offline. Try later."
+        }
+      },
+      "maxHoursExceedExample": {
+        "summary": "Переданное время продления превышает максимально возможное",
+        "value": {
+          "title": "MAX_HOURS_EXCEED",
+          "details": "Requested extension duration exceeds the maximum allowed hours.",
+          "info": {
+            "max": 336
+          }
+        }
+      },
+      "activationNotAvailableExample": {
+        "summary": "Действие недоступно для переданной активации",
+        "value": {
+          "title": "ACTION_NOT_AVAILABLE",
+          "details": "Action not available for this activation. Try '/reactivate' method."
+        }
+      },
+      "threadsReachedExample": {
+        "summary": "Ограничение потоков",
+        "value": {
+          "title": "CHANNELS_LIMIT",
+          "details": "You have reached the maximum number of concurrent threads (purchases) allowed for your account. Contact the technical support.",
+          "info": {
+            "current_threads": 0,
+            "max_allowed": -1
+          }
+        }
+      },
+      "serviceRestrictedExample": {
+        "summary": "Позиция недоступна к продаже",
+        "value": {
+          "title": "SERVICE_NOT_AVAILABLE",
+          "details": "Service not available for sale. Contact the technical support."
+        }
+      },
+      "inactiveAccountExample": {
+        "summary": "Необходимо подтвердить учётную запись",
+        "value": {
+          "title": "ACCOUNT_INACTIVE",
+          "details": "Activate your account"
+        }
+      },
+      "activationFinishedExample": {
+        "summary": "Активация завершена",
+        "value": {
+          "title": "FINISHED",
+          "details": "Activation finished."
+        }
+      },
+      "activationRefundedExample": {
+        "summary": "Средства за активацию возвращены",
+        "value": {
+          "title": "REFUNDED",
+          "details": "Activation blocked. Funds refunded."
+        }
+      },
+      "activationCanceledExample": {
+        "summary": "Активация отменена. Вам возвращены средства.",
+        "value": {
+          "title": "CANCELED",
+          "details": "Activation canceled."
+        }
+      },
+      "freeCancellationExpiredExample": {
+        "summary": "Невозможно отменить активацию",
+        "value": {
+          "title": "FREE_CANCELLATION_EXPIRED",
+          "details": "Cannot terminate activation - time limit exceeded (20 minutes)"
+        }
+      },
+      "earlyCancellationExample": {
+        "summary": "Невозможно отменить активацию",
+        "value": {
+          "title": "EARLY_CANCEL_DENIED",
+          "details": "Activation cannot be cancelled at this time. Minimum activation period must pass.",
+          "info": {
+            "minActivationTime": 120
+          }
+        }
+      },
+      "activationOtpReceivedExample": {
+        "summary": "Невозможно отменить активацию - пришло otp",
+        "value": {
+          "title": "OTP_RECEIVED",
+          "details": "Cannot terminate activation - OTP has been received on this number"
+        }
+      },
+      "paymentRequiredExample": {
+        "summary": "Недостаточно средств",
+        "value": {
+          "title": "NO_BALANCE",
+          "details": "Payment Required"
+        }
+      },
+      "noNumbersExample": {
+        "summary": "Нет номеров в продаже",
+        "value": {
+          "title": "NO_NUMBERS",
+          "details": "Numbers Gone. Try Later"
+        }
+      },
+      "activationNotActiveExample": {
+        "summary": "Активация неактивна",
+        "value": {
+          "title": "ACTIVATION_NOT_ACTIVE",
+          "details": "Activation is terminated/refunded and Otp cannot be retrieved"
+        }
+      },
+      "SAServerErrorExample": {
+        "summary": "Внутренняя ошибка сервиса",
+        "value": {
+          "title": "SERVER_ERROR",
+          "details": "Server Gone"
+        }
+      },
+      "methodNotFoundExample": {
+        "summary": "Метод не найден",
+        "value": {
+          "title": "BAD_ACTION",
+          "details": "Method Not Found"
+        }
+      },
+      "activationNotFoundExample": {
+        "summary": "Активация не найдена",
+        "value": {
+          "title": "NOT_FOUND",
+          "details": "Activation Not Found"
+        }
+      },
+      "unauthorizedExample": {
+        "summary": "Неверный апи-ключ",
+        "value": {
+          "title": "BAD_KEY",
+          "details": "Unauthorized"
+        }
+      },
+      "activationNewOtpReceivedExample": {
+        "summary": "Невозможно завершить активацию - пришло otp",
+        "value": {
+          "title": "NEW_OTP_RECEIVED",
+          "details": "Otp was received on this number. Please confirm termination.",
+          "info": {
+            "data": [
+              {
+                "id": "3416693217",
+                "phoneFrom": "Telegram",
+                "code": "123456",
+                "text": "Telegram code 123456",
+                "service": "tg",
+                "date": "2026-02-16T12:36:59+03:00",
+                "type": "sms"
+              },
+              {
+                "id": "3416693218",
+                "phoneFrom": "213421421431",
+                "service": "tg",
+                "date": "2026-02-16T12:36:59+03:00",
+                "type": "call"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "description": "Format: ApiKey {your_token}",
+        "name": "Authorization",
+        "in": "header"
+      },
+      "apiKeyQuery": {
+        "type": "apiKey",
+        "name": "api_key",
+        "in": "query"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Emails",
+      "description": "HeroSMS email activations"
+    },
+    {
+      "name": "Activations",
+      "description": "HeroSMS OTP activations"
+    },
+    {
+      "name": "SMS-Activate",
+      "description": "API compatible with SMS-Activate"
+    },
+    {
+      "name": "Webhooks",
+      "description": "\n##### Real-time event notification mechanism.\nAfter a purchase of the number, there is no need to repeatedly request activation status to receive incoming SMS messages.\nThe service sends SMS content to the specified HTTPS URLs using the POST method.\n\nUp to 3 webhook URLs can be supported simultaneously.\nURLs are specified in the accounts personal information.\nEach webhook call is performed independently for each specified URL.\n- Method: POST\n- Content-Type: application/json\n- Response timeout: 3 seconds\n- If there is no response with code 200, the call is considered unsuccessful:\n    - Number of retries - 7 times at least\n    - Delay between retries - 20–30 seconds\n    - Total duration of attempts - 3 minutes at least\n\nIt is strongly recommended to respond with a 200 code even if the SMS has already been processed on the recipient's side.\n\n##### Source IP addresses of webhook requests\nTo ensure correct performance, add the following IP addresses to the whitelist:\n- ```84.32.223.53```\n- ```185.138.88.87```\n"
+    }
+  ],
+  "webhooks": {
+    "sms-incoming": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Webhook: incoming SMS",
+        "description": "The event is sent upon reception of an incoming SMS to the number linked to the active activation",
+        "operationId": "smsIncoming",
+        "requestBody": {
+          "description": "JSON with a data about the received SMS",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "required": [
+                  "activationId",
+                  "service",
+                  "text",
+                  "country",
+                  "receivedAt"
+                ],
+                "properties": {
+                  "activationId": {
+                    "$ref": "#/components/schemas/ActivationId"
+                  },
+                  "service": {
+                    "$ref": "#/components/schemas/ServiceId"
+                  },
+                  "text": {
+                    "$ref": "#/components/schemas/SMSText"
+                  },
+                  "code": {
+                    "$ref": "#/components/schemas/SMSCode"
+                  },
+                  "country": {
+                    "$ref": "#/components/schemas/CountryId"
+                  },
+                  "receivedAt": {
+                    "$ref": "#/components/schemas/dateISO8601",
+                    "description": "SMS arrival time"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook successfully received (recommended response)"
+          },
+          "default": {
+            "description": "Webhook is not accepted, up to 7 retries"
+          }
+        }
+      }
+    }
+  }
+}

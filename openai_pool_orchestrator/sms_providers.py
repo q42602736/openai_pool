@@ -1,6 +1,9 @@
 """
 SMS Provider 抽象层
-当前提供 HeroSMS，用于浏览器模式2自动取号与短信验证码轮询。
+当前支持兼容 handler_api.php 风格的短信平台：
+- HeroSMS
+- SMSBower
+用于浏览器模式2自动取号与短信验证码轮询。
 """
 
 from __future__ import annotations
@@ -141,6 +144,129 @@ class HeroSMSAcquireStoppedError(RuntimeError):
     """HeroSMS 取号过程中收到停止请求，当前流程应立即收尾。"""
 
 
+HANDLER_API_PROVIDER_LABELS: Dict[str, str] = {
+    "hero_sms": "HeroSMS",
+    "smsbower": "SMSBower",
+}
+
+SMSBOWER_AUTO_COUNTRY_ID = 0
+SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO"}
+SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
+    "indonesia",
+    "indonesian",
+    "philippines",
+    "philippine",
+    "romania",
+    "romanian",
+    "印度尼西亚",
+    "菲律宾",
+    "罗马尼亚",
+}
+
+
+def normalize_handler_api_country(value: Any, *, default: int = 16, allow_zero: bool = False) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return int(default)
+    if allow_zero and parsed == 0:
+        return 0
+    if parsed >= 1:
+        return parsed
+    return int(default)
+
+
+def _build_default_country_catalogs() -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    catalog_by_iso: Dict[str, Dict[str, Any]] = {
+        str(item.get("isoCode") or "").strip().upper(): item
+        for item in DEFAULT_PHONE_COUNTRIES
+        if str(item.get("isoCode") or "").strip()
+    }
+    catalog_by_dial: Dict[str, Dict[str, Any]] = {
+        str(item.get("dialCode") or "").strip().lstrip("+"): item
+        for item in DEFAULT_PHONE_COUNTRIES
+        if str(item.get("dialCode") or "").strip()
+    }
+    return catalog_by_iso, catalog_by_dial
+
+
+def normalize_handler_api_country_row(
+    *,
+    country_id: Any,
+    api_name: Any = "",
+    iso_code: Any = "",
+    dial_code: Any = "",
+) -> Dict[str, Any]:
+    parsed_country_id = HeroSMSProvider._parse_integer(country_id)
+    normalized_iso = str(iso_code or "").strip().upper()
+    normalized_dial = str(dial_code or "").strip().lstrip("+")
+    catalog_by_iso, catalog_by_dial = _build_default_country_catalogs()
+    catalog_item = catalog_by_iso.get(normalized_iso) or catalog_by_dial.get(normalized_dial) or {}
+    display_name = str(
+        catalog_item.get("name")
+        or api_name
+        or normalized_iso
+        or normalized_dial
+        or parsed_country_id
+        or ""
+    ).strip()
+    return {
+        "hero_sms_country": int(parsed_country_id or 0),
+        "name": display_name,
+        "api_name": str(api_name or "").strip(),
+        "iso_code": normalized_iso,
+        "dial_code": normalized_dial,
+    }
+
+
+def is_virtual_phone_country_name(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    hints = (
+        "virtual",
+        "voip",
+        "non-fixed",
+        "non fixed",
+        "internet",
+        "online",
+    )
+    return any(hint in text for hint in hints)
+
+
+def is_smsbower_excluded_country(*, iso_code: Any = "", name: Any = "", api_name: Any = "") -> bool:
+    normalized_iso = str(iso_code or "").strip().upper()
+    if normalized_iso in SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES:
+        return True
+    haystacks = [
+        str(name or "").strip().lower(),
+        str(api_name or "").strip().lower(),
+    ]
+    return any(any(blocked in text for blocked in SMSBOWER_EXCLUDED_COUNTRY_NAMES) for text in haystacks if text)
+
+
+def parse_price_range(value: Any) -> tuple[Optional[float], Optional[float]]:
+    text = str(value or "").strip()
+    if not text:
+        return None, None
+    normalized = text.replace("—", "-").replace("–", "-").replace("~", "-").replace(" ", "")
+    if "-" not in normalized:
+        single = HeroSMSProvider._parse_number(normalized)
+        return single, single
+    left_text, right_text = normalized.split("-", 1)
+    left_number = HeroSMSProvider._parse_number(left_text)
+    right_number = HeroSMSProvider._parse_number(right_text)
+    if left_number is None and right_number is None:
+        return None, None
+    if left_number is None:
+        left_number = right_number
+    if right_number is None:
+        right_number = left_number
+    if left_number is None or right_number is None:
+        return None, None
+    return (left_number, right_number) if left_number <= right_number else (right_number, left_number)
+
+
 def _interruptible_sleep(seconds: float, stop_event: Optional[threading.Event] = None) -> bool:
     duration = max(0.0, float(seconds or 0.0))
     if duration <= 0:
@@ -173,18 +299,23 @@ class HeroSMSProvider(SMSProvider):
     ) -> None:
         self.api_key = str(api_key or "").strip()
         self.service = str(service or "").strip()
-        try:
-            self.country = int(country or 16)
-        except (TypeError, ValueError):
-            self.country = 16
+        self.country = normalize_handler_api_country(
+            country,
+            default=16,
+            allow_zero=self._supports_global_auto_country(),
+        )
         self.operator = str(operator or "").strip()
         self.target_price_raw = str(target_price or "").strip()
-        self.target_price = self._parse_number(self.target_price_raw)
-        self.fixed_price = _as_bool(fixed_price, default=True) and self.target_price is not None
+        self.min_target_price, self.max_target_price = parse_price_range(self.target_price_raw)
+        self.target_price = self.max_target_price
+        self.fixed_price = _as_bool(fixed_price, default=True) and self.min_target_price is not None and self.max_target_price is not None
         try:
             self.max_acquire_retries = max(1, int(max_acquire_retries or 5))
         except (TypeError, ValueError):
             self.max_acquire_retries = 5
+
+    def _supports_global_auto_country(self) -> bool:
+        return False
 
     def _resolve_catalog_country(self, *, proxy: str = "") -> Dict[str, Any]:
         country_id = int(self.country or 16)
@@ -273,8 +404,8 @@ class HeroSMSProvider(SMSProvider):
         return tiers[0]
 
     def _resolve_actual_price_ceiling(self, expected_price: Optional[float]) -> Optional[float]:
-        if self.target_price is not None:
-            return self.target_price
+        if self.max_target_price is not None:
+            return self.max_target_price
         if expected_price is None:
             return None
         return max(
@@ -282,12 +413,46 @@ class HeroSMSProvider(SMSProvider):
             expected_price + self.MAX_ACCEPTABLE_PRICE_DELTA,
         )
 
+    def _resolve_actual_price_floor(self, expected_price: Optional[float]) -> Optional[float]:
+        if self.min_target_price is not None:
+            return self.min_target_price
+        return expected_price
+
+    def _has_price_range(self) -> bool:
+        return (
+            self.min_target_price is not None
+            and self.max_target_price is not None
+            and abs(self.min_target_price - self.max_target_price) > self.PRICE_COMPARE_EPSILON
+        )
+
+    def _price_target_label(self) -> str:
+        if self.min_target_price is None and self.max_target_price is None:
+            return "-"
+        if self._has_price_range():
+            return f"${self.min_target_price}-${self.max_target_price}"
+        return f"${self.max_target_price if self.max_target_price is not None else self.min_target_price}"
+
+    def _price_in_target_range(self, price: Any) -> bool:
+        parsed_price = self._parse_number(price)
+        if parsed_price is None:
+            return False
+        if self.min_target_price is not None and parsed_price < (self.min_target_price - self.PRICE_COMPARE_EPSILON):
+            return False
+        if self.max_target_price is not None and parsed_price > (self.max_target_price + self.PRICE_COMPARE_EPSILON):
+            return False
+        return True
+
     def _get_price_mode(self) -> str:
-        if self.target_price is None:
+        if self.max_target_price is None and self.min_target_price is None:
             return "auto"
+        if self._has_price_range():
+            return "range"
         if self.fixed_price:
             return "fixed"
         return "ceiling"
+
+    def _provider_label(self) -> str:
+        return "SMSBower" if "smsbower" in str(self.BASE_URL or "").lower() else "HeroSMS"
 
     @classmethod
     def _is_matching_price_tier(cls, left: Any, right: Any) -> bool:
@@ -369,6 +534,32 @@ class HeroSMSProvider(SMSProvider):
                 or data.get("available_balance")
             )
         return None
+
+    def list_services(self, *, proxy: str = "") -> List[Dict[str, Any]]:
+        data = self._request("getServicesList", proxy=proxy)
+        if isinstance(data, str):
+            try:
+                import json as _json
+                data = _json.loads(data)
+            except Exception:
+                return []
+        payload = data.get("services") if isinstance(data, dict) and isinstance(data.get("services"), list) else data
+        if not isinstance(payload, list):
+            return []
+        rows: List[Dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code") or item.get("service") or item.get("id") or "").strip()
+            name = str(item.get("name") or item.get("title") or item.get("service_name") or "").strip()
+            if not code:
+                continue
+            rows.append({
+                "code": code,
+                "name": name or code,
+            })
+        rows.sort(key=lambda item: (str(item.get("name") or ""), str(item.get("code") or "")))
+        return rows
 
     @staticmethod
     def _parse_countries_response(data: Any) -> List[Dict[str, Any]]:
@@ -852,7 +1043,13 @@ class HeroSMSProvider(SMSProvider):
 
     def resolve_country_and_operator(self, *, proxy: str = "") -> Dict[str, Any]:
         base = self._resolve_catalog_country(proxy=proxy)
-        country_id = int(base.get("hero_sms_country") or self.country or 16)
+        country_id = self._parse_integer(base.get("hero_sms_country"))
+        if country_id is None:
+            country_id = normalize_handler_api_country(
+                self.country,
+                default=16,
+                allow_zero=self._supports_global_auto_country(),
+            )
         aggregate_price = None
         aggregate_count = None
         price_tier_options = self.get_price_tier_options(country=country_id, proxy=proxy)
@@ -900,7 +1097,7 @@ class HeroSMSProvider(SMSProvider):
         }
 
     def _ensure_fixed_price_matches_known_tier(self, selection: Dict[str, Any]) -> None:
-        if not self.fixed_price or self.target_price is None:
+        if not self.fixed_price or (self.min_target_price is None and self.max_target_price is None):
             return
         price_tier_options = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
         operator_options = selection.get("operator_options") if isinstance(selection.get("operator_options"), list) else []
@@ -911,7 +1108,7 @@ class HeroSMSProvider(SMSProvider):
             candidate_prices.append(selection.get("selected_operator_price"))
         if not candidate_prices:
             return
-        if any(self._is_matching_price_tier(price, self.target_price) for price in candidate_prices):
+        if any(self._price_in_target_range(price) for price in candidate_prices):
             return
         normalized_prices = sorted(
             {
@@ -921,13 +1118,13 @@ class HeroSMSProvider(SMSProvider):
             }
         )
         raise RuntimeError(
-            "HeroSMS 固定价模式要求目标价格必须命中当前真实价档: "
-            + f"target=${self.target_price}, available={normalized_prices or '-'}。"
-            + "如果你想填 0.03 这种手输价格，请改用“只作价格上限”。"
+            f"{self._provider_label()} 固定价模式要求目标价格必须命中当前真实价档/区间: "
+            + f"target={self._price_target_label()}, available={normalized_prices or '-'}。"
+            + "如果你想手填一个区间上限，请改用“只作价格上限”。"
         )
 
     def _resolve_ceiling_price_candidates(self, selection: Dict[str, Any]) -> List[float]:
-        if self.target_price is None or self.fixed_price:
+        if self.max_target_price is None or self.fixed_price:
             return []
         price_tier_options = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
         operator_options = selection.get("operator_options") if isinstance(selection.get("operator_options"), list) else []
@@ -936,21 +1133,41 @@ class HeroSMSProvider(SMSProvider):
             if not isinstance(row, dict):
                 continue
             price = self._parse_number(row.get("price"))
-            if price is None or price > (self.target_price + self.PRICE_COMPARE_EPSILON):
+            if price is None or not self._price_in_target_range(price):
                 continue
             candidate_prices.append(price)
         for row in operator_options:
             if not isinstance(row, dict):
                 continue
             price = self._parse_number(row.get("price"))
-            if price is None or price > (self.target_price + self.PRICE_COMPARE_EPSILON):
+            if price is None or not self._price_in_target_range(price):
                 continue
             candidate_prices.append(price)
         selected_operator_price = self._parse_number(selection.get("selected_operator_price"))
-        if selected_operator_price is not None and selected_operator_price <= (self.target_price + self.PRICE_COMPARE_EPSILON):
+        if selected_operator_price is not None and self._price_in_target_range(selected_operator_price):
             candidate_prices.append(selected_operator_price)
         normalized_prices = sorted({round(float(price), 6) for price in candidate_prices})
         return normalized_prices
+
+    def _resolve_fixed_price_provider_ids(self, selection: Dict[str, Any]) -> List[int]:
+        if not self.fixed_price or (self.min_target_price is None and self.max_target_price is None):
+            return []
+        rows = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
+        provider_ids: List[int] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if not self._price_in_target_range(row.get("price")):
+                continue
+            raw_ids = row.get("provider_ids")
+            if not isinstance(raw_ids, list):
+                continue
+            for provider_id in raw_ids:
+                parsed_provider_id = self._parse_integer(provider_id)
+                if parsed_provider_id is None or parsed_provider_id in provider_ids:
+                    continue
+                provider_ids.append(parsed_provider_id)
+        return provider_ids
 
     def acquire_number(
         self,
@@ -959,9 +1176,16 @@ class HeroSMSProvider(SMSProvider):
         stop_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         last_error = ""
+        provider_label = self._provider_label()
         selection = self.resolve_country_and_operator(proxy=proxy)
         self._ensure_fixed_price_matches_known_tier(selection)
-        selected_country_id = self._parse_integer(selection.get("hero_sms_country")) or int(self.country or 16)
+        selected_country_id = self._parse_integer(selection.get("hero_sms_country"))
+        if selected_country_id is None:
+            selected_country_id = normalize_handler_api_country(
+                self.country,
+                default=16,
+                allow_zero=self._supports_global_auto_country(),
+            )
         selected_operator = str(selection.get("selected_operator") or "").strip()
         operator_was_auto_selected = not str(self.operator or "").strip() and bool(selected_operator)
         price_tier_options = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
@@ -970,12 +1194,13 @@ class HeroSMSProvider(SMSProvider):
             if self._parse_number(item.get("price")) is not None
         ]
         exact_ceiling_candidates = self._resolve_ceiling_price_candidates(selection)
-        exact_ceiling_mode = bool(self.target_price is not None and not self.fixed_price and exact_ceiling_candidates)
-        hidden_ceiling_fallback = bool(self.target_price is not None and not self.fixed_price and not exact_ceiling_candidates)
+        exact_ceiling_mode = bool(self.max_target_price is not None and not self.fixed_price and exact_ceiling_candidates)
+        hidden_ceiling_fallback = bool(self.max_target_price is not None and not self.fixed_price and not exact_ceiling_candidates)
+        exact_fixed_provider_ids = self._resolve_fixed_price_provider_ids(selection)
         exact_ceiling_index = 0
         auto_price_index = 0
         auto_price_floor = None
-        expected_price = self.target_price
+        expected_price = self.max_target_price
         if expected_price is None:
             expected_price = self._parse_number(selection.get("selected_operator_price"))
         if expected_price is None:
@@ -991,6 +1216,58 @@ class HeroSMSProvider(SMSProvider):
                     break
         balance_before = self.get_balance(proxy=proxy)
         debug_events: List[str] = []
+        country_candidates = selection.get("country_candidates") if isinstance(selection.get("country_candidates"), list) else []
+        auto_country_mode = bool(selection.get("auto_country_mode")) and bool(country_candidates)
+        country_candidate_index = 0
+
+        def _apply_country_selection(country_selection: Dict[str, Any]) -> None:
+            nonlocal selection
+            nonlocal selected_country_id
+            nonlocal selected_operator
+            nonlocal operator_was_auto_selected
+            nonlocal price_tier_options
+            nonlocal auto_price_candidates
+            nonlocal exact_ceiling_candidates
+            nonlocal exact_ceiling_mode
+            nonlocal hidden_ceiling_fallback
+            nonlocal exact_fixed_provider_ids
+            nonlocal exact_ceiling_index
+            nonlocal auto_price_index
+            nonlocal auto_price_floor
+            nonlocal expected_price
+            selection = dict(country_selection)
+            selected_country_id = self._parse_integer(selection.get("hero_sms_country")) or selected_country_id
+            selected_operator = str(selection.get("selected_operator") or "").strip()
+            operator_was_auto_selected = not str(self.operator or "").strip() and bool(selected_operator)
+            price_tier_options = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
+            auto_price_candidates = [
+                item for item in price_tier_options
+                if self._parse_number(item.get("price")) is not None
+            ]
+            exact_ceiling_candidates = self._resolve_ceiling_price_candidates(selection)
+            exact_ceiling_mode = bool(self.max_target_price is not None and not self.fixed_price and exact_ceiling_candidates)
+            hidden_ceiling_fallback = bool(self.max_target_price is not None and not self.fixed_price and not exact_ceiling_candidates)
+            exact_fixed_provider_ids = self._resolve_fixed_price_provider_ids(selection)
+            exact_ceiling_index = 0
+            auto_price_index = 0
+            expected_price = self.max_target_price
+            if expected_price is None:
+                expected_price = self._parse_number(selection.get("selected_operator_price"))
+            if expected_price is None:
+                expected_price = self._parse_number(selection.get("aggregate_price"))
+            if exact_ceiling_mode:
+                expected_price = exact_ceiling_candidates[0]
+            auto_price_floor = expected_price if expected_price is not None else None
+            if expected_price is not None:
+                for index, item in enumerate(auto_price_candidates):
+                    if self._parse_number(item.get("price")) == expected_price:
+                        auto_price_index = index
+                        break
+
+        if auto_country_mode:
+            _apply_country_selection(country_candidates[0])
+        else:
+            _apply_country_selection(selection)
 
         def _build_failure_message(message: str) -> str:
             parts = [str(message or "").strip()]
@@ -1005,7 +1282,7 @@ class HeroSMSProvider(SMSProvider):
             if hidden_ceiling_fallback:
                 parts.append(
                     "ceiling_mode=hidden_pool"
-                    + f"(visible tiers within <=${self.target_price if self.target_price is not None else '-'}: none)"
+                    + f"(visible tiers within {self._price_target_label()}: none)"
                 )
             if debug_events:
                 parts.append("trace=" + " || ".join(str(item) for item in debug_events[:20]))
@@ -1013,29 +1290,34 @@ class HeroSMSProvider(SMSProvider):
 
         for attempt in range(1, self.max_acquire_retries + 1):
             if stop_event is not None and stop_event.is_set():
-                raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
+                raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
             current_operator = selected_operator
             debug_events.append(
-                "attempt="
+                "第 "
                 + str(attempt)
-                + f", operator={current_operator or 'ANY'}"
-                + f", price_mode={self._get_price_mode()}"
+                + " 次尝试"
+                + f"，运营商 {current_operator or 'ANY'}"
+                + f"，价格模式 {self._get_price_mode()}"
                 + (
-                    f", max_price=${self.target_price}"
-                    if self.target_price is not None and not self.fixed_price
-                    else f", target_price=${self.target_price if self.target_price is not None else '-'}"
+                    f"，价格区间 {self._price_target_label()}"
+                    if self._has_price_range()
+                    else (
+                        f"，价格上限 ${self.max_target_price}"
+                        if self.max_target_price is not None and not self.fixed_price
+                        else f"，目标价 {self._price_target_label()}"
+                    )
                 )
                 + (
-                    f", expected=hidden_pool<=${self.target_price}"
-                    if hidden_ceiling_fallback and self.target_price is not None
-                    else f", expected=${expected_price if expected_price is not None else '-'}"
+                    f"，预期从隐藏低价池中拿到命中 {self._price_target_label()} 的号码"
+                    if hidden_ceiling_fallback and (self.min_target_price is not None or self.max_target_price is not None)
+                    else f"，当前优先尝试价位 ${expected_price if expected_price is not None else '-'}"
                 )
                 + (
-                    f", ceiling_tier_index={exact_ceiling_index + 1}/{len(exact_ceiling_candidates)}"
+                    f"，上限候选档位 {exact_ceiling_index + 1}/{len(exact_ceiling_candidates)}"
                     if exact_ceiling_mode
                     else ""
                 )
-                + f", balance_before=${balance_before if balance_before is not None else '-'}"
+                + f"，取号前余额 ${balance_before if balance_before is not None else '-'}"
             )
             try:
                 params: Dict[str, Any] = {
@@ -1044,20 +1326,25 @@ class HeroSMSProvider(SMSProvider):
                 }
                 if current_operator:
                     params["operator"] = current_operator
-                request_max_price = self.target_price if self.target_price is not None else expected_price
+                request_max_price = self.max_target_price if self.max_target_price is not None else expected_price
                 if exact_ceiling_mode and expected_price is not None:
                     request_max_price = expected_price
+                request_min_price = self.min_target_price if self.min_target_price is not None else None
                 if request_max_price is not None:
                     params["maxPrice"] = request_max_price
                     if self.fixed_price or exact_ceiling_mode:
                         params["fixedPrice"] = "true"
+                if request_min_price is not None:
+                    params["minPrice"] = request_min_price
+                if self.fixed_price and exact_fixed_provider_ids:
+                    params["providerIds"] = ",".join(str(item) for item in exact_fixed_provider_ids)
                 data = self._request("getNumberV2", proxy=proxy, **params)
             except Exception as exc:
-                last_error = f"HeroSMS API 请求失败: {exc}"
-                debug_events.append(f"attempt={attempt}, request_error={exc}")
+                last_error = f"{provider_label} API 请求失败: {exc}"
+                debug_events.append(f"第 {attempt} 次尝试请求接口失败：{exc}")
                 if attempt < self.max_acquire_retries:
                     if _interruptible_sleep(5.0, stop_event):
-                        raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止") from exc
+                        raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止") from exc
                     continue
                 raise RuntimeError(last_error) from exc
 
@@ -1082,42 +1369,42 @@ class HeroSMSProvider(SMSProvider):
 
             if response_code in {"NO_BALANCE", "BAD_KEY", "NO_NUMBERS"}:
                 debug_events.append(
-                    f"attempt={attempt}, response={response_code}, operator={current_operator or 'ANY'}, message={response_message or '-'}"
+                    f"第 {attempt} 次尝试接口返回 {response_code}，运营商 {current_operator or 'ANY'}，说明：{response_message or '-'}"
                 )
                 if response_code == "NO_BALANCE":
-                    raise RuntimeError("HeroSMS 余额不足")
+                    raise RuntimeError(f"{provider_label} 余额不足")
                 if response_code == "BAD_KEY":
-                    raise RuntimeError("HeroSMS API Key 无效")
+                    raise RuntimeError(f"{provider_label} API Key 无效")
                 if response_code == "NO_NUMBERS":
                     if current_operator and operator_was_auto_selected:
                         selected_operator = ""
                         expected_price = exact_ceiling_candidates[exact_ceiling_index] if exact_ceiling_mode else (
-                            self.target_price
-                            if self.target_price is not None
+                            self.max_target_price
+                            if self.max_target_price is not None
                             else self._parse_number(selection.get("aggregate_price"))
                         )
                         debug_events.append(
-                            f"attempt={attempt}, fallback=aggregate, from_operator={current_operator}, "
-                            + f"new_expected=${expected_price if expected_price is not None else '-'}"
+                            f"第 {attempt} 次尝试已从运营商 {current_operator} 回退到国家聚合池，"
+                            + f"新的优先价位 ${expected_price if expected_price is not None else '-'}"
                         )
-                        last_error = "HeroSMS 自动选择的运营商当前无号，已回退到国家聚合池重试取号"
+                        last_error = f"{provider_label} 自动选择的运营商当前无号，已回退到国家聚合池重试取号"
                         if _interruptible_sleep(1.0, stop_event):
-                            raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
+                            raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
                         continue
                     if exact_ceiling_mode and exact_ceiling_index + 1 < len(exact_ceiling_candidates):
                         exact_ceiling_index += 1
                         expected_price = exact_ceiling_candidates[exact_ceiling_index]
                         last_error = (
-                            "HeroSMS 上限模式当前最低档无号，已切到上限内下一档继续尝试: "
+                            f"{provider_label} 上限模式当前最低档无号，已切到上限内下一档继续尝试: "
                             + f"country={selected_country_id}, service={self.service}, next_expected=${expected_price}"
                         )
                         debug_events.append(
-                            f"attempt={attempt}, fallback=next_ceiling_tier, new_expected=${expected_price}, tier_index={exact_ceiling_index}"
+                            f"第 {attempt} 次尝试改为上限内下一档，新的优先价位 ${expected_price}，候选序号 {exact_ceiling_index + 1}"
                         )
                         if _interruptible_sleep(1.0, stop_event):
-                            raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
+                            raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
                         continue
-                    if self.target_price is None and auto_price_index + 1 < len(auto_price_candidates):
+                    if self.max_target_price is None and auto_price_index + 1 < len(auto_price_candidates):
                         auto_price_index += 1
                         next_price = self._parse_number(auto_price_candidates[auto_price_index].get("price"))
                         if next_price is not None:
@@ -1128,71 +1415,103 @@ class HeroSMSProvider(SMSProvider):
                                 )
                                 if next_price > auto_price_ceiling:
                                     last_error = (
-                                        "HeroSMS 自动最低价可用号已超出允许涨价范围，停止继续抬价: "
+                                        f"{provider_label} 自动最低价可用号已超出允许涨价范围，停止继续抬价: "
                                         + f"country={selected_country_id}, service={self.service}, "
                                         + f"base=${auto_price_floor}, next=${next_price}, ceiling=${round(auto_price_ceiling, 6)}"
                                     )
                                     debug_events.append(
-                                        f"attempt={attempt}, stop=auto_price_ceiling, base=${auto_price_floor}, next=${next_price}, ceiling=${round(auto_price_ceiling, 6)}"
+                                        f"第 {attempt} 次尝试停止继续抬价：基准价 ${auto_price_floor}，下一档 ${next_price}，允许上限 ${round(auto_price_ceiling, 6)}"
                                     )
                                     raise RuntimeError(last_error)
                             expected_price = next_price
                             last_error = (
-                                "HeroSMS 当前最低价档无号，已自动切换到下一档价格重试取号: "
+                                f"{provider_label} 当前最低价档无号，已自动切换到下一档价格重试取号: "
                                 + f"country={selected_country_id}, service={self.service}, next_expected=${expected_price}"
                             )
                             debug_events.append(
-                                f"attempt={attempt}, fallback=next_price_tier, new_expected=${expected_price}, tier_index={auto_price_index}"
+                                f"第 {attempt} 次尝试切到下一价格档，新的优先价位 ${expected_price}，档位序号 {auto_price_index + 1}"
                             )
                             if _interruptible_sleep(1.0, stop_event):
-                                raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
+                                raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
                             continue
-                    if self.target_price is not None:
+                    if self.max_target_price is not None or self.min_target_price is not None:
                         last_error = (
-                            "HeroSMS 在设定价格上限内无可用号码: "
+                            f"{provider_label} 在设定价格区间内无可用号码: "
                             + f"attempt={attempt}, operator={current_operator or 'ANY'}, "
                             + f"country={selected_country_id}, service={self.service}, "
-                            + f"max_price=${self.target_price}"
+                            + f"target={self._price_target_label()}"
                         )
                     else:
                         last_error = (
-                            "HeroSMS 当前无可用号码: "
+                            f"{provider_label} 当前无可用号码: "
                             + f"attempt={attempt}, operator={current_operator or 'ANY'}, "
                             + f"country={selected_country_id}, service={self.service}"
                         )
+                    if auto_country_mode and country_candidate_index + 1 < len(country_candidates):
+                        country_candidate_index += 1
+                        _apply_country_selection(country_candidates[country_candidate_index])
+                        debug_events.append(
+                            f"第 {attempt} 次尝试切换到自动国家候选 {country_candidate_index + 1}/{len(country_candidates)}："
+                            + f"{str(selection.get('name') or '-')} (ID {selected_country_id})，参考价 ${selection.get('aggregate_price')}"
+                        )
+                        if _interruptible_sleep(1.0, stop_event):
+                            raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
+                        continue
                     if attempt < self.max_acquire_retries:
                         if _interruptible_sleep(3.0, stop_event):
-                            raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
+                            raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
                         continue
                     raise HeroSMSAcquireRetryableError(_build_failure_message(last_error + "（重试耗尽）"))
-                raise RuntimeError(f"HeroSMS 获取号码失败: {data}")
+                raise RuntimeError(f"{provider_label} 获取号码失败: {data}")
 
             if not isinstance(data, dict):
-                debug_events.append(f"attempt={attempt}, invalid_response_type={type(data).__name__}, response={response_code or '-'}")
-                raise RuntimeError(f"HeroSMS 获取号码返回异常结构: {type(data).__name__}: {data}")
+                debug_events.append(f"第 {attempt} 次尝试返回结构异常：{type(data).__name__}，响应码 {response_code or '-'}")
+                raise RuntimeError(f"{provider_label} 获取号码返回异常结构: {type(data).__name__}: {data}")
 
             activation_id = str(data.get("activationId") or data.get("id") or "").strip()
             phone_number = str(data.get("phoneNumber") or data.get("phone") or "").strip()
             if not activation_id or not phone_number:
-                debug_events.append(f"attempt={attempt}, missing_fields={data}")
-                raise RuntimeError(f"HeroSMS 获取号码缺少 activationId/phoneNumber: {data}")
+                debug_events.append(f"第 {attempt} 次尝试返回结果缺少 activationId 或 phoneNumber：{data}")
+                raise RuntimeError(f"{provider_label} 获取号码缺少 activationId/phoneNumber: {data}")
             actual_cost = self._parse_number(data.get("activationCost"))
+            if self.fixed_price and (self.min_target_price is not None or self.max_target_price is not None) and actual_cost is not None:
+                if not self._price_in_target_range(actual_cost):
+                    debug_events.append(
+                        f"第 {attempt} 次尝试固定价/区间不匹配：目标 {self._price_target_label()}，实际成交价 ${actual_cost}，运营商 {current_operator or 'ANY'}"
+                    )
+                    last_error = (
+                        f"{self._provider_label()} 固定价模式要求实际成交价必须命中目标价/区间: "
+                        + f"target={self._price_target_label()}, actual=${actual_cost}, "
+                        + f"operator={current_operator or '-'}, country={selected_country_id}"
+                    )
+                    try:
+                        self.cancel(activation_id, proxy=proxy)
+                    except Exception:
+                        pass
+                    if attempt < self.max_acquire_retries:
+                        if _interruptible_sleep(2.0, stop_event):
+                            raise HeroSMSAcquireStoppedError(f"{self._provider_label()} 取号已停止")
+                        continue
+                    raise RuntimeError(last_error)
             if expected_price is not None and actual_cost is not None:
                 max_allowed_price = self._resolve_actual_price_ceiling(expected_price)
-                if max_allowed_price is not None and actual_cost > (max_allowed_price + self.PRICE_COMPARE_EPSILON):
+                min_allowed_price = self._resolve_actual_price_floor(expected_price)
+                if (
+                    (max_allowed_price is not None and actual_cost > (max_allowed_price + self.PRICE_COMPARE_EPSILON))
+                    or (min_allowed_price is not None and actual_cost < (min_allowed_price - self.PRICE_COMPARE_EPSILON))
+                ):
                     debug_events.append(
-                        f"attempt={attempt}, overpriced expected=${expected_price}, allowed=${max_allowed_price}, actual=${actual_cost}, "
-                        + f"operator={current_operator or 'ANY'}"
+                        f"第 {attempt} 次尝试实际成交价超出范围：预期 ${expected_price}，允许区间 ${min_allowed_price if min_allowed_price is not None else '-'}-${max_allowed_price if max_allowed_price is not None else '-'}，实际 ${actual_cost}，运营商 {current_operator or 'ANY'}"
                     )
-                    if self.target_price is not None:
+                    if self.max_target_price is not None or self.min_target_price is not None:
                         last_error = (
-                            "HeroSMS 实际成交价超过设定价格上限: "
-                            f"max_price={self.target_price}, actual={actual_cost}, "
+                            f"{provider_label} 实际成交价超出设定价格区间: "
+                            f"target={self._price_target_label()}, actual={actual_cost}, "
                             f"operator={current_operator or '-'}, country={selected_country_id}"
                         )
                     else:
                         last_error = (
-                            "HeroSMS 实际成交价高于预期报价: "
+                            f"{provider_label} 实际成交价高于预期报价: "
                             f"expected={expected_price}, actual={actual_cost}, "
                             f"operator={current_operator or '-'}, country={selected_country_id}"
                         )
@@ -1202,22 +1521,50 @@ class HeroSMSProvider(SMSProvider):
                         pass
                     if attempt < self.max_acquire_retries:
                         if _interruptible_sleep(2.0, stop_event):
-                            raise HeroSMSAcquireStoppedError("HeroSMS 取号已停止")
+                            raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
                         continue
                     raise RuntimeError(last_error)
             if not phone_number.startswith("+"):
                 phone_number = f"+{phone_number}"
+            if (
+                auto_country_mode
+                and is_smsbower_excluded_country(
+                    iso_code=str(selection.get("iso_code") or "").strip().upper(),
+                    name=selection.get("name"),
+                    api_name=selection.get("api_name"),
+                )
+            ):
+                debug_events.append(
+                    f"第 {attempt} 次尝试命中自动国家排除名单：{str(selection.get('name') or '-')} ({str(selection.get('iso_code') or '').strip().upper() or '-'})，"
+                    + "已取消当前激活并切换下一国家候选"
+                )
+                try:
+                    self.cancel(activation_id, proxy=proxy)
+                except Exception:
+                    pass
+                last_error = (
+                    f"{provider_label} 自动国家模式命中过滤国家，已废弃当前号码: "
+                    + f"country={selected_country_id}, name={str(selection.get('name') or '-').strip() or '-'}"
+                )
+                if country_candidate_index + 1 < len(country_candidates):
+                    country_candidate_index += 1
+                    _apply_country_selection(country_candidates[country_candidate_index])
+                    if _interruptible_sleep(1.0, stop_event):
+                        raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
+                    continue
+                raise HeroSMSAcquireRetryableError(_build_failure_message(last_error))
             balance_after = self.get_balance(proxy=proxy)
             debug_events.append(
-                f"attempt={attempt}, success operator={current_operator or 'ANY'}, actual=${actual_cost if actual_cost is not None else data.get('activationCost')}, "
-                + f"balance_after=${balance_after if balance_after is not None else '-'}"
+                f"第 {attempt} 次尝试成功，运营商 {current_operator or 'ANY'}，实际成交价 ${actual_cost if actual_cost is not None else data.get('activationCost')}，"
+                + f"取号后余额 ${balance_after if balance_after is not None else '-'}"
             )
             return {
                 "activation_id": activation_id,
                 "phone_number": phone_number,
                 "activation_cost": actual_cost if actual_cost is not None else data.get("activationCost"),
                 "target_price": self.target_price,
-                "max_price": self.target_price if self.target_price is not None and not self.fixed_price else None,
+                "min_price": self.min_target_price,
+                "max_price": self.max_target_price if (self.min_target_price is not None or self.max_target_price is not None) and not self.fixed_price else None,
                 "price_mode": self._get_price_mode(),
                 "used_hidden_ceiling_fallback": hidden_ceiling_fallback,
                 "visible_ceiling_candidates": exact_ceiling_candidates,
@@ -1234,12 +1581,14 @@ class HeroSMSProvider(SMSProvider):
                 "operator_options": selection.get("operator_options") or [],
                 "selected_operator_price": selection.get("selected_operator_price"),
                 "selected_operator_count": selection.get("selected_operator_count"),
+                "auto_country_mode": auto_country_mode,
+                "country_candidates_total": len(country_candidates) if auto_country_mode else 0,
                 "balance_before": balance_before,
                 "balance_after": balance_after,
                 "debug_events": debug_events,
             }
 
-        raise HeroSMSAcquireRetryableError(_build_failure_message(last_error or "HeroSMS 获取号码失败"))
+        raise HeroSMSAcquireRetryableError(_build_failure_message(last_error or f"{provider_label} 获取号码失败"))
 
     def mark_ready(self, activation_id: str, *, proxy: str = "") -> None:
         if not str(activation_id or "").strip():
@@ -1251,20 +1600,59 @@ class HeroSMSProvider(SMSProvider):
                 raise RuntimeError(f"HeroSMS mark_ready 返回异常: {result}")
 
     def _get_status(self, activation_id: str, *, proxy: str = "") -> Dict[str, Any]:
-        data = self._request("getStatusV2", proxy=proxy, id=str(activation_id).strip())
-        if isinstance(data, str):
-            if data == "STATUS_WAIT_CODE":
+        activation = str(activation_id or "").strip()
+        if not activation:
+            return {"received": False, "code": ""}
+        request_errors: List[str] = []
+        for action in ("getStatusV2", "getStatus"):
+            try:
+                data = self._request(action, proxy=proxy, id=activation)
+            except Exception as exc:
+                request_errors.append(f"{action}:{exc}")
+                continue
+            if isinstance(data, str):
+                text = str(data or "").strip()
+                upper_text = text.upper()
+                if upper_text == "STATUS_WAIT_CODE":
+                    return {"received": False, "code": ""}
+                if upper_text == "STATUS_CANCEL":
+                    return {"received": False, "code": "", "cancelled": True}
+                if upper_text.startswith("STATUS_OK:"):
+                    return {"received": True, "code": text.split(":", 1)[1].strip()}
+                if upper_text.startswith("STATUS_WAIT_RETRY:"):
+                    return {"received": True, "code": text.split(":", 1)[1].strip()}
+                if upper_text in {"BAD_ACTION", "BAD_STATUS", "NO_ACTIVATION"}:
+                    request_errors.append(f"{action}:{upper_text}")
+                    continue
                 return {"received": False, "code": ""}
-            if data == "STATUS_CANCEL":
+            if not isinstance(data, dict):
+                continue
+            error_text = str(
+                data.get("error")
+                or data.get("title")
+                or data.get("code")
+                or data.get("status")
+                or ""
+            ).strip()
+            if error_text:
+                normalized_error = error_text.upper()
+                if normalized_error in {"BAD_ACTION", "BAD_STATUS", "NO_ACTIVATION"} or "BAD TYPE PARAMETER" in normalized_error:
+                    request_errors.append(f"{action}:{error_text}")
+                    continue
+            sms_payload = data.get("sms") if isinstance(data.get("sms"), dict) else {}
+            sms_code = str(
+                sms_payload.get("code")
+                or data.get("code")
+                or data.get("smsCode")
+                or ""
+            ).strip()
+            if sms_code:
+                return {"received": True, "code": sms_code}
+            if str(data.get("cancelled") or "").strip().lower() == "true":
                 return {"received": False, "code": "", "cancelled": True}
-            if data.startswith("STATUS_OK:"):
-                return {"received": True, "code": data.split(":", 1)[1].strip()}
-            return {"received": False, "code": ""}
-        if not isinstance(data, dict):
-            return {"received": False, "code": ""}
-        sms_payload = data.get("sms") if isinstance(data.get("sms"), dict) else {}
-        sms_code = str(sms_payload.get("code") or "").strip()
-        return {"received": bool(sms_code), "code": sms_code}
+        if request_errors:
+            return {"received": False, "code": "", "errors": request_errors}
+        return {"received": False, "code": ""}
 
     def wait_for_code(
         self,
@@ -1368,6 +1756,367 @@ class HeroSMSProvider(SMSProvider):
         return {"ok": True, "code": str(result or "ACCESS_CANCEL"), "message": "取消成功", "retryable": False}
 
 
+class SMSBowerProvider(HeroSMSProvider):
+    BASE_URL = "https://smsbower.page/stubs/handler_api.php"
+    API_V1_BASE_URL = "https://smsbower.page/api/v1"
+
+    def _supports_global_auto_country(self) -> bool:
+        return True
+
+    @staticmethod
+    def _coerce_json_payload(data: Any) -> Any:
+        if not isinstance(data, str):
+            return data
+        try:
+            import json as _json
+            return _json.loads(data)
+        except Exception:
+            return data
+
+    @staticmethod
+    def _normalize_price_tier_rows(rows: List[Dict[str, Any]], source: str) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in rows:
+            normalized.append({
+                "price": item.get("price"),
+                "count": item.get("count"),
+                "physical_count": item.get("physical_count"),
+                "is_default_price": False,
+                "is_min_price": False,
+                "default_price_count": None,
+                "total_count": None,
+                "retail_price": None,
+                "source": source,
+                "signature": "|".join([
+                    str(item.get("price")),
+                    str(item.get("count")),
+                    str(item.get("physical_count")),
+                ]),
+                "provider_ids": item.get("provider_ids") if isinstance(item.get("provider_ids"), list) else [],
+            })
+        return normalized
+
+    def _request_global_price_matrix(self, *, proxy: str = "") -> tuple[Any, str]:
+        for action in ("getPricesV3", "getPricesV2", "getPrices"):
+            try:
+                data = self._request(action, proxy=proxy, service=self.service)
+            except Exception:
+                continue
+            parsed = self._coerce_json_payload(data)
+            if isinstance(parsed, (dict, list)):
+                return parsed, action
+        return None, ""
+
+    def get_global_price_tier_options(self, *, proxy: str = "") -> List[Dict[str, Any]]:
+        raw_matrix, action = self._request_global_price_matrix(proxy=proxy)
+        if raw_matrix is None:
+            return []
+        matrix = self._unwrap_price_matrix(raw_matrix)
+        country_ids: set[int] = set()
+        if isinstance(matrix, dict):
+            for key in matrix.keys():
+                parsed_country_id = self._parse_integer(key)
+                if parsed_country_id is not None:
+                    country_ids.add(parsed_country_id)
+        for item in self.list_countries(proxy=proxy):
+            parsed_country_id = self._parse_integer(item.get("heroSmsCountry"))
+            if parsed_country_id is not None:
+                country_ids.add(parsed_country_id)
+        grouped: Dict[float, Dict[str, Any]] = {}
+        for country_id in country_ids:
+            rows = self._extract_country_price_options(raw_matrix, country_id, self.service)
+            for item in rows:
+                price = self._parse_number(item.get("price"))
+                if price is None:
+                    continue
+                bucket = grouped.setdefault(price, {
+                    "price": price,
+                    "count": 0,
+                    "physical_count": 0,
+                    "provider_ids": set(),
+                })
+                parsed_count = self._parse_integer(item.get("count"))
+                parsed_physical = self._parse_integer(item.get("physical_count"))
+                if parsed_count is not None:
+                    bucket["count"] = int(bucket.get("count") or 0) + parsed_count
+                if parsed_physical is not None:
+                    bucket["physical_count"] = int(bucket.get("physical_count") or 0) + parsed_physical
+                raw_provider_ids = item.get("provider_ids")
+                if isinstance(raw_provider_ids, list):
+                    for provider_id in raw_provider_ids:
+                        parsed_provider_id = self._parse_integer(provider_id)
+                        if parsed_provider_id is not None:
+                            bucket["provider_ids"].add(parsed_provider_id)
+        rows = self._normalize_price_tier_rows(
+            [
+                {
+                    "price": price,
+                    "count": value.get("count"),
+                    "physical_count": value.get("physical_count"),
+                    "provider_ids": sorted(value.get("provider_ids") or []),
+                }
+                for price, value in grouped.items()
+            ],
+            f"smsbower_global_{action or 'prices'}",
+        )
+        rows.sort(key=lambda item: (float(item.get("price") or 999999.0), -int(item.get("count") or 0)))
+        return rows
+
+    def _build_global_country_candidates(self, *, proxy: str = "") -> List[Dict[str, Any]]:
+        raw_matrix, action = self._request_global_price_matrix(proxy=proxy)
+        if raw_matrix is None:
+            return []
+        countries_by_id: Dict[int, Dict[str, Any]] = {}
+        for item in self.list_countries(proxy=proxy):
+            parsed_country_id = self._parse_integer(item.get("heroSmsCountry"))
+            if parsed_country_id is None:
+                continue
+            countries_by_id[parsed_country_id] = normalize_handler_api_country_row(
+                country_id=parsed_country_id,
+                api_name=item.get("apiName"),
+                iso_code=item.get("isoCode"),
+                dial_code=item.get("dialCode"),
+            )
+        matrix = self._unwrap_price_matrix(raw_matrix)
+        if isinstance(matrix, dict):
+            for key in matrix.keys():
+                parsed_country_id = self._parse_integer(key)
+                if parsed_country_id is None or parsed_country_id in countries_by_id:
+                    continue
+                countries_by_id[parsed_country_id] = normalize_handler_api_country_row(country_id=parsed_country_id)
+        candidates: List[Dict[str, Any]] = []
+        for country_id, base_country in countries_by_id.items():
+            if is_virtual_phone_country_name(base_country.get("name")) or is_virtual_phone_country_name(base_country.get("api_name")):
+                continue
+            if is_smsbower_excluded_country(
+                iso_code=base_country.get("iso_code"),
+                name=base_country.get("name"),
+                api_name=base_country.get("api_name"),
+            ):
+                continue
+            parsed_rows = self._extract_country_price_options(raw_matrix, country_id, self.service)
+            if not parsed_rows:
+                continue
+            price_tier_options = self._normalize_price_tier_rows(parsed_rows, f"smsbower_{action or 'prices'}")
+            if not price_tier_options:
+                continue
+            if self.min_target_price is None and self.max_target_price is None:
+                matched_rows = list(price_tier_options)
+            elif self.fixed_price:
+                matched_rows = [
+                    row for row in price_tier_options
+                    if self._price_in_target_range(row.get("price"))
+                ]
+            else:
+                matched_rows = []
+                for row in price_tier_options:
+                    parsed_price = self._parse_number(row.get("price"))
+                    if parsed_price is None or not self._price_in_target_range(parsed_price):
+                        continue
+                    matched_rows.append(row)
+            if not matched_rows:
+                continue
+            preferred_row = self._select_preferred_price_tier(matched_rows) or matched_rows[0]
+            candidates.append({
+                **base_country,
+                "aggregate_price": preferred_row.get("price"),
+                "aggregate_count": preferred_row.get("count"),
+                "price_tier_options": price_tier_options,
+                "preferred_price_tier": preferred_row,
+                "target_price": self.target_price,
+                "operator_options": [],
+                "selected_operator": "",
+                "selected_operator_price": None,
+                "selected_operator_count": None,
+                "candidate_match_price": preferred_row.get("price"),
+                "candidate_match_count": preferred_row.get("count"),
+                "candidate_source": "global_auto_country",
+            })
+        candidates.sort(
+            key=lambda item: (
+                float(item.get("candidate_match_price") or 999999.0),
+                -int(item.get("candidate_match_count") or 0),
+                str(item.get("name") or ""),
+                int(item.get("hero_sms_country") or 0),
+            )
+        )
+        return candidates
+
+    def resolve_country_and_operator(self, *, proxy: str = "") -> Dict[str, Any]:
+        if self.country != SMSBOWER_AUTO_COUNTRY_ID:
+            return super().resolve_country_and_operator(proxy=proxy)
+        candidates = self._build_global_country_candidates(proxy=proxy)
+        if not candidates:
+            if (self.min_target_price is not None or self.max_target_price is not None) and self.fixed_price:
+                raise RuntimeError(
+                    f"SMSBower 自动国家模式下，没有国家命中固定价/区间 {self._price_target_label()}。"
+                )
+            if self.min_target_price is not None or self.max_target_price is not None:
+                raise RuntimeError(
+                    f"SMSBower 自动国家模式下，没有国家存在命中价格区间 {self._price_target_label()} 的可用价档。"
+                )
+            raise RuntimeError("SMSBower 自动国家模式下，没有找到可用国家报价。")
+        first = dict(candidates[0])
+        first["country_candidates"] = [dict(item) for item in candidates]
+        first["auto_country_mode"] = True
+        first["selected_country_count"] = len(candidates)
+        return first
+
+    def _get_status(self, activation_id: str, *, proxy: str = "") -> Dict[str, Any]:
+        activation = str(activation_id or "").strip()
+        if not activation:
+            return {"received": False, "code": ""}
+        for action in ("getStatus", "getStatusV2"):
+            try:
+                data = self._request(action, proxy=proxy, id=activation)
+            except Exception:
+                continue
+            if isinstance(data, str):
+                text = str(data or "").strip()
+                upper_text = text.upper()
+                if upper_text == "STATUS_WAIT_CODE":
+                    return {"received": False, "code": ""}
+                if upper_text == "STATUS_CANCEL":
+                    return {"received": False, "code": "", "cancelled": True}
+                if upper_text.startswith("STATUS_OK:"):
+                    return {"received": True, "code": text.split(":", 1)[1].strip()}
+                if upper_text.startswith("STATUS_WAIT_RETRY:"):
+                    return {"received": True, "code": text.split(":", 1)[1].strip()}
+                continue
+            if not isinstance(data, dict):
+                continue
+            error_text = str(
+                data.get("error")
+                or data.get("title")
+                or data.get("code")
+                or data.get("status")
+                or ""
+            ).strip().upper()
+            if error_text and ("BAD TYPE PARAMETER" in error_text or error_text in {"BAD_ACTION", "BAD_STATUS", "NO_ACTIVATION"}):
+                continue
+            sms_payload = data.get("sms") if isinstance(data.get("sms"), dict) else {}
+            sms_code = str(
+                sms_payload.get("code")
+                or data.get("code")
+                or data.get("smsCode")
+                or ""
+            ).strip()
+            if sms_code:
+                return {"received": True, "code": sms_code}
+        return {"received": False, "code": ""}
+
+    @classmethod
+    def _extract_country_price_options(cls, raw: Any, country_id: int, service: str) -> List[Dict[str, Any]]:
+        matrix = cls._unwrap_price_matrix(raw)
+        service_key = str(service or "").strip()
+        id_key = str(country_id)
+
+        def push_result(
+            results: List[Dict[str, Any]],
+            seen: set[tuple[Any, Any, Any, tuple[int, ...]]],
+            *,
+            price: Any,
+            count: Any,
+            physical_count: Any,
+            provider_ids: Optional[List[int]] = None,
+        ) -> None:
+            parsed_price = cls._parse_number(price)
+            parsed_count = cls._parse_integer(count)
+            parsed_physical = cls._parse_integer(physical_count)
+            normalized_provider_ids = tuple(sorted({
+                parsed_id
+                for parsed_id in (
+                    cls._parse_integer(item)
+                    for item in (provider_ids or [])
+                )
+                if parsed_id is not None
+            }))
+            if parsed_price is None and parsed_count is None and parsed_physical is None:
+                return
+            signature = (parsed_price, parsed_count, parsed_physical, normalized_provider_ids)
+            if signature in seen:
+                return
+            seen.add(signature)
+            row: Dict[str, Any] = {
+                "price": parsed_price,
+                "count": parsed_count,
+                "physical_count": parsed_physical,
+            }
+            if normalized_provider_ids:
+                row["provider_ids"] = list(normalized_provider_ids)
+            results.append(row)
+
+        results: List[Dict[str, Any]] = []
+        seen: set[tuple[Any, Any, Any, tuple[int, ...]]] = set()
+
+        if isinstance(matrix, dict):
+            country_node = matrix.get(id_key) if isinstance(matrix.get(id_key), dict) else None
+            service_node = country_node.get(service_key) if isinstance(country_node, dict) and isinstance(country_node.get(service_key), dict) else None
+            if isinstance(service_node, dict):
+                all_v3 = True
+                for provider_id, item in service_node.items():
+                    if not isinstance(item, dict):
+                        all_v3 = False
+                        break
+                    if cls._parse_number(item.get("price")) is None and cls._parse_integer(item.get("count")) is None:
+                        all_v3 = False
+                        break
+                if all_v3 and service_node:
+                    grouped: Dict[float, Dict[str, Any]] = {}
+                    for provider_id, item in service_node.items():
+                        if not isinstance(item, dict):
+                            continue
+                        parsed_price = cls._parse_number(item.get("price"))
+                        if parsed_price is None:
+                            continue
+                        parsed_count = cls._parse_integer(item.get("count"))
+                        parsed_physical = cls._parse_integer(
+                            item.get("physicalCount") or item.get("physical_count") or item.get("realCount")
+                        )
+                        parsed_provider_id = cls._parse_integer(item.get("provider_id") or provider_id)
+                        bucket = grouped.setdefault(parsed_price, {
+                            "price": parsed_price,
+                            "count": 0,
+                            "physical_count": parsed_physical,
+                            "provider_ids": [],
+                        })
+                        if parsed_count is not None:
+                            bucket["count"] = int(bucket.get("count") or 0) + parsed_count
+                        if bucket.get("physical_count") is None and parsed_physical is not None:
+                            bucket["physical_count"] = parsed_physical
+                        if parsed_provider_id is not None and parsed_provider_id not in bucket["provider_ids"]:
+                            bucket["provider_ids"].append(parsed_provider_id)
+                    for item in grouped.values():
+                        push_result(
+                            results,
+                            seen,
+                            price=item.get("price"),
+                            count=item.get("count"),
+                            physical_count=item.get("physical_count"),
+                            provider_ids=item.get("provider_ids"),
+                        )
+                    results.sort(key=lambda item: (float(item.get("price") or 999999.0), -int(item.get("count") or 0)))
+                    return results
+
+        return super()._extract_country_price_options(raw, country_id, service)
+
+    def get_price_tier_options(self, *, country: int, proxy: str = "") -> List[Dict[str, Any]]:
+        if int(country) == SMSBOWER_AUTO_COUNTRY_ID:
+            return self.get_global_price_tier_options(proxy=proxy)
+        for action in ("getPricesV3", "getPricesV2", "getPrices"):
+            try:
+                data = self._request(action, proxy=proxy, service=self.service, country=country)
+            except Exception:
+                continue
+            data = self._coerce_json_payload(data)
+            if not isinstance(data, (dict, list)):
+                continue
+            options = self._extract_country_price_options(data, country, self.service)
+            if options:
+                return self._normalize_price_tier_rows(options, f"smsbower_{action}")
+        return super().get_price_tier_options(country=country, proxy=proxy)
+
+
 def schedule_hero_sms_delayed_cancel(
     *,
     provider: SMSProvider,
@@ -1375,6 +2124,7 @@ def schedule_hero_sms_delayed_cancel(
     purchased_at: float,
     proxy: str = "",
     min_wait_seconds: int = HERO_SMS_CANCEL_MIN_WAIT_SECONDS,
+    provider_label: str = "HeroSMS",
     logger: Optional[Any] = None,
 ) -> Optional[threading.Thread]:
     activation = str(activation_id or "").strip()
@@ -1392,18 +2142,18 @@ def schedule_hero_sms_delayed_cancel(
     def _runner() -> None:
         if delay_seconds > 0:
             _log(
-                "HeroSMS 延迟取消已入队: "
+                f"{provider_label} 延迟取消已入队: "
                 + f"activation_id={activation}, remaining={round(delay_seconds, 1)}s"
             )
             time.sleep(delay_seconds)
         try:
             result = provider.cancel(activation, proxy=proxy)
         except Exception as exc:
-            _log(f"HeroSMS 延迟取消执行异常: activation_id={activation}, error={exc}")
+            _log(f"{provider_label} 延迟取消执行异常: activation_id={activation}, error={exc}")
             return
         code = str((result or {}).get("code") or "")
         if result and result.get("ok"):
-            _log(f"HeroSMS 延迟取消成功: activation_id={activation}, code={code or 'ACCESS_CANCEL'}")
+            _log(f"{provider_label} 延迟取消成功: activation_id={activation}, code={code or 'ACCESS_CANCEL'}")
             return
         retryable = bool(result and result.get("retryable"))
         retry_after = 0.0
@@ -1414,7 +2164,7 @@ def schedule_hero_sms_delayed_cancel(
         if retryable and retry_after > 0:
             retry_delay = max(0.0, retry_after - max(0.0, time.time() - float(purchased_at or 0.0)))
             _log(
-                "HeroSMS 延迟取消仍被拒绝，准备再次等待后重试: "
+                f"{provider_label} 延迟取消仍被拒绝，准备再次等待后重试: "
                 + f"activation_id={activation}, code={code or '-'}, retry_after={round(retry_delay, 1)}s"
             )
             if retry_delay > 0:
@@ -1422,19 +2172,19 @@ def schedule_hero_sms_delayed_cancel(
             try:
                 retry_result = provider.cancel(activation, proxy=proxy)
             except Exception as exc:
-                _log(f"HeroSMS 延迟取消重试异常: activation_id={activation}, error={exc}")
+                _log(f"{provider_label} 延迟取消重试异常: activation_id={activation}, error={exc}")
                 return
             retry_code = str((retry_result or {}).get("code") or "")
             if retry_result and retry_result.get("ok"):
-                _log(f"HeroSMS 延迟取消重试成功: activation_id={activation}, code={retry_code or 'ACCESS_CANCEL'}")
+                _log(f"{provider_label} 延迟取消重试成功: activation_id={activation}, code={retry_code or 'ACCESS_CANCEL'}")
             else:
                 _log(
-                    "HeroSMS 延迟取消重试结束但未成功: "
+                    f"{provider_label} 延迟取消重试结束但未成功: "
                     + f"activation_id={activation}, code={retry_code or '-'}, message={str((retry_result or {}).get('message') or '-')}"
                 )
             return
         _log(
-            "HeroSMS 延迟取消结束但未成功: "
+            f"{provider_label} 延迟取消结束但未成功: "
             + f"activation_id={activation}, code={code or '-'}, message={str((result or {}).get('message') or '-')}"
         )
 
@@ -1449,15 +2199,16 @@ def schedule_hero_sms_delayed_cancel(
 
 def create_sms_provider_from_browser_config(browser_config: Optional[Dict[str, Any]]) -> Optional[SMSProvider]:
     cfg = browser_config if isinstance(browser_config, dict) else {}
-    auto_enabled = str(cfg.get("browser_manual_v2_phone_mode") or "").strip().lower() == "hero_sms"
+    phone_mode = str(cfg.get("browser_manual_v2_phone_mode") or "").strip().lower()
     api_key = str(cfg.get("hero_sms_api_key") or "").strip()
     service = str(cfg.get("hero_sms_service") or "").strip()
-    if not auto_enabled or not api_key or not service:
+    if phone_mode not in ("hero_sms", "smsbower") or not api_key or not service:
         return None
-    return HeroSMSProvider(
+    provider_cls = HeroSMSProvider if phone_mode == "hero_sms" else SMSBowerProvider
+    return provider_cls(
         api_key=api_key,
         service=service,
-        country=cfg.get("hero_sms_country") or 16,
+        country=cfg.get("hero_sms_country", 16),
         operator=str(cfg.get("hero_sms_operator") or "").strip(),
         target_price=cfg.get("hero_sms_target_price") or "",
         fixed_price=_as_bool(cfg.get("hero_sms_fixed_price", True), default=True),
@@ -1470,40 +2221,45 @@ def list_hero_sms_countries(
     api_key: str,
     service: str = "",
     proxy: str = "",
+    provider_mode: str = "hero_sms",
 ) -> List[Dict[str, Any]]:
     service_text = str(service or "").strip()
-    if not api_key or not service_text:
+    if not api_key:
         return []
-    provider = HeroSMSProvider(
+    provider_cls = HeroSMSProvider if str(provider_mode or "").strip().lower() != "smsbower" else SMSBowerProvider
+    provider = provider_cls(
         api_key=api_key,
         service=service_text,
     )
     api_rows = provider.list_countries(proxy=proxy)
-    catalog_by_iso: Dict[str, Dict[str, Any]] = {
-        str(item.get("isoCode") or "").strip().upper(): item
-        for item in DEFAULT_PHONE_COUNTRIES
-        if str(item.get("isoCode") or "").strip()
-    }
-    catalog_by_dial: Dict[str, Dict[str, Any]] = {
-        str(item.get("dialCode") or "").strip().lstrip("+"): item
-        for item in DEFAULT_PHONE_COUNTRIES
-        if str(item.get("dialCode") or "").strip()
-    }
     rows: List[Dict[str, Any]] = []
     for item in api_rows:
-        iso_code = str(item.get("isoCode") or "").strip().upper()
-        dial_code = str(item.get("dialCode") or "").strip().lstrip("+")
-        catalog_item = catalog_by_iso.get(iso_code) or catalog_by_dial.get(dial_code) or {}
-        display_name = str(catalog_item.get("name") or item.get("apiName") or iso_code or dial_code or item.get("heroSmsCountry") or "").strip()
-        rows.append({
-            "hero_sms_country": int(item.get("heroSmsCountry") or 0),
-            "name": display_name,
-            "api_name": str(item.get("apiName") or "").strip(),
-            "iso_code": iso_code,
-            "dial_code": dial_code,
-        })
+        rows.append(normalize_handler_api_country_row(
+            country_id=item.get("heroSmsCountry"),
+            api_name=item.get("apiName"),
+            iso_code=item.get("isoCode"),
+            dial_code=item.get("dialCode"),
+        ))
     rows.sort(key=lambda item: (str(item.get("name") or ""), int(item.get("hero_sms_country") or 0)))
     return rows
+
+
+def list_handler_api_services(
+    *,
+    api_key: str,
+    service: str = "",
+    proxy: str = "",
+    provider_mode: str = "hero_sms",
+) -> List[Dict[str, Any]]:
+    api_key_text = str(api_key or "").strip()
+    if not api_key_text:
+        return []
+    provider_cls = HeroSMSProvider if str(provider_mode or "").strip().lower() != "smsbower" else SMSBowerProvider
+    provider = provider_cls(
+        api_key=api_key_text,
+        service=str(service or "").strip(),
+    )
+    return provider.list_services(proxy=proxy)
 
 
 def list_hero_sms_operator_quotes(
@@ -1512,6 +2268,7 @@ def list_hero_sms_operator_quotes(
     service: str,
     country: int,
     proxy: str = "",
+    provider_mode: str = "hero_sms",
 ) -> List[Dict[str, Any]]:
     service_text = str(service or "").strip()
     if not api_key or not service_text:
@@ -1520,7 +2277,8 @@ def list_hero_sms_operator_quotes(
         country_id = max(1, int(country or 0))
     except (TypeError, ValueError):
         return []
-    provider = HeroSMSProvider(
+    provider_cls = HeroSMSProvider if str(provider_mode or "").strip().lower() != "smsbower" else SMSBowerProvider
+    provider = provider_cls(
         api_key=api_key,
         service=service_text,
         country=country_id,
@@ -1551,6 +2309,7 @@ def list_hero_sms_price_tiers(
     country: int,
     operator: str = "",
     proxy: str = "",
+    provider_mode: str = "hero_sms",
 ) -> List[Dict[str, Any]]:
     service_text = str(service or "").strip()
     if not api_key or not service_text:
@@ -1559,7 +2318,8 @@ def list_hero_sms_price_tiers(
         country_id = max(1, int(country or 0))
     except (TypeError, ValueError):
         return []
-    provider = HeroSMSProvider(
+    provider_cls = HeroSMSProvider if str(provider_mode or "").strip().lower() != "smsbower" else SMSBowerProvider
+    provider = provider_cls(
         api_key=api_key,
         service=service_text,
         country=country_id,
