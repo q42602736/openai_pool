@@ -150,7 +150,7 @@ HANDLER_API_PROVIDER_LABELS: Dict[str, str] = {
 }
 
 SMSBOWER_AUTO_COUNTRY_ID = 0
-SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO"}
+SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO", "CA", "AR"}
 SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "indonesia",
     "indonesian",
@@ -158,9 +158,17 @@ SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "philippine",
     "romania",
     "romanian",
+    "canada",
+    "canadian",
+    "argentina",
+    "argentinas",
+    "argentine",
+    "argentinian",
     "印度尼西亚",
     "菲律宾",
     "罗马尼亚",
+    "加拿大",
+    "阿根廷",
 }
 
 
