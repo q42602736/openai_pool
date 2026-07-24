@@ -394,6 +394,7 @@ document.addEventListener('DOMContentLoaded', () => {
   loadMailConfig();
   initMailCheckboxes();
   initCustomDomainsContainer();
+  initTempmailDomainsContainer();
   pollPoolStatus();
   pollSub2ApiPoolStatus();
   loadSub2ApiAccounts();
@@ -3656,22 +3657,24 @@ function createDomainInputRow(value = '') {
   return row;
 }
 
-// 初始化域名输入容器
-function initCustomDomainsContainer() {
-  const container = document.getElementById('customDomainsContainer');
-  const addBtn = document.getElementById('addDomainBtn');
-  
-  if (!container || !addBtn) return;
-  
-  // 添加域名按钮
-  addBtn.addEventListener('click', () => {
-    container.appendChild(createDomainInputRow());
-  });
-  
-  // 初始添加一个空输入框
+function ensureDomainContainerHasRow(container) {
+  if (!container) return;
   if (container.children.length === 0) {
     container.appendChild(createDomainInputRow());
   }
+}
+
+// 初始化域名输入容器
+function initCustomDomainsContainer() {
+  const container = document.getElementById('customDomainsContainer');
+  if (!container) return;
+  ensureDomainContainerHasRow(container);
+}
+
+function initTempmailDomainsContainer() {
+  const container = document.getElementById('tempmailDomainsContainer');
+  if (!container) return;
+  ensureDomainContainerHasRow(container);
 }
 
 // 加载域名列表到容器
@@ -3700,6 +3703,28 @@ function loadCustomDomains(domainsValue) {
   }
 }
 
+function loadTempmailDomains(domainsValue) {
+  const container = document.getElementById('tempmailDomainsContainer');
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  let domains = [];
+  if (Array.isArray(domainsValue)) {
+    domains = domainsValue;
+  } else if (typeof domainsValue === 'string' && domainsValue.trim()) {
+    domains = domainsValue.split(/[,\n\r]+/).map(d => d.trim()).filter(d => d);
+  }
+
+  if (domains.length === 0) {
+    container.appendChild(createDomainInputRow());
+  } else {
+    domains.forEach(domain => {
+      container.appendChild(createDomainInputRow(domain));
+    });
+  }
+}
+
 // 收集所有域名
 function collectCustomDomains() {
   const container = document.getElementById('customDomainsContainer');
@@ -3718,6 +3743,39 @@ function collectCustomDomains() {
   
   return domains.join(',');
 }
+
+function collectTempmailDomains() {
+  const container = document.getElementById('tempmailDomainsContainer');
+  if (!container) return '';
+
+  const domains = [];
+  container.querySelectorAll('.domain-input-row input').forEach(input => {
+    const value = input.value.trim();
+    if (value && isValidDomain(value)) {
+      domains.push(value);
+      input.classList.remove('invalid');
+    } else if (value) {
+      input.classList.add('invalid');
+    }
+  });
+
+  return domains.join(',');
+}
+
+document.addEventListener('click', (event) => {
+  const addBtn = event.target.closest('#addDomainBtn, #addTempmailDomainBtn');
+  if (!addBtn) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  const containerId = addBtn.id === 'addTempmailDomainBtn'
+    ? 'tempmailDomainsContainer'
+    : 'customDomainsContainer';
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.appendChild(createDomainInputRow());
+});
 
 function initMailCheckboxes() {
   document.querySelectorAll('.mail-provider-check').forEach(cb => {
@@ -3750,9 +3808,12 @@ async function loadMailConfig() {
       // 填充 per-provider 配置
       const pcfg = configs[name] || {};
       
-      // 特殊处理 mailtm_forward 的 custom_domains
+      // 特殊处理 mailtm_forward / tempmail 的 custom_domains
       if (name === 'mailtm_forward' && pcfg.custom_domains) {
         loadCustomDomains(pcfg.custom_domains);
+      }
+      if (name === 'tempmail' && pcfg.custom_domains) {
+        loadTempmailDomains(pcfg.custom_domains);
       }
       
       item.querySelectorAll('[data-key]').forEach(input => {
@@ -3782,8 +3843,12 @@ async function loadMailConfig() {
       const activeProvider = data.mail_provider || 'mailtm';
       const item = document.querySelector(`.provider-item[data-provider="${activeProvider}"]`);
       if (item) {
-        const apiBaseInput = item.querySelector('[data-key="api_base"]');
-        if (apiBaseInput && mc.api_base) apiBaseInput.value = mc.api_base;
+        item.querySelectorAll('[data-key]').forEach(input => {
+          const key = input.dataset.key;
+          const previewKey = key + '_preview';
+          if (mc[key]) input.value = mc[key];
+          else if (mc[previewKey]) input.placeholder = mc[previewKey];
+        });
       }
     }
 
@@ -3802,9 +3867,12 @@ async function saveMailConfig() {
       const item = cb.closest('.provider-item');
       const cfg = {};
       
-      // 特殊处理 mailtm_forward 的 custom_domains
+      // 特殊处理 mailtm_forward / tempmail 的 custom_domains
       if (name === 'mailtm_forward') {
         cfg.custom_domains = collectCustomDomains();
+      }
+      if (name === 'tempmail') {
+        cfg.custom_domains = collectTempmailDomains();
       }
       
       item.querySelectorAll('[data-key]').forEach(input => {

@@ -4107,9 +4107,16 @@ def run(
                             proxy_selector=mail_proxy_selector,
                         )
                 except TypeError:
-                    email, dev_token = mail_provider.create_mailbox(
-                        proxy=selected_browser_proxy if browser_mode else static_proxy
-                    )
+                    try:
+                        email, dev_token = mail_provider.create_mailbox(
+                            proxy=selected_browser_proxy if browser_mode else static_proxy
+                        )
+                    except Exception as e:
+                        emitter.error(f"临时邮箱创建失败: {e}", step="create_email")
+                        return None
+                except Exception as e:
+                    emitter.error(f"临时邮箱创建失败: {e}", step="create_email")
+                    return None
             else:
                 emitter.info("正在创建 Mail.tm 临时邮箱...", step="create_email")
                 email, dev_token = get_email_and_token(

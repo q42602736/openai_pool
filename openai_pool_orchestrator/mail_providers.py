@@ -1,6 +1,6 @@
 """
 MailProvider 抽象层
-支持 Mail.tm / MoeMail / DuckMail / 自定义兼容 API
+支持 Mail.tm / MoeMail / DuckMail / TempMail Plus / 自定义兼容 API
 """
 
 from __future__ import annotations
@@ -344,6 +344,7 @@ class MailTmForwardProvider(MailTmProvider):
         self.forward_to_token = str(forward_to_token or "").strip()
         self.alias_prefix = re.sub(r"[^a-z0-9._-]", "", str(alias_prefix or "oc").strip().lower()) or "oc"
         self.alias_length = self._to_int(alias_length, default=12, minimum=6, maximum=24)
+        self._last_token_error = ""
 
     @staticmethod
     def _split_domains(value: Any) -> List[str]:
@@ -402,23 +403,65 @@ class MailTmForwardProvider(MailTmProvider):
             return None
 
     def _issue_receiver_token(self, session: _requests.Session) -> str:
+        self._last_token_error = ""
         if self.forward_to_token:
             return self.forward_to_token
         if not self.forward_to_email or not self.forward_to_password:
+            self._last_token_error = "未配置转发收件箱邮箱或密码"
             return ""
-        try:
-            token_resp = session.post(
-                f"{self.api_base}/token",
-                headers=self._headers(use_json=True),
-                json={"address": self.forward_to_email, "password": self.forward_to_password},
-                timeout=15, verify=False,
-            )
-            if token_resp.status_code != 200:
+        retryable_statuses = {429, 500, 502, 503, 504}
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                token_resp = session.post(
+                    f"{self.api_base}/token",
+                    headers=self._headers(use_json=True),
+                    json={"address": self.forward_to_email, "password": self.forward_to_password},
+                    timeout=15, verify=False,
+                )
+                if token_resp.status_code != 200:
+                    detail = ""
+                    try:
+                        data = token_resp.json()
+                        if isinstance(data, dict):
+                            detail = str(
+                                data.get("detail")
+                                or data.get("message")
+                                or data.get("title")
+                                or data.get("hydra:description")
+                                or ""
+                            ).strip()
+                    except Exception:
+                        detail = str(token_resp.text or "").strip()[:160]
+                    self._last_token_error = (
+                        f"Mail.tm /token 返回 {token_resp.status_code}"
+                        + (f": {detail}" if detail else "")
+                        + (
+                            f"（第 {attempt}/{max_attempts} 次失败）"
+                            if token_resp.status_code in retryable_statuses
+                            else ""
+                        )
+                    )
+                    if token_resp.status_code in retryable_statuses and attempt < max_attempts:
+                        time.sleep(float(attempt))
+                        continue
+                    return ""
+                token = str(token_resp.json().get("token") or "").strip()
+                if not token:
+                    self._last_token_error = "Mail.tm /token 未返回 token"
+                return token
+            except Exception as exc:
+                self._last_token_error = f"Mail.tm /token 请求异常: {exc}（第 {attempt}/{max_attempts} 次失败）"
+                if attempt < max_attempts:
+                    time.sleep(float(attempt))
+                    continue
                 return ""
-            token = str(token_resp.json().get("token") or "").strip()
-            return token
-        except Exception:
-            return ""
+        return ""
+
+    def _receiver_token_failure_message(self) -> str:
+        reason = str(getattr(self, "_last_token_error", "") or "").strip()
+        base = "mailtm_forward 无法登录 Mail.tm 转发收件箱，请检查转发邮箱地址/密码或 Token"
+        return f"{base}（{reason}）" if reason else base
 
     def _build_alias_email(self) -> str:
         if not self.custom_domains:
@@ -477,14 +520,14 @@ class MailTmForwardProvider(MailTmProvider):
         proxy_selector: Optional[Callable[[], str]] = None,
     ) -> Tuple[str, str]:
         if not self.custom_domains:
-            return "", ""
+            raise RuntimeError("mailtm_forward 未配置自定义域名")
         with _build_session(proxy, proxy_selector) as session:
             token = self._issue_receiver_token(session)
             if not token:
-                return "", ""
+                raise RuntimeError(self._receiver_token_failure_message())
             email = self._build_alias_email()
             if not email:
-                return "", ""
+                raise RuntimeError("mailtm_forward 未能生成转发别名，请检查自定义域名配置")
             return email, self._pack_credential(token, email)
 
     def wait_for_otp(
@@ -596,7 +639,7 @@ class MailTmForwardProvider(MailTmProvider):
         with _build_session(proxy) as session:
             token = self._issue_receiver_token(session)
             if not token:
-                return False, "无法登录 Mail.tm 转发收件箱，请检查转发邮箱地址/密码或 Token"
+                return False, self._receiver_token_failure_message()
             try:
                 resp = session.get(
                     f"{self.api_base}/messages",
@@ -827,6 +870,308 @@ class DuckMailProvider(MailProvider):
                     logger.warning("DuckMail 轮询验证码失败: %s", exc)
                 time.sleep(3)
         return ""
+
+
+# ==================== TempMail Plus 转发 ====================
+
+class TempMailPlusProvider(MailProvider):
+    """使用自定义域名收信，并转发到 TempMail Plus 收件箱。"""
+
+    def __init__(
+        self,
+        api_base: str = "https://tempmail.plus",
+        custom_domains: Any = None,
+        receiver_email: str = "",
+        epin: str = "",
+        alias_prefix: str = "oc",
+        alias_length: Any = 12,
+        email_extension: str = "@mailto.plus",
+    ):
+        base = str(api_base or "https://tempmail.plus").strip().rstrip("/")
+        if base.endswith("/api"):
+            base = base[:-4]
+        self.api_base = base or "https://tempmail.plus"
+        self.custom_domains = MailTmForwardProvider._split_domains(custom_domains)
+        self.receiver_email = self._normalize_receiver_email(receiver_email, email_extension)
+        self.epin = str(epin or "").strip()
+        self.alias_prefix = re.sub(r"[^a-z0-9._-]", "", str(alias_prefix or "oc").strip().lower()) or "oc"
+        self.alias_length = MailTmForwardProvider._to_int(alias_length, default=12, minimum=6, maximum=24)
+
+    @staticmethod
+    def _normalize_receiver_email(receiver_email: str, email_extension: str) -> str:
+        raw = str(receiver_email or "").strip().lower()
+        if not raw:
+            return ""
+        if "@" in raw:
+            return raw
+        ext = str(email_extension or "@mailto.plus").strip()
+        if ext and not ext.startswith("@"):
+            ext = f"@{ext.lstrip('@')}"
+        ext = ext or "@mailto.plus"
+        return f"{raw}{ext}"
+
+    def _headers(self) -> Dict[str, str]:
+        return {"Accept": "application/json"}
+
+    def _list_params(self, receiver_email: str, limit: int = 20) -> Dict[str, Any]:
+        return {
+            "email": receiver_email,
+            "limit": limit,
+            "epin": self.epin,
+        }
+
+    def _detail_params(self, receiver_email: str) -> Dict[str, Any]:
+        return {
+            "email": receiver_email,
+            "epin": self.epin,
+        }
+
+    def _build_alias_email(self) -> str:
+        if not self.custom_domains:
+            return ""
+        random_part = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(self.alias_length))
+        domain = random.choice(self.custom_domains)
+        return f"{self.alias_prefix}{random_part}@{domain}"
+
+    @staticmethod
+    def _extract_mail_ids(payload: Any) -> List[str]:
+        ids: List[str] = []
+        seen: set[str] = set()
+        if not isinstance(payload, dict):
+            return ids
+        first_id = payload.get("first_id") or payload.get("firstId")
+        if first_id:
+            first_id = str(first_id).strip()
+            if first_id and first_id not in seen:
+                seen.add(first_id)
+                ids.append(first_id)
+        for key in ("mail_list", "mailList", "mails", "items", "results", "list"):
+            items = payload.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("id") or item.get("mail_id") or item.get("mailId")
+                item_id = str(item_id or "").strip()
+                if item_id and item_id not in seen:
+                    seen.add(item_id)
+                    ids.append(item_id)
+        return ids
+
+    @staticmethod
+    def _flatten_strings(value: Any) -> List[str]:
+        return MailTmForwardProvider._flatten_strings(value)
+
+    @staticmethod
+    def _message_timestamp(mail_data: Dict[str, Any]) -> Optional[float]:
+        for key in ("createdAt", "updatedAt", "created_at", "updated_at", "date"):
+            ts = MailTmForwardProvider._parse_iso_timestamp(mail_data.get(key))
+            if ts is not None:
+                return ts
+        return None
+
+    def _message_matches_email(self, payload: Dict[str, Any], target_email: str) -> bool:
+        target = str(target_email or "").strip().lower()
+        if not target:
+            return True
+        combined = "\n".join(self._flatten_strings(payload)).lower()
+        return target in combined
+
+    def _cleanup_mail(self, session: _requests.Session, receiver_email: str, first_id: str) -> None:
+        if not receiver_email or not first_id:
+            return
+        try:
+            session.delete(
+                f"{self.api_base}/api/mails/",
+                data={
+                    "email": receiver_email,
+                    "first_id": first_id,
+                    "epin": self.epin,
+                },
+                headers=self._headers(),
+                timeout=10,
+                verify=False,
+            )
+        except Exception as exc:
+            logger.debug("TempMail Plus 清理邮件失败: %s", exc)
+
+    def _pack_credential(self, generated_email: str) -> str:
+        import json
+        return json.dumps(
+            {
+                "receiver_email": self.receiver_email,
+                "generated_email": generated_email,
+                "issued_at": time.time(),
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _unpack_credential(auth_credential: str) -> Dict[str, Any]:
+        import json
+        raw = str(auth_credential or "").strip()
+        if not raw or not raw.startswith("{"):
+            return {}
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            return {}
+        return {}
+
+    def create_mailbox(
+        self,
+        proxy: str = "",
+        proxy_selector: Optional[Callable[[], str]] = None,
+    ) -> Tuple[str, str]:
+        if not self.custom_domains:
+            raise RuntimeError("tempmail 未配置自定义域名")
+        if not self.receiver_email:
+            raise RuntimeError("tempmail 未配置接收邮箱地址")
+        with _build_session(proxy, proxy_selector) as session:
+            try:
+                resp = session.get(
+                    f"{self.api_base}/api/mails",
+                    params=self._list_params(self.receiver_email, limit=1),
+                    headers=self._headers(),
+                    timeout=15,
+                    verify=False,
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(f"tempmail 收件箱连接失败，状态码: {resp.status_code}")
+                resp.json()
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"tempmail 收件箱连接失败: {exc}") from exc
+
+            email = self._build_alias_email()
+            if not email:
+                raise RuntimeError("tempmail 未能生成转发别名，请检查自定义域名配置")
+            return email, self._pack_credential(email)
+
+    def wait_for_otp(
+        self,
+        auth_credential: str,
+        email: str,
+        proxy: str = "",
+        proxy_selector: Optional[Callable[[], str]] = None,
+        timeout: int = 120,
+        stop_event: Optional[threading.Event] = None,
+    ) -> str:
+        cred = self._unpack_credential(auth_credential)
+        receiver_email = str(cred.get("receiver_email") or self.receiver_email or "").strip().lower()
+        if not receiver_email:
+            return ""
+
+        try:
+            created_after = float(cred.get("issued_at") or 0.0)
+        except (TypeError, ValueError):
+            created_after = 0.0
+
+        mailbox_key = f"{receiver_email}|{email}|{auth_credential}"
+        with _build_session(proxy, proxy_selector) as session:
+            seen_ids = _get_seen_message_ids(self, mailbox_key)
+            runtime_state = _get_mailbox_runtime_state(self, mailbox_key)
+            first_poll_started_at = float(runtime_state.get("first_poll_started_at") or 0.0)
+            if first_poll_started_at <= 0:
+                first_poll_started_at = time.time()
+                runtime_state["first_poll_started_at"] = first_poll_started_at
+            start = time.time()
+
+            while time.time() - start < timeout:
+                if stop_event and stop_event.is_set():
+                    return ""
+                try:
+                    list_resp = session.get(
+                        f"{self.api_base}/api/mails",
+                        params=self._list_params(receiver_email, limit=20),
+                        headers=self._headers(),
+                        timeout=15,
+                        verify=False,
+                    )
+                    if list_resp.status_code != 200:
+                        time.sleep(3)
+                        continue
+
+                    list_data = list_resp.json()
+                    for mail_id in self._extract_mail_ids(list_data):
+                        if mail_id in seen_ids:
+                            continue
+                        detail_resp = session.get(
+                            f"{self.api_base}/api/mails/{mail_id}",
+                            params=self._detail_params(receiver_email),
+                            headers=self._headers(),
+                            timeout=15,
+                            verify=False,
+                        )
+                        if detail_resp.status_code != 200:
+                            continue
+
+                        detail = detail_resp.json()
+                        msg_ts = self._message_timestamp(detail)
+                        if created_after and msg_ts is not None and msg_ts + 2 < created_after:
+                            seen_ids.add(mail_id)
+                            continue
+
+                        joined_payload = {}
+                        if isinstance(list_data, dict):
+                            joined_payload.update(list_data)
+                        if isinstance(detail, dict):
+                            joined_payload.update(detail)
+
+                        content = "\n".join(
+                            str(part or "").strip()
+                            for part in (
+                                detail.get("subject"),
+                                detail.get("text"),
+                                detail.get("html"),
+                                detail.get("from"),
+                                detail.get("raw"),
+                            )
+                            if str(part or "").strip()
+                        )
+                        lower_content = content.lower()
+                        strict_match = self._message_matches_email(joined_payload, email)
+                        code = _extract_code(content)
+
+                        if "openai" not in lower_content and not strict_match:
+                            continue
+                        if not strict_match and not code and time.time() - first_poll_started_at < 12:
+                            continue
+
+                        seen_ids.add(mail_id)
+                        if code:
+                            self._cleanup_mail(session, receiver_email, mail_id)
+                            return code
+                except Exception as exc:
+                    logger.warning("TempMail Plus 轮询验证码失败: %s", exc)
+                time.sleep(3)
+        return ""
+
+    def test_connection(self, proxy: str = "") -> Tuple[bool, str]:
+        if not self.custom_domains:
+            return False, "未配置自定义域名"
+        if not self.receiver_email:
+            return False, "未配置接收邮箱地址"
+        with _build_session(proxy) as session:
+            try:
+                resp = session.get(
+                    f"{self.api_base}/api/mails",
+                    params=self._list_params(self.receiver_email, limit=1),
+                    headers=self._headers(),
+                    timeout=15,
+                    verify=False,
+                )
+                if resp.status_code != 200:
+                    return False, f"tempmail 收件箱连接失败，状态码: {resp.status_code}"
+            except Exception as exc:
+                return False, f"tempmail 收件箱连接失败: {exc}"
+            preview_email = self._build_alias_email()
+            return True, f"转发邮箱可用，测试别名: {preview_email}"
 
 
 # ==================== Cloudflare Temp Email ====================
@@ -1114,6 +1459,16 @@ def create_provider_by_name(provider_type: str, mail_cfg: Dict[str, Any]) -> Mai
         return DuckMailProvider(
             api_base=api_base or "https://api.duckmail.sbs",
             bearer_token=str(mail_cfg.get("bearer_token", "")).strip(),
+        )
+    elif provider_type == "tempmail":
+        return TempMailPlusProvider(
+            api_base=api_base or "https://tempmail.plus",
+            custom_domains=mail_cfg.get("custom_domains", ""),
+            receiver_email=str(mail_cfg.get("receiver_email", "") or mail_cfg.get("forward_to_email", "")).strip(),
+            epin=str(mail_cfg.get("epin", "")).strip(),
+            alias_prefix=str(mail_cfg.get("alias_prefix", "oc")).strip(),
+            alias_length=mail_cfg.get("alias_length", 12),
+            email_extension=str(mail_cfg.get("email_extension", "@mailto.plus")).strip(),
         )
     elif provider_type == "cloudflare_temp_email":
         return CloudflareTempEmailProvider(

@@ -2651,7 +2651,7 @@ async def api_get_sync_config() -> Dict[str, Any]:
         if not isinstance(pcfg, dict):
             continue
         sc = dict(pcfg)
-        for secret_key in ("bearer_token", "api_key", "admin_password"):
+        for secret_key in ("bearer_token", "api_key", "admin_password", "epin"):
             val = str(sc.get(secret_key, ""))
             if val:
                 sc[f"{secret_key}_preview"] = (val[:8] + "...") if len(val) > 8 else val
@@ -2986,7 +2986,12 @@ async def api_extension_v2_start_session() -> Dict[str, Any]:
         try:
             email, dev_token = provider.create_mailbox(proxy="", proxy_selector=None)
         except TypeError:
-            email, dev_token = provider.create_mailbox(proxy="")
+            try:
+                email, dev_token = provider.create_mailbox(proxy="")
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"mailtm_forward 创建临时邮箱失败: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"mailtm_forward 创建临时邮箱失败: {exc}") from exc
         if not email or not dev_token:
             raise HTTPException(status_code=500, detail="mailtm_forward 创建临时邮箱失败")
 
@@ -4390,13 +4395,16 @@ async def api_get_mail_config() -> Dict[str, Any]:
     key = str(mail_cfg.get("api_key", ""))
     mail_cfg["api_key_preview"] = (key[:8] + "...") if len(key) > 8 else key
     mail_cfg.pop("api_key", None)
+    epin = str(mail_cfg.get("epin", ""))
+    mail_cfg["epin_preview"] = (epin[:8] + "...") if len(epin) > 8 else epin
+    mail_cfg.pop("epin", None)
 
     # 脱敏 provider_configs 中的敏感字段
     raw_configs = cfg.get("mail_provider_configs") or {}
     safe_configs: Dict[str, Dict] = {}
     for pname, pcfg in raw_configs.items():
         sc = dict(pcfg)
-        for secret_key in ("bearer_token", "api_key", "admin_password"):
+        for secret_key in ("bearer_token", "api_key", "admin_password", "epin"):
             val = str(sc.get(secret_key, ""))
             if val:
                 sc[f"{secret_key}_preview"] = (val[:8] + "...") if len(val) > 8 else val

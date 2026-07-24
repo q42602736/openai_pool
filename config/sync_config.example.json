@@ -11,6 +11,13 @@
     "duckmail": {
       "api_base": "https://api.duckmail.sbs"
     },
+    "tempmail": {
+      "custom_domains": "example.com,example2.com",
+      "receiver_email": "kksjldks62567@mailto.plus",
+      "epin": "",
+      "alias_prefix": "oc",
+      "alias_length": 12
+    },
     "moemail": {
       "api_base": "",
       "api_key": ""

@@ -826,6 +826,40 @@
                 </div>
               </div>
             </div>
+            <div class="provider-item" data-provider="tempmail">
+              <label class="provider-toggle">
+                <input type="checkbox" class="mail-provider-check" value="tempmail" />
+                <span class="provider-check-mark"></span>
+                TempMail Plus 转发 (自定义域名)
+              </label>
+              <div class="provider-config" style="display:none;">
+                <div class="config-field">
+                  <label>自定义域名</label>
+                  <div id="tempmailDomainsContainer" class="custom-domains-container"></div>
+                  <button type="button" class="btn btn-ghost btn-sm" id="addTempmailDomainBtn" style="margin-top:8px;">+ 添加域名</button>
+                </div>
+                <div class="config-field">
+                  <label>转发到 mailto.plus 邮箱</label>
+                  <input type="text" data-key="receiver_email" placeholder="kksjldks62567@mailto.plus" autocomplete="off"
+                    spellcheck="false" />
+                </div>
+                <div class="config-field">
+                  <label>EPIN (可选)</label>
+                  <input type="password" data-key="epin" placeholder="留空则不传" autocomplete="off" />
+                </div>
+                <div class="config-row">
+                  <div class="config-field" style="flex:1;">
+                    <label>别名前缀</label>
+                    <input type="text" data-key="alias_prefix" placeholder="oc" autocomplete="off"
+                      spellcheck="false" />
+                  </div>
+                  <div class="config-field" style="flex:1;">
+                    <label>别名长度</label>
+                    <input type="number" data-key="alias_length" placeholder="12" min="6" max="24" autocomplete="off" />
+                  </div>
+                </div>
+              </div>
+            </div>
             <div class="provider-item" data-provider="cloudflare_temp_email">
               <label class="provider-toggle">
                 <input type="checkbox" class="mail-provider-check" value="cloudflare_temp_email" />
