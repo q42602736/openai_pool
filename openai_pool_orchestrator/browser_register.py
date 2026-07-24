@@ -8611,7 +8611,7 @@ def run_browser_registration(
         if soft_banned_skipped > 0:
             emitter.info(
                 f"浏览器模式2 {manual_v2_auto_phone_provider_label} 自动国家候选已跳过 {soft_banned_skipped} 个"
-                + "连败软禁国家（同国连续 3 次注册失败会禁 5 分钟）。",
+                + "连败软禁国家（同国连续 5 次注册失败会禁 5 分钟）。",
                 step=step,
             )
         if price_tier_options:
@@ -8964,13 +8964,13 @@ def run_browser_registration(
             if ban_info.get("just_banned"):
                 emitter.warn(
                     f"浏览器模式2 国家 {country_label} 已连续注册失败 "
-                    + f"{ban_info.get('failure_streak_before_reset') or ban_info.get('threshold') or 3} 次，"
+                    + f"{ban_info.get('failure_streak_before_reset') or ban_info.get('threshold') or 5} 次，"
                     + f"自动国家模式将禁取该国约 {ban_info.get('ban_seconds') or 300} 秒。",
                     step="runtime",
                 )
             else:
                 streak = int(ban_info.get("failure_streak") or 0)
-                threshold = int(ban_info.get("threshold") or 3)
+                threshold = int(ban_info.get("threshold") or 5)
                 if streak > 0:
                     emitter.info(
                         f"浏览器模式2 国家 {country_label} 注册失败连败 {streak}/{threshold}；"
