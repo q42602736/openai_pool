@@ -563,19 +563,51 @@ def _page_snapshot_signature(url: str, body_text: str) -> str:
     return f"{url_text}|{body_norm[:240]}"
 
 
-def _first_visible_locator(page: Any, selectors: list[str]) -> Any:
-    for selector in selectors:
-        try:
-            locator = page.locator(selector)
-            count = min(locator.count(), 8)
-            if count <= 0:
-                continue
-            for index in range(count):
-                item = locator.nth(index)
-                if item.is_visible():
-                    return item
-        except Exception:
+def _iter_page_targets(page: Any) -> list[Any]:
+    """主文档 + 全部 frame，便于识别 auth.openai.com iframe 内的真实注册页。"""
+    targets: list[Any] = []
+    if page is None:
+        return targets
+    targets.append(page)
+    try:
+        frames = list(getattr(page, "frames", []) or [])
+    except Exception:
+        frames = []
+    for frame in frames:
+        if frame is None:
             continue
+        try:
+            if hasattr(page, "main_frame") and frame is getattr(page, "main_frame", None):
+                continue
+        except Exception:
+            pass
+        targets.append(frame)
+    return targets
+
+
+def _frame_url(target: Any) -> str:
+    if target is None:
+        return ""
+    try:
+        return str(getattr(target, "url", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _first_visible_locator(page: Any, selectors: list[str]) -> Any:
+    for target in _iter_page_targets(page):
+        for selector in selectors:
+            try:
+                locator = target.locator(selector)
+                count = min(locator.count(), 8)
+                if count <= 0:
+                    continue
+                for index in range(count):
+                    item = locator.nth(index)
+                    if item.is_visible():
+                        return item
+            except Exception:
+                continue
     return None
 
 
@@ -1544,9 +1576,25 @@ def _get_page_deep_text(page: Any) -> str:
 def _is_session_ended_page(url: str, body_text: str) -> bool:
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
+    # 注册主路径页面上即使残留文案，也不按会话结束处理，避免短信后误重拉 OAuth。
+    if any(
+        token in url_lower
+        for token in (
+            "contact-verification",
+            "verify-phone",
+            "phone-verification",
+            "about-you",
+            "create-account/password",
+            "email-verification",
+            "add-email",
+            "auth_challenge/passkey",
+        )
+    ):
+        return False
     return bool(
-        "session has ended" in body_lower
-        or "your session has ended" in body_lower
+        "your session has ended" in body_lower
+        or "session has ended" in body_lower
+        or "你的会话已结束" in body_text
         or ("chatgpt.com" in url_lower and "sign up" in body_lower and "session" in body_lower and "ended" in body_lower)
     )
 
@@ -2114,22 +2162,55 @@ def _fetch_browser_session_payload(
                 pass
 
 
-def _is_profile_page(url: str, body_text: str) -> bool:
+def _is_profile_page(url: str, body_text: str, page: Any = None) -> bool:
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
-    return bool(
-        "about-you" in url_lower
-        or "let's confirm your age" in body_lower
-        or "what's your name" in body_lower
-        or "full name" in body_lower
-        or "birthday" in body_lower
-        or "date of birth" in body_lower
-        or "确认你的年龄" in body_lower
-        or "你的名字" in body_lower
-        or "全名" in body_text
-        or "生日" in body_text
-        or "出生日期" in body_text
-    )
+    body_text_value = str(body_text or "")
+    if "about-you" in url_lower:
+        return True
+    if any(
+        token in body_lower
+        for token in (
+            "let's confirm your age",
+            "how old are you",
+            "whats your name",
+            "what's your name",
+            "full name",
+            "finish creating account",
+            "please enter name to continue",
+            "enter a valid age",
+            "birthday",
+            "date of birth",
+            "confirm your age",
+        )
+    ) or any(
+        token in body_text_value
+        for token in (
+            "确认你的年龄",
+            "你的名字",
+            "全名",
+            "生日",
+            "出生日期",
+            "完成帐户创建",
+            "完成账户创建",
+        )
+    ):
+        return True
+    if page is not None:
+        if _first_visible_locator(
+            page,
+            [
+                'input[name="name"][autocomplete="name"]',
+                'input[name="name"][placeholder*="Full name" i]',
+                'input[name="age"]',
+                'input[placeholder="Age"]',
+                'input[placeholder*="Age" i]',
+                'button:has-text("Finish creating account")',
+                '[type="submit"]:has-text("Finish creating account")',
+            ],
+        ) is not None:
+            return True
+    return False
 
 
 def _is_logged_in_chatgpt_home(url: str, body_text: str) -> bool:
@@ -2179,7 +2260,43 @@ def _is_birthdate_segment(locator: Any) -> bool:
     return any(token in haystack for token in ("birthday", "date of birth", "生日", "出生日期"))
 
 
+def _is_profile_form_field(locator: Any) -> bool:
+    """about-you 的 name/age 等资料字段，绝不能当 OTP 验证码输入。"""
+    if locator is None:
+        return False
+    try:
+        meta = _locator_metadata(locator) or {}
+    except Exception:
+        meta = {}
+    joined = " ".join(str(v or "") for v in meta.values()).lower()
+    name = str(meta.get("name") or "").strip().lower()
+    placeholder = str(meta.get("placeholder") or "").strip().lower()
+    autocomplete = str(meta.get("autocomplete") or "").strip().lower()
+    input_type = str(meta.get("type") or "").strip().lower()
+    if name in {"name", "age", "full_name", "fullname"}:
+        return True
+    if autocomplete in {"name", "given-name", "family-name"}:
+        return True
+    if placeholder in {"full name", "age", "name"} or "full name" in placeholder:
+        return True
+    if "age" in joined and "code" not in joined and "otp" not in joined:
+        return True
+    if input_type == "text" and name == "name":
+        return True
+    if input_type == "number" and ("age" in joined or name == "age"):
+        return True
+    return False
+
+
 def _detect_otp_inputs(page: Any) -> Dict[str, Any]:
+    # about-you 资料页绝不当 OTP 页。
+    try:
+        current_url = str(getattr(page, "url", "") or "")
+    except Exception:
+        current_url = ""
+    if "about-you" in current_url.lower():
+        return {"mode": "", "input": None}
+
     single_input = _first_visible_locator(
         page,
         [
@@ -2199,7 +2316,7 @@ def _detect_otp_inputs(page: Any) -> Dict[str, Any]:
             '[role="spinbutton"][aria-label*="code" i]',
         ],
     )
-    if single_input is not None and _is_birthdate_segment(single_input):
+    if single_input is not None and (_is_birthdate_segment(single_input) or _is_profile_form_field(single_input)):
         single_input = None
 
     segmented = []
@@ -2225,13 +2342,18 @@ def _detect_otp_inputs(page: Any) -> Dict[str, Any]:
                     text_value = str(item.inner_text(timeout=300) or "").strip().lower()
                 except Exception:
                     text_value = ""
+                if _is_profile_form_field(item) or _is_birthdate_segment(item):
+                    continue
+                item_name = str(item.get_attribute("name") or "").strip().lower()
+                if item_name in {"name", "age"}:
+                    continue
                 if (
                     maxlength == "1"
-                    or inputmode == "numeric"
+                    or (inputmode == "numeric" and item_name not in {"age"} and "age" not in aria_label)
                     or autocomplete == "one-time-code"
                     or item_type == "tel"
                     or (role in {"spinbutton", "textbox"} and ("code" in aria_label or "digit" in aria_label or data_type in {"otp", "code"}))
-                    or (role in {"spinbutton", "textbox"} and text_value in {"", "•", "-", "_"})
+                    or (role in {"spinbutton", "textbox"} and text_value in {"", "•", "-", "_"} and "age" not in aria_label and item_name not in {"age", "name"})
                 ):
                     segmented.append(item)
             except Exception:
@@ -2728,6 +2850,13 @@ def _fill_otp(page: Any, code: str) -> bool:
 
 
 def _wait_and_fill_otp(page: Any, code: str, *, timeout_seconds: float = 8.0) -> bool:
+    if page is not None:
+        try:
+            url_now = str(getattr(page, "url", "") or "")
+        except Exception:
+            url_now = ""
+        if "about-you" in url_now.lower() or _is_profile_page(url_now, _get_body_text(page), page):
+            return False
     deadline = time.time() + max(1.0, float(timeout_seconds or 0))
     tried_without_controls = False
     while time.time() < deadline:
@@ -3010,13 +3139,19 @@ def _fill_age(page: Any, birthdate: str) -> bool:
     if _fill_first(
         page,
         [
+            'input[name="age"]',
+            'input[placeholder="Age"]',
+            'input[type="number"][name="age"]',
+            'input[inputmode="numeric"][name="age"]',
             'input[name*="age" i]',
+            'input[id*="-age" i]',
             'input[id*="age" i]',
             'input[placeholder*="age" i]',
             'input[aria-label*="age" i]',
             'input[placeholder*="年龄"]',
             'input[aria-label*="年龄"]',
             'input[name*="年龄"]',
+            'input[type="number"]',
         ],
         age_value,
     ):
@@ -3187,32 +3322,82 @@ def _summarize_about_you_controls(page: Any) -> str:
 
 
 def _fill_about_you_profile(page: Any, ctx: Any) -> tuple[bool, str]:
-    if not (
+    # 先清掉可能被 OTP 误填进 age 的脏值。
+    age_locator = _first_visible_locator(
+        page,
+        [
+            'input[name="age"]',
+            'input[placeholder="Age"]',
+            'input[placeholder*="Age" i]',
+            'input[id*="-age" i]',
+            'input[type="number"]',
+        ],
+    )
+    if age_locator is not None:
+        try:
+            age_locator.fill("", timeout=800)
+        except Exception:
+            try:
+                _write_text_to_locator(age_locator, "")
+            except Exception:
+                pass
+
+    name_ok = (
         _fill_input_by_label(page, ["全名", "姓名", "full name", "name"], ctx.profile_name)
         or _fill_first(
             page,
             [
                 'input[name="name"]',
                 'input[autocomplete="name"]',
+                'input[placeholder*="Full name" i]',
                 'input[placeholder*="name" i]',
+                'input[id*="-name" i]',
                 'input[id*="name" i]',
                 'input[type="text"]',
             ],
             ctx.profile_name,
         )
-    ):
+    )
+    if not name_ok:
         return False, "name"
+    # 回读姓名，避免“看起来点了但没写上”
+    name_locator = _first_visible_locator(
+        page,
+        [
+            'input[name="name"]',
+            'input[autocomplete="name"]',
+            'input[placeholder*="Full name" i]',
+        ],
+    )
+    if name_locator is not None:
+        typed_name = str(_locator_value(name_locator, timeout_ms=500) or "").strip()
+        if not typed_name:
+            if not _write_text_to_locator(name_locator, ctx.profile_name):
+                return False, "name"
 
     body_text = _get_body_text(page)
     body_lower = str(body_text or "").lower()
+    has_age_input = _first_visible_locator(
+        page,
+        [
+            'input[name="age"]',
+            'input[placeholder="Age"]',
+            'input[placeholder*="Age" i]',
+            'input[id*="-age" i]',
+            'input[id*="age" i]',
+            'input[inputmode="numeric"][name="age"]',
+        ],
+    ) is not None
     has_birthdate_controls = _has_about_you_birthdate_controls(page)
     prefers_age = (
-        "confirm your age" in body_lower
+        has_age_input
+        or "confirm your age" in body_lower
         or "your age" in body_lower
         or " age " in f" {body_lower} "
         or "年龄" in body_text
     )
-    if has_birthdate_controls:
+    # 同时有明确 age 输入框时，优先年龄，不强制生日下拉。
+    if has_birthdate_controls and not has_age_input:
         prefers_age = False
     if prefers_age:
         if not _fill_age(page, ctx.profile_birthdate):
@@ -3223,8 +3408,35 @@ def _fill_about_you_profile(page: Any, ctx: Any) -> tuple[bool, str]:
             if not _fill_age(page, ctx.profile_birthdate):
                 return False, "birthdate"
 
+    # 校验 age 是否是合理年龄，避免短信码被误填进去。
+    if prefers_age:
+        age_check = _first_visible_locator(
+            page,
+            [
+                'input[name="age"]',
+                'input[placeholder="Age"]',
+                'input[placeholder*="Age" i]',
+                'input[id*="-age" i]',
+                'input[type="number"]',
+            ],
+        )
+        if age_check is not None:
+            age_value = str(_locator_value(age_check, timeout_ms=500) or "").strip()
+            expected_age = _derive_profile_age(ctx.profile_birthdate)
+            invalid_age = (not age_value.isdigit()) or int(age_value) < 5 or int(age_value) > 130 or len(age_value) >= 4
+            if invalid_age or age_value != expected_age:
+                if not _write_text_to_locator(age_check, expected_age):
+                    if not _fill_age(page, ctx.profile_birthdate):
+                        return False, "age"
+                age_value = str(_locator_value(age_check, timeout_ms=500) or "").strip()
+                if (not age_value.isdigit()) or int(age_value) < 5 or int(age_value) > 130:
+                    return False, "age"
+
+    # 新版 about-you 可能没有同意勾选；勾选失败不硬失败。
     if not _ensure_about_you_checkbox(page):
-        return False, "checkbox"
+        # 若页面明确要求勾选再失败；否则放行提交按钮。
+        if any(token in body_lower for token in ("i agree", "agree to", "terms", "同意", "勾选")):
+            return False, "checkbox"
     return True, ("age" if prefers_age else "birthdate")
 
 
@@ -3380,6 +3592,113 @@ def _describe_page(page: Any, *, force_refresh: bool = False) -> tuple[str, str]
     return current_url, body_text
 
 
+def _collect_auth_frame_urls(page: Any) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for target in _iter_page_targets(page):
+        url = _frame_url(target)
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _best_auth_target_url(page: Any) -> str:
+    """在主文档与 iframe 中挑出优先级最高的 auth 业务 URL。"""
+    best_url = ""
+    best_score = -1
+    for url in _collect_auth_frame_urls(page):
+        score = _page_priority_from_url(url)
+        if score > best_score:
+            best_score = score
+            best_url = url
+    return best_url
+
+
+def _promote_auth_target_if_needed(page: Any, *, timeout_ms: int = 12000) -> tuple[Any, str, str]:
+    """若顶层仍是 chatgpt 壳，但 iframe/子 frame 已进入 auth 业务页，则提升到真实 URL。"""
+    if page is None:
+        return page, "", ""
+    top_url = ""
+    try:
+        top_url = str(page.url or "").strip()
+    except Exception:
+        top_url = ""
+    top_lower = top_url.lower()
+    best_url = _best_auth_target_url(page)
+    best_lower = str(best_url or "").lower()
+    should_promote = bool(
+        best_url
+        and "auth.openai.com" in best_lower
+        and (
+            "chatgpt.com" in top_lower
+            or not top_lower
+            or top_lower.startswith("about:blank")
+            or (
+                "auth.openai.com" in top_lower
+                and _page_priority_from_url(best_url) > _page_priority_from_url(top_url)
+            )
+        )
+        and best_lower != top_lower
+    )
+    if should_promote and any(
+        token in best_lower
+        for token in (
+            "create-account/password",
+            "auth_challenge",
+            "log-in/password",
+            "contact-verification",
+            "email-verification",
+            "about-you",
+            "reset-password",
+            "add-phone",
+            "add-email",
+        )
+    ):
+        try:
+            page.goto(best_url, wait_until="domcontentloaded", timeout=max(3000, int(timeout_ms or 0)))
+        except Exception:
+            try:
+                page.goto(best_url, wait_until="commit", timeout=max(3000, int(timeout_ms or 0)))
+            except Exception:
+                pass
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+    current_url, body_text = _describe_page(page, force_refresh=True)
+    deep_body = _get_page_deep_text(page)
+    if str(deep_body or "").strip():
+        body_text = str(deep_body or "")
+    # 若仍在 chatgpt 壳，但 deep text / frame 已能确认密码页，用 best auth URL 作为逻辑 URL。
+    current_lower = str(current_url or "").lower()
+    if "chatgpt.com" in current_lower and best_url and "auth.openai.com" in best_lower:
+        if any(
+            token in best_lower
+            for token in (
+                "create-account/password",
+                "auth_challenge",
+                "log-in/password",
+                "contact-verification",
+                "about-you",
+            )
+        ) or _first_visible_locator(
+            page,
+            [
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[name="new-password"]',
+                'input[autocomplete="new-password"]',
+            ],
+        ) is not None:
+            current_url = best_url
+    return page, current_url, body_text
+
+
 def _page_priority_from_url(url: str) -> int:
     url_lower = str(url or "").strip().lower()
     if not url_lower:
@@ -3405,6 +3724,8 @@ def _page_priority_from_url(url: str) -> int:
             return 172
         if "/reset-password" in url_lower:
             return 166
+        if "auth_challenge" in url_lower or "passkey" in url_lower:
+            return 176
         if "/log-in" in url_lower:
             return 162
         if "/create-account" in url_lower:
@@ -3473,17 +3794,127 @@ def _is_phone_flow_page(url: str, body_text: str) -> bool:
 
 
 def _is_contact_verification_page(url: str, body_text: str, page: Any) -> bool:
+    """仅识别“已发短信后的手机验证码页”，避免 ChatGPT 首页营销文案误判。"""
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
-    if "contact-verification" in url_lower:
-        return True
+    body_text_value = str(body_text or "")
+
+    # URL 已明确是手机 contact-verification，直接认定（优先级最高，避免被后续邮箱文案误杀）。
     if (
-        "verify your phone" in body_lower
-        or "contact verification" in body_lower
-        or "whatsapp" in body_lower
-        or "resend whatsapp message" in body_lower
+        "contact-verification" in url_lower
+        or "verify-phone" in url_lower
+        or "phone-verification" in url_lower
+        or "phone_verification" in url_lower
     ):
         return True
+
+    # 邮箱验证码页/补邮箱页绝不能当成手机短信验证码页。
+    if "email-verification" in url_lower or "add-email" in url_lower or "email-otp" in url_lower:
+        return False
+    if any(
+        token in body_lower
+        for token in (
+            "check your inbox",
+            "resend email",
+            "verify your email",
+            "email address",
+            "verification code we just sent to",
+            "we just sent to",
+        )
+    ) and ("@" in body_text_value or "email" in body_lower) and not any(
+        token in body_lower
+        for token in (
+            "verify your phone",
+            "sent to your phone",
+            "resend whatsapp",
+            "短信验证码",
+            "验证你的手机",
+        )
+    ):
+        return False
+
+    # about-you 资料页优先，绝不回流到短信验证码处理。
+    if "about-you" in url_lower:
+        return False
+    if any(
+        token in body_lower
+        for token in (
+            "how old are you",
+            "finish creating account",
+            "please enter name to continue",
+            "enter a valid age",
+            "full name",
+        )
+    ) and "verification code" not in body_lower:
+        return False
+    if page is not None and _first_visible_locator(
+        page,
+        [
+            'input[name="name"]',
+            'input[name="age"]',
+            'input[placeholder="Age"]',
+            'input[placeholder*="Full name" i]',
+            'button:has-text("Finish creating account")',
+        ],
+    ) is not None:
+        return False
+
+    # 首页/桥接壳绝不算短信验证码页。
+    if "chatgpt.com" in url_lower and "auth.openai.com" not in url_lower:
+        if "contact-verification" not in url_lower and "verify-phone" not in url_lower:
+            return False
+    if "chatgpt.com/auth/login_with" in url_lower:
+        return False
+    # 密码/passkey 明确页不算短信验证码页（避免与其他判定互相递归）。
+    if "/create-account/password" in url_lower or "/log-in/password" in url_lower:
+        return False
+    if "auth_challenge/passkey" in url_lower:
+        return False
+    if _has_phone_input(page) and "contact-verification" not in url_lower and "verify-phone" not in url_lower:
+        # 还在输入手机号阶段，不算验证码页。
+        # 但 contact-verification URL 可能同时有残留 phone 输入，故 URL 命中时放行。
+        body_suggests_otp = any(
+            token in body_lower
+            for token in (
+                "verify your phone",
+                "sent a code",
+                "enter the code",
+                "verification code",
+                "短信验证码",
+            )
+        )
+        if not body_suggests_otp:
+            return False
+
+    url_hit = bool(
+        "contact-verification" in url_lower
+        or "verify-phone" in url_lower
+        or "phone-verification" in url_lower
+        or "phone_verification" in url_lower
+    )
+    # 注意：不要用“sent a code / we sent a code”这类邮箱页也会出现的泛化文案。
+    strong_text_hit = bool(
+        "verify your phone" in body_lower
+        or "contact verification" in body_lower
+        or "resend whatsapp message" in body_lower
+        or "sent to your phone" in body_lower
+        or "sent a code to your phone" in body_lower
+        or ("sent a code to" in body_lower and ("phone" in body_lower or "sms" in body_lower or "whatsapp" in body_lower))
+        or ("we sent a code" in body_lower and ("phone" in body_lower or "sms" in body_lower or "whatsapp" in body_lower))
+        or ("enter the code" in body_lower and ("phone" in body_lower or "sms" in body_lower or "whatsapp" in body_lower))
+        or "验证你的手机" in body_text_value
+        or "短信验证码" in body_text_value
+    )
+    # 单独出现 whatsapp / phone 等营销词不够。
+    if (
+        "whatsapp" in body_lower
+        and not strong_text_hit
+        and not url_hit
+        and "verify" not in body_lower
+        and "code" not in body_lower
+    ):
+        return False
+
     phone_otp_input = _first_visible_locator(
         page,
         [
@@ -3493,11 +3924,22 @@ def _is_contact_verification_page(url: str, body_text: str, page: Any) -> bool:
             'input[placeholder*="code" i]',
             'input[inputmode="numeric"]',
             'input[autocomplete="one-time-code"]',
-            'input[name*="code" i]',
             'input[name*="otp" i]',
         ],
     )
-    return phone_otp_input is not None and ("phone" in body_lower or "sms" in body_lower)
+    if url_hit:
+        return True
+    if strong_text_hit and phone_otp_input is not None:
+        return True
+    if strong_text_hit and "auth.openai.com" in url_lower:
+        return True
+    return bool(
+        phone_otp_input is not None
+        and ("phone" in body_lower or "sms" in body_lower or "whatsapp" in body_lower)
+        and ("code" in body_lower or "verification" in body_lower or "验证" in body_text_value)
+        and "auth.openai.com" in url_lower
+    )
+
 
 
 def _is_phone_login_entry_page(url: str, body_text: str, page: Any) -> bool:
@@ -3602,6 +4044,12 @@ def _click_choose_account_phone_card(page: Any, phone_number: str) -> Dict[str, 
 
 def _is_create_account_password_page(url: str, body_text: str, page: Any) -> bool:
     url_lower = str(url or "").lower()
+    if page is not None:
+        for frame_url in _collect_auth_frame_urls(page):
+            frame_lower = str(frame_url or "").lower()
+            if "/create-account/password" in frame_lower:
+                url_lower = frame_lower
+                break
     if _is_retryable_error_page(url, body_text) or _is_create_account_failed_error(url, body_text, page):
         return False
     if "/reset-password/new-password" in url_lower:
@@ -4064,6 +4512,58 @@ def _is_login_password_page(url: str, body_text: str, page: Any) -> bool:
             'a:has-text("Forgot password")',
         ],
     ) is not None
+
+
+
+def _is_passkey_challenge_page(url: str, body_text: str, page: Any = None) -> bool:
+    """Passkey / security key 挑战页：通常表示当前手机号已绑定既有账号。"""
+    url_lower = str(url or "").lower()
+    body_lower = str(body_text or "").lower()
+    body_text_value = str(body_text or "")
+    if "auth_challenge/passkey" in url_lower:
+        return True
+    if "auth_challenge" in url_lower and "passkey" in url_lower:
+        return True
+    if any(
+        hint in body_lower
+        for hint in (
+            "continue with passkey",
+            "verifying it's you",
+            "we've found a passkey",
+            "security key for your account",
+            "use a passkey",
+            "use passkey",
+        )
+    ):
+        return True
+    if "passkey" in body_lower and (
+        "try another way" in body_lower
+        or "继续使用通行密钥" in body_text_value
+        or "验证是你本人" in body_text_value
+    ):
+        return True
+    if page is not None:
+        has_passkey_action = _first_visible_locator(
+            page,
+            [
+                'button:has-text("Continue with passkey")',
+                '[role="button"]:has-text("Continue with passkey")',
+                'button:has-text("Try another way")',
+                '[role="button"]:has-text("Try another way")',
+                'button:has-text("继续使用通行密钥")',
+                '[role="button"]:has-text("继续使用通行密钥")',
+                'button:has-text("换个方式")',
+                '[role="button"]:has-text("换个方式")',
+            ],
+        ) is not None
+        if has_passkey_action and (
+            "passkey" in body_lower
+            or "security key" in body_lower
+            or "auth_challenge" in url_lower
+            or "通行密钥" in body_text_value
+        ):
+            return True
+    return False
 
 
 def _is_reset_password_page(url: str, body_text: str, page: Any) -> bool:
@@ -4899,14 +5399,97 @@ def _wait_for_add_email_ready(page: Any, *, timeout_ms: int = 12000) -> bool:
     return False
 
 
-def _is_login_with_bridge_page(url: str, body_text: str) -> bool:
+def _is_login_with_bridge_page(url: str, body_text: str, page: Any = None) -> bool:
+    """仅识别 ChatGPT 首页登录桥接弹层，避免 create-password / passkey 等页面被误判。"""
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
-    return bool(
+    # 已进入 OpenAI 认证域的真实业务页，一律不算桥接页。
+    if "auth.openai.com" in url_lower:
+        if any(
+            token in url_lower
+            for token in (
+                "auth_challenge",
+                "create-account",
+                "log-in/password",
+                "reset-password",
+                "contact-verification",
+                "email-verification",
+                "about-you",
+                "add-email",
+                "add-phone",
+            )
+        ):
+            return False
+    url_is_bridge = bool(
         "chatgpt.com/auth/login_with" in url_lower
         or ("login_with" in url_lower and "chatgpt.com" in url_lower)
-        or ("continue with" in body_lower and "chatgpt" in body_lower)
     )
+    if not url_is_bridge:
+        # 正文启发式只在仍停留在 chatgpt 域、且没有密码/OTP 主流程控件时启用。
+        if "chatgpt.com" not in url_lower:
+            return False
+        if any(
+            token in body_lower
+            for token in (
+                "create a password",
+                "create password",
+                "enter your password",
+                "continue with passkey",
+                "verifying it's you",
+                "verification code",
+                "verify your phone",
+            )
+        ):
+            return False
+        if page is not None and _first_visible_locator(
+            page,
+            [
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[name="new-password"]',
+                'input[autocomplete="new-password"]',
+                'input[name="code"]',
+                'input[autocomplete="one-time-code"]',
+            ],
+        ) is not None:
+            return False
+        # 纯 chatgpt.com 首页即便有 Continue with Google/Email 文案，也优先视为首页壳，
+        # 只有 login_with URL 或明确登录弹层路径才算桥接；否则会挡住 Sign up 点击。
+        if "chatgpt.com" in url_lower and "login_with" not in url_lower and "/auth/login" not in url_lower:
+            return False
+        return bool(
+            (
+                "continue with phone" in body_lower
+                or "continue with email" in body_lower
+                or "continue with google" in body_lower
+                or "continue with apple" in body_lower
+                or "use phone instead" in body_lower
+            )
+            and ("login_with" in url_lower or "/auth/login" in url_lower)
+        )
+    # URL 已是 login_with，再排除已切入下一阶段控件的情况。
+    if any(
+        token in body_lower
+        for token in (
+            "create a password",
+            "create password",
+            "enter your password",
+            "continue with passkey",
+            "verifying it's you",
+        )
+    ):
+        return False
+    if page is not None and _first_visible_locator(
+        page,
+        [
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[name="new-password"]',
+            'input[autocomplete="new-password"]',
+        ],
+    ) is not None:
+        return False
+    return True
 
 
 def _is_session_ended_login_shell_page(url: str, body_text: str, page: Any) -> bool:
@@ -5073,10 +5656,22 @@ def _classify_page_state(url: str, body_text: str, page: Any) -> str:
 
     if "code=" in url_lower and "state=" in url_lower:
         return "callback"
+    # 手机短信验证码路由优先于邮箱 OTP 分类，避免 contact-verification 被标成 otp_ready。
+    if (
+        "contact-verification" in url_lower
+        or "verify-phone" in url_lower
+        or "phone-verification" in url_lower
+        or "phone_verification" in url_lower
+    ):
+        return "contact_verification"
+    if "email-verification" in url_lower or "email-otp" in url_lower:
+        return "otp_ready" if _is_otp_page_ready(url, body_text, page) else "otp_loading"
     if _is_login_with_bridge_page(url, body_text):
         return "login_with_bridge"
     if _is_session_ended_page(url, body_text):
         return "session_ended"
+    if _is_passkey_challenge_page(url, body_text, page):
+        return "passkey_challenge"
     if _is_timeout_error_page(url, body_text):
         return "timeout_error"
     if _is_phone_verification_page(url, body_text, page):
@@ -5089,7 +5684,7 @@ def _classify_page_state(url: str, body_text: str, page: Any) -> str:
         return "blank"
     if any(keyword in url_lower for keyword in ("consent", "workspace", "organization")):
         return "workspace"
-    if _is_profile_page(url, body_text):
+    if _is_profile_page(url, body_text, page):
         return "profile"
     if _is_otp_page(url, body_text, page):
         return "otp_ready" if _is_otp_page_ready(url, body_text, page) else "otp_loading"
@@ -6199,10 +6794,12 @@ def run_browser_registration(
                     score += 4
                 if candidate_state == "contact_verification":
                     score += 6
+                if candidate_state == "passkey_challenge":
+                    score += 5
                 if candidate_state == "password" or candidate_state == "auth":
-                    score += 1
+                    score += 4
                 if candidate_state == "login_with_bridge":
-                    score -= 2
+                    score -= 8
                 rank = (score, -len(seen_ids))
                 if selected_page is None or selected_rank is None or rank > selected_rank:
                     selected_page = candidate_page
@@ -6333,11 +6930,97 @@ def run_browser_registration(
         if not cfg["browser_headless"]:
             emitter.info("当前为可见浏览器模式，可直接观察页面流程用于排查", step="oauth_init")
 
+    def _goto_manual_v2_phone_auth_entry(*, reason: str, prefer_login: bool = False) -> bool:
+        """点击失败或点了没跳转时，直接走手机号登录/注册入口 URL（步骤1/补资料共用）。"""
+        candidates = []
+        try:
+            for frame in _iter_page_targets(page):
+                try:
+                    loc = frame.locator(
+                        'a[data-auth-provider="phone"], a[href*="usernameKind=phone"], a._X60mza_providerButton'
+                    )
+                    count = min(int(loc.count() or 0), 8)
+                except Exception:
+                    count = 0
+                for index in range(count):
+                    item = loc.nth(index)
+                    try:
+                        if not item.is_visible():
+                            continue
+                        href = str(item.get_attribute("href") or "").strip()
+                    except Exception:
+                        href = ""
+                    if href:
+                        candidates.append(href)
+                        break
+                if candidates:
+                    break
+        except Exception:
+            pass
+        if prefer_login:
+            candidates.extend(
+                [
+                    "https://chatgpt.com/auth/login?usernameKind=phone_number",
+                    "https://chatgpt.com/auth/login?next=%2F&usernameKind=phone_number",
+                    "https://auth.openai.com/log-in",
+                ]
+            )
+        else:
+            candidates.extend(
+                [
+                    "https://chatgpt.com/auth/login?usernameKind=phone_number",
+                    "https://chatgpt.com/auth/login?next=%2F&usernameKind=phone_number",
+                    "https://chatgpt.com/auth/login?screen_hint=signup&usernameKind=phone_number",
+                ]
+            )
+        seen = set()
+        for url in candidates:
+            target = str(url or "").strip()
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            try:
+                emitter.info(
+                    f"浏览器模式2 {reason}，改用手机号入口直链: {_mask_secret(target, head=72, tail=24)}",
+                    step="oauth_init",
+                )
+                _goto_with_recovery(
+                    target,
+                    step="oauth_init",
+                    reason="浏览器模式2 打开手机号入口直链失败",
+                    wait_until="domcontentloaded",
+                    timeout_ms=min(20000, int(cfg.get("browser_timeout_ms") or 20000)),
+                    max_attempts=2,
+                )
+                _wait_for_load(page, timeout_ms=2500)
+                latest_url, latest_body = _describe_page(page, force_refresh=True)
+                latest_lower = str(latest_url or "").lower()
+                if (
+                    _has_phone_input(page)
+                    or "auth.openai.com" in latest_lower
+                    or "chatgpt.com/auth/" in latest_lower
+                    or _is_phone_input_page(latest_url, latest_body, page)
+                    or _is_login_password_page(latest_url, latest_body, page)
+                    or _is_create_account_password_page(latest_url, latest_body, page)
+                ):
+                    emitter.info("浏览器模式2 已通过手机号入口直链进入认证流程。", step="oauth_init")
+                    return True
+            except Exception as exc:
+                emitter.warn(f"浏览器模式2 手机号入口直链失败: {exc}", step="oauth_init")
+        return False
+
     def _bootstrap_manual_v2_phone_entry(current_url: str, body_text: str) -> bool:
         nonlocal manual_v2_entry_bootstrap_signature, manual_v2_entry_bootstrap_seen_at
         nonlocal manual_v2_entry_bootstrap_wait_logged
         nonlocal manual_v2_entry_unavailable_since, manual_v2_entry_fallback_attempts
         signup_selectors = [
+            'button[data-mobile-auth-entry-action="signup"]',
+            'button.wm-app-signupButton',
+            'button[commandfor="mobile-auth-dialog"]',
+            'button[data-mobile-auth-entry-trigger="cta"]',
+            'button:has-text("Sign up for free")',
+            'a:has-text("Sign up for free")',
+            '[role="button"]:has-text("Sign up for free")',
             'a:has-text("Sign up")',
             'button:has-text("Sign up")',
             '[role="button"]:has-text("Sign up")',
@@ -6349,20 +7032,29 @@ def run_browser_registration(
             '[role="button"]:has-text("注册")',
         ]
         phone_entry_selectors = [
+            'a[data-auth-provider="phone"]',
+            'a._X60mza_providerButton[data-auth-provider="phone"]',
+            'a[href*="usernameKind=phone_number"]',
+            'a[href*="usernameKind=phone"]',
+            'a:has-text("Continue with phone")',
             'button:has-text("Continue with phone")',
             '[role="button"]:has-text("Continue with phone")',
             'div:has-text("Continue with phone")',
+            'a:has-text("Use phone instead")',
             'button:has-text("Use phone instead")',
             '[role="button"]:has-text("Use phone instead")',
             'div:has-text("Use phone instead")',
+            'a:has-text("Phone")',
             'button:has-text("Phone")',
             '[role="button"]:has-text("Phone")',
+            'a:has-text("手机号")',
             'button:has-text("手机号")',
             '[role="button"]:has-text("手机号")',
             'button:has-text("使用手机")',
             '[role="button"]:has-text("使用手机")',
             'button:has-text("手机登录")',
             '[role="button"]:has-text("手机登录")',
+            'a:has-text("继续使用手机登录")',
             'button:has-text("继续使用手机登录")',
             '[role="button"]:has-text("继续使用手机登录")',
             'div:has-text("继续使用手机登录")',
@@ -6395,43 +7087,133 @@ def run_browser_registration(
         def _entry_flow_ready(url_text: str, body_value: str) -> bool:
             if _has_phone_input(page):
                 return True
+            url_lower = str(url_text or "").lower()
+            if "auth.openai.com" in url_lower:
+                return True
+            if "chatgpt.com/auth/login" in url_lower and "phone" in url_lower:
+                return True
+            if "chatgpt.com/auth/login_with" in url_lower:
+                return True
             return bool(
                 _is_phone_input_page(url_text, body_value, page)
                 or _is_phone_verification_page(url_text, body_value, page)
                 or _is_create_account_password_page(url_text, body_value, page)
+                or _is_login_password_page(url_text, body_value, page)
+                or _is_passkey_challenge_page(url_text, body_value, page)
             )
 
         def _wait_signup_transition(previous_url: str, previous_body: str, *, action_label: str) -> tuple[str, str]:
-            quick_deadline = time.time() + 1.8
+            quick_deadline = time.time() + 4.0
             latest_url = previous_url
             latest_body = previous_body
+            previous_url_lower = str(previous_url or "").lower()
             while time.time() < quick_deadline:
+                active_page = _resolve_active_page(page, timeout_ms=300)
+                if active_page is not None:
+                    # ensure outer page handle follows new tabs if any
+                    pass
                 latest_url, latest_body = _describe_page(page, force_refresh=True)
+                latest_url_lower = str(latest_url or "").lower()
                 if _entry_flow_ready(latest_url, latest_body):
                     return latest_url, latest_body
-                if _first_visible_locator(page, phone_entry_selectors) is not None:
+                if _first_visible_locator(page, phone_entry_selectors) is not None and "auth.openai.com" not in latest_url_lower:
+                    # 弹层已出现，也算过渡成功的一环
+                    if "continue with phone" in str(latest_body or "").lower() or _first_visible_locator(page, ['a[data-auth-provider="phone"]']) is not None:
+                        return latest_url, latest_body
+                if latest_url_lower and latest_url_lower != previous_url_lower and (
+                    "auth.openai.com" in latest_url_lower
+                    or "chatgpt.com/auth/" in latest_url_lower
+                ):
                     return latest_url, latest_body
-                _sleep_with_page(page, 120)
+                _sleep_with_page(page, 180)
             latest_url, latest_body = _wait_for_page_stabilize(
                 previous_url,
                 previous_body,
                 step="oauth_init",
                 action_label=action_label,
-                timeout_ms=7000,
+                timeout_ms=9000,
             )
-            settle_deadline = time.time() + 2.5
+            settle_deadline = time.time() + 4.0
             while time.time() < settle_deadline:
                 _wait_for_load(page, timeout_ms=1200)
                 latest_url, latest_body = _describe_page(page, force_refresh=True)
                 if _entry_flow_ready(latest_url, latest_body):
+                    return latest_url, latest_body
+                if "auth.openai.com" in str(latest_url or "").lower() or "chatgpt.com/auth/" in str(latest_url or "").lower():
                     return latest_url, latest_body
                 if _first_visible_locator(page, phone_entry_selectors) is not None:
                     return latest_url, latest_body
                 _sleep_with_page(page, 250)
             return latest_url, latest_body
 
+        def _extract_phone_provider_href() -> str:
+            try:
+                href = page.evaluate(
+                    """() => {
+                        const isVisible = (el) => {
+                            if (!el) return false;
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                        };
+                        const candidates = Array.from(document.querySelectorAll(
+                            'a[data-auth-provider="phone"], a[href*="usernameKind=phone"], a._X60mza_providerButton, a'
+                        ));
+                        for (const el of candidates) {
+                            if (!isVisible(el)) continue;
+                            const provider = String(el.getAttribute('data-auth-provider') || '').toLowerCase();
+                            const href = String(el.getAttribute('href') || '').trim();
+                            const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                            if (!href) continue;
+                            if (
+                                provider === 'phone'
+                                || href.toLowerCase().includes('usernamekind=phone')
+                                || text.includes('continue with phone')
+                                || text.includes('use phone instead')
+                                || text.includes('继续使用手机')
+                            ) {
+                                try {
+                                    return new URL(href, window.location.origin).toString();
+                                } catch (e) {
+                                    return href;
+                                }
+                            }
+                        }
+                        return '';
+                    }"""
+                )
+                return str(href or "").strip()
+            except Exception:
+                return ""
+
+        def _goto_phone_auth_entry(*, reason: str) -> bool:
+            """兼容旧调用：统一复用外层手机号入口直链兜底。"""
+            extracted = _extract_phone_provider_href()
+            if extracted:
+                try:
+                    emitter.info(
+                        f"浏览器模式2 {reason}，改用页面提取的手机号入口直链: {_mask_secret(extracted, head=72, tail=24)}",
+                        step="oauth_init",
+                    )
+                    _goto_with_recovery(
+                        extracted,
+                        step="oauth_init",
+                        reason="浏览器模式2 打开页面提取手机号入口直链失败",
+                        wait_until="domcontentloaded",
+                        timeout_ms=min(20000, int(cfg.get("browser_timeout_ms") or 20000)),
+                        max_attempts=2,
+                    )
+                    _wait_for_load(page, timeout_ms=2500)
+                    latest_url, latest_body = _describe_page(page, force_refresh=True)
+                    if _entry_flow_ready(latest_url, latest_body) or "auth.openai.com" in str(latest_url or "").lower() or "chatgpt.com/auth/" in str(latest_url or "").lower():
+                        emitter.info("浏览器模式2 已通过手机号入口直链进入认证流程。", step="oauth_init")
+                        return True
+                except Exception as exc:
+                    emitter.warn(f"浏览器模式2 页面提取手机号入口直链失败: {exc}", step="oauth_init")
+            return _goto_manual_v2_phone_auth_entry(reason=reason, prefer_login=False)
+
         url_lower = str(current_url or "").lower()
-        if "chatgpt.com" not in url_lower:
+        if "chatgpt.com" not in url_lower and "auth.openai.com" not in url_lower:
             manual_v2_entry_unavailable_since = 0.0
             return False
         if _entry_flow_ready(current_url, body_text):
@@ -6440,7 +7222,7 @@ def run_browser_registration(
             manual_v2_entry_bootstrap_wait_logged = False
             manual_v2_entry_unavailable_since = 0.0
             manual_v2_entry_fallback_attempts = 0
-            return False
+            return True if _has_phone_input(page) or "auth.openai.com" in url_lower else False
 
         clicked = False
         signup_visible = _first_visible_locator(page, signup_selectors) is not None
@@ -6461,7 +7243,7 @@ def run_browser_registration(
             return False
         if signup_visible or phone_entry_visible:
             manual_v2_entry_unavailable_since = 0.0
-            manual_v2_entry_fallback_attempts = 0
+            # 不重置 fallback_attempts，便于累计后走直链
         if not signup_visible and not phone_entry_visible:
             if manual_v2_entry_unavailable_since <= 0:
                 manual_v2_entry_unavailable_since = time.time()
@@ -6474,7 +7256,6 @@ def run_browser_registration(
                 phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
                 if signup_visible or phone_entry_visible:
                     manual_v2_entry_unavailable_since = 0.0
-                    manual_v2_entry_fallback_attempts = 0
         entry_signature = f"{url_lower}|signup:{1 if signup_visible else 0}|phone_entry:{1 if phone_entry_visible else 0}"
         if not signup_visible and not phone_entry_visible:
             now = time.time()
@@ -6491,89 +7272,211 @@ def run_browser_registration(
                 )
             if (
                 manual_v2_entry_unavailable_since > 0
-                and now - manual_v2_entry_unavailable_since >= 12.0
-                and manual_v2_entry_fallback_attempts < 2
+                and now - manual_v2_entry_unavailable_since >= 8.0
+                and manual_v2_entry_fallback_attempts < 3
             ):
                 manual_v2_entry_fallback_attempts += 1
                 manual_v2_entry_unavailable_since = now
-                emitter.warn(
-                    "浏览器模式2 首页注册入口持续 12 秒仍未出现，"
-                    + f"准备第 {manual_v2_entry_fallback_attempts}/2 次直接重开注册授权页兜底...",
-                    step="oauth_init",
-                )
-                current_oauth = generate_oauth_url_func()
-                _start_oauth_flow(page, current_oauth, "signup")
+                if _goto_phone_auth_entry(reason=f"首页入口持续未出现，准备第 {manual_v2_entry_fallback_attempts}/3 次手机号直链兜底"):
+                    return True
+                if manual_v2_entry_fallback_attempts >= 2:
+                    emitter.warn(
+                        "浏览器模式2 首页注册入口持续未出现，准备直接重开注册授权页兜底...",
+                        step="oauth_init",
+                    )
+                    current_oauth = generate_oauth_url_func()
+                    _start_oauth_flow(page, current_oauth, "signup")
                 return False
             return False
+
         if signup_visible and not phone_entry_visible:
             if entry_signature != manual_v2_entry_bootstrap_signature:
                 manual_v2_entry_bootstrap_signature = entry_signature
                 manual_v2_entry_bootstrap_seen_at = time.time()
                 manual_v2_entry_bootstrap_wait_logged = False
-            if time.time() - manual_v2_entry_bootstrap_seen_at < 0.5:
+            if time.time() - manual_v2_entry_bootstrap_seen_at < 0.2:
                 if not manual_v2_entry_bootstrap_wait_logged:
                     manual_v2_entry_bootstrap_wait_logged = True
                     emitter.info("浏览器模式2 首页注册入口已出现，先等待页面稳定再点击，避免误点空白弹层...", step="oauth_init")
                 return False
         else:
-            manual_v2_entry_bootstrap_signature = ""
-            manual_v2_entry_bootstrap_seen_at = 0.0
-            manual_v2_entry_bootstrap_wait_logged = False
+            if not phone_entry_visible:
+                manual_v2_entry_bootstrap_signature = ""
+                manual_v2_entry_bootstrap_seen_at = 0.0
+                manual_v2_entry_bootstrap_wait_logged = False
 
-        if not phone_entry_visible and signup_visible and _click_first(page, signup_selectors, timeout_ms=1200):
-            emitter.info("浏览器模式2 已自动点击首页注册入口，准备拉起手机号注册界面...", step="oauth_init")
-            clicked = True
-            current_url, body_text = _wait_signup_transition(current_url, body_text, action_label="首页注册入口已点击")
-            if _entry_flow_ready(current_url, body_text):
-                return True
-            phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
+        def _js_click_mobile_auth_signup() -> bool:
+            try:
+                return bool(
+                    page.evaluate(
+                        """() => {
+                            const isVisible = (el) => {
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = window.getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                            };
+                            const candidates = Array.from(document.querySelectorAll(
+                                'button[data-mobile-auth-entry-action="signup"], button.wm-app-signupButton, button[commandfor="mobile-auth-dialog"], button, a, [role="button"]'
+                            ));
+                            for (const el of candidates) {
+                                if (!isVisible(el)) continue;
+                                const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                                const action = String(el.getAttribute('data-mobile-auth-entry-action') || '').toLowerCase();
+                                if (action === 'signup' || text === 'sign up for free' || text === 'sign up' || text.includes('sign up for free') || text === '免费注册' || text === '注册') {
+                                    try { el.click(); return true; } catch (e) {}
+                                    try {
+                                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                                        return true;
+                                    } catch (e2) {}
+                                }
+                            }
+                            return false;
+                        }"""
+                    )
+                )
+            except Exception:
+                return False
+
+        def _js_click_phone_provider() -> bool:
+            try:
+                return bool(
+                    page.evaluate(
+                        """() => {
+                            const isVisible = (el) => {
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const style = window.getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                            };
+                            const candidates = Array.from(document.querySelectorAll(
+                                'a[data-auth-provider="phone"], a[href*="usernameKind=phone"], a._X60mza_providerButton, a, button, [role="button"], div'
+                            ));
+                            for (const el of candidates) {
+                                if (!isVisible(el)) continue;
+                                const provider = String(el.getAttribute('data-auth-provider') || '').toLowerCase();
+                                const href = String(el.getAttribute('href') || '').toLowerCase();
+                                const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                                if (
+                                    provider === 'phone'
+                                    || href.includes('usernamekind=phone')
+                                    || text === 'continue with phone'
+                                    || text.includes('continue with phone')
+                                    || text === 'use phone instead'
+                                    || text.includes('继续使用手机')
+                                    || text === '手机登录'
+                                ) {
+                                    try { el.click(); return true; } catch (e) {}
+                                    try {
+                                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                                        return true;
+                                    } catch (e2) {}
+                                }
+                            }
+                            return false;
+                        }"""
+                    )
+                )
+            except Exception:
+                return False
+
+        if not phone_entry_visible and signup_visible:
+            signup_clicked = (
+                _click_first(page, signup_selectors, timeout_ms=1500)
+                or _click_text_ancestor(page, ["Sign up for free", "Sign up", "免费注册", "注册"], timeout_ms=1200)
+                or _js_click_mobile_auth_signup()
+            )
+            if signup_clicked:
+                emitter.info("浏览器模式2 已自动点击首页注册入口（Sign up for free / Sign up），准备拉起手机号注册界面...", step="oauth_init")
+                clicked = True
+                _sleep_with_page(page, 500)
+                current_url, body_text = _wait_signup_transition(current_url, body_text, action_label="首页注册入口已点击")
+                if _entry_flow_ready(current_url, body_text):
+                    return True
+                phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
+                if not phone_entry_visible:
+                    for _ in range(12):
+                        _sleep_with_page(page, 250)
+                        phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
+                        if phone_entry_visible:
+                            break
 
         phone_entry_clicked = False
-        if phone_entry_visible:
-            phone_entry_clicked = _click_first(page, phone_entry_selectors, timeout_ms=1200) or _click_text_ancestor(
-                page,
-                ["Continue with phone", "Use phone instead", "继续使用手机登录", "使用手机", "手机登录"],
-                timeout_ms=1200,
+        phone_href_before_click = _extract_phone_provider_href() if (phone_entry_visible or clicked) else ""
+        if phone_entry_visible or clicked:
+            phone_entry_clicked = (
+                _click_first(page, phone_entry_selectors, timeout_ms=1500)
+                or _click_text_ancestor(
+                    page,
+                    ["Continue with phone", "Use phone instead", "继续使用手机登录", "使用手机", "手机登录"],
+                    timeout_ms=1200,
+                )
+                or _js_click_phone_provider()
             )
         if phone_entry_clicked:
             emitter.info("浏览器模式2 已点击手机号注册入口，等待站点真正渲染手机号输入框...", step="oauth_init")
             clicked = True
             current_url, body_text = _wait_signup_transition(current_url, body_text, action_label="手机号注册入口已点击")
             if _entry_flow_ready(current_url, body_text):
-                emitter.info("浏览器模式2 已自动切换到手机号注册入口，已看到手机号输入控件。", step="oauth_init")
+                emitter.info("浏览器模式2 已自动切换到手机号注册入口，已看到手机号输入控件或认证页。", step="oauth_init")
                 return True
+            # 点了但还在 chatgpt 首页：优先用链接 href 直跳
+            if "chatgpt.com" in str(current_url or "").lower() and "auth.openai.com" not in str(current_url or "").lower():
+                if _goto_phone_auth_entry(reason="点击 Continue with phone 后仍停在首页"):
+                    latest_url, latest_body = _describe_page(page, force_refresh=True)
+                    if _entry_flow_ready(latest_url, latest_body) or "auth.openai.com" in str(latest_url or "").lower() or "chatgpt.com/auth/" in str(latest_url or "").lower():
+                        emitter.info("浏览器模式2 已通过手机号入口直链进入认证流程。", step="oauth_init")
+                        return True
 
         if _entry_flow_ready(current_url, body_text):
             return True
         if clicked:
-            if _is_login_with_bridge_page(current_url, body_text):
+            if _is_login_with_bridge_page(current_url, body_text, page):
                 emitter.info(
                     "浏览器模式2 首页入口点击后已进入登录弹层桥接页，正在等待站点真正渲染手机号输入控件...",
                     step="oauth_init",
                 )
+            # 累计失败后强制直链，避免无限“点了没进去”
+            manual_v2_entry_fallback_attempts += 1
+            if manual_v2_entry_fallback_attempts >= 2:
+                if _goto_phone_auth_entry(reason=f"连续 {manual_v2_entry_fallback_attempts} 次点击后仍未进入手机号页"):
+                    return True
             emitter.warn(
                 "浏览器模式2 首页入口点击后尚未真正进入手机号页，本轮按未成功处理，下一轮继续等待页面稳定后再试。"
                 + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
-                + f", state={_classify_page_state(current_url, body_text, page)}",
+                + f", state={_classify_page_state(current_url, body_text, page)}"
+                + f", attempt={manual_v2_entry_fallback_attempts}",
                 step="oauth_init",
             )
             emitter.info(
-                "首页入口点击后诊断: actions=" + _summarize_primary_actions(page),
+                "首页入口点击后诊断: actions=" + _summarize_primary_actions(page)
+                + f", phone_href={_mask_secret(phone_href_before_click or _extract_phone_provider_href(), head=64, tail=24) or '-'}",
                 step="oauth_init",
             )
         return False
 
     def _bootstrap_manual_v2_login_entry(current_url: str, body_text: str) -> bool:
+        nonlocal manual_v2_entry_fallback_attempts
         url_lower = str(current_url or "").lower()
         body_lower = str(body_text or "").lower()
-        if "auth.openai.com/log-in" not in url_lower and not _is_login_with_bridge_page(current_url, body_text):
-            return False
-        if _is_phone_input_page(current_url, body_text, page):
+        if _is_phone_input_page(current_url, body_text, page) or _has_phone_input(page):
             return True
-        if (
+        # 首页/桥接页也允许走补资料登录入口（不仅 auth.openai.com/log-in）。
+        on_login_shell = (
+            "auth.openai.com/log-in" in url_lower
+            or _is_login_with_bridge_page(current_url, body_text)
+            or ("chatgpt.com" in url_lower and "auth.openai.com" not in url_lower)
+        )
+        if not on_login_shell:
+            return False
+        clicked = (
             _click_first(
                 page,
                 [
+                    'a[data-auth-provider="phone"]',
+                    'a[href*="usernameKind=phone_number"]',
+                    'a[href*="usernameKind=phone"]',
+                    'a:has-text("Continue with phone")',
                     'button:has-text("Continue with phone")',
                     '[role="button"]:has-text("Continue with phone")',
                     'div:has-text("Continue with phone")',
@@ -6599,26 +7502,49 @@ def run_browser_registration(
                 ["Continue with phone", "Use phone instead", "继续使用手机登录", "使用手机", "手机登录"],
                 timeout_ms=1200,
             )
-        ):
+        )
+        if clicked:
             if manual_v2_profile_completion_mode and manual_v2_phone_number:
                 emitter.info(
-                    "浏览器模式2 已在 auth.openai.com/log-in 页面点击手机号登录入口，等待手机号输入页就绪后自动复用已保存手机号...",
+                    "浏览器模式2 已在登录入口点击手机号登录，等待手机号输入页就绪后自动复用已保存手机号...",
                     step="oauth_init",
                 )
             else:
-                emitter.info("浏览器模式2 已在 auth.openai.com/log-in 页面点击手机号登录入口，等待站点渲染手机号输入框...", step="oauth_init")
-            _wait_for_load(page, timeout_ms=2000)
+                emitter.info("浏览器模式2 已在登录入口点击手机号登录，等待站点渲染手机号输入框...", step="oauth_init")
+            _wait_for_load(page, timeout_ms=2500)
             latest_url, latest_body = _describe_page(page, force_refresh=True)
-            if _is_phone_input_page(latest_url, latest_body, page):
+            if _is_phone_input_page(latest_url, latest_body, page) or _has_phone_input(page):
                 if manual_v2_profile_completion_mode and manual_v2_phone_number:
                     emitter.info(
-                        "浏览器模式2 已在 auth.openai.com/log-in 页面切到手机号输入页，准备自动复用已保存手机号...",
+                        "浏览器模式2 已切到手机号输入页，准备自动复用已保存手机号...",
                         step="oauth_init",
                     )
                 else:
-                    emitter.info("浏览器模式2 已在 auth.openai.com/log-in 页面切到手机号输入页。", step="oauth_init")
+                    emitter.info("浏览器模式2 已切到手机号输入页。", step="oauth_init")
                 return True
-            return bool("continue with phone" in body_lower or "use phone instead" in body_lower or "继续使用手机登录" in body_text)
+            # 点了 Continue with phone 仍停在首页/桥接：复用直链兜底
+            latest_lower = str(latest_url or "").lower()
+            if "chatgpt.com" in latest_lower and "auth.openai.com" not in latest_lower:
+                if _goto_manual_v2_phone_auth_entry(reason="点击 Continue with phone 后仍停在首页", prefer_login=True):
+                    return True
+            if "auth.openai.com/log-in" in latest_lower or _is_login_with_bridge_page(latest_url, latest_body):
+                manual_v2_entry_fallback_attempts += 1
+                if manual_v2_entry_fallback_attempts >= 1:
+                    if _goto_manual_v2_phone_auth_entry(
+                        reason=f"登录入口连续 {manual_v2_entry_fallback_attempts} 次点击后仍未进入手机号页",
+                        prefer_login=True,
+                    ):
+                        return True
+            return False
+        # 点不到 Continue with phone 时，首页/登录壳直接走直链
+        if "chatgpt.com" in url_lower or "auth.openai.com/log-in" in url_lower or _is_login_with_bridge_page(current_url, body_text):
+            manual_v2_entry_fallback_attempts += 1
+            if manual_v2_entry_fallback_attempts >= 1:
+                if _goto_manual_v2_phone_auth_entry(
+                    reason=f"登录入口未点到 Continue with phone，准备第 {manual_v2_entry_fallback_attempts} 次手机号直链兜底",
+                    prefer_login=True,
+                ):
+                    return True
         return bool("continue with phone" in body_lower or "use phone instead" in body_lower or "继续使用手机登录" in body_text)
 
     def _reset_browser_phase_state(*, clear_profile: bool = False) -> None:
@@ -6879,6 +7805,7 @@ def run_browser_registration(
         step: str = "add_phone",
         timeout_ms: int = 18000,
     ) -> tuple[str, str]:
+        nonlocal page
         previous_url_lower = str(previous_url or "").lower()
         previous_state = _classify_page_state(previous_url, previous_body, page)
         previous_signature = _page_snapshot_signature(previous_url, previous_body)
@@ -6887,51 +7814,89 @@ def run_browser_registration(
         latest_url = previous_url
         latest_body = previous_body
         same_signature_rounds = 0
+        stalled_bridge_rounds = 0
         while time.time() < deadline_local:
             if stop_event is not None and stop_event.is_set():
                 return latest_url, latest_body
-            active_page = _resolve_active_page(page, timeout_ms=300)
+            active_page = _resolve_active_page(page, timeout_ms=500)
             if active_page is None:
                 if callback_state["url"]:
                     return latest_url, latest_body
                 if not wait_logged:
                     wait_logged = True
                     emitter.info("步骤1手机号已提交，等待页面稳定并切换到下一阶段...", step=step)
-                _sleep_with_page(None, 200)
+                _sleep_with_page(None, 250)
                 continue
             if not callback_state["url"]:
                 _consume_loopback_callback()
-            latest_url, latest_body = _describe_page(page, force_refresh=True)
+            page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=8000)
             latest_url_lower = latest_url.lower()
             latest_state = _classify_page_state(latest_url, latest_body, page)
             latest_signature = _page_snapshot_signature(latest_url, latest_body)
             if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
                 return latest_url, latest_body
+            if _has_recent_network_url(recent_network_events, "create-account/password", within_seconds=20.0):
+                page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                latest_url_lower = latest_url.lower()
             if _is_create_account_password_page(latest_url, latest_body, page):
                 return latest_url, latest_body
             if _is_login_password_page(latest_url, latest_body, page):
                 return latest_url, latest_body
+            if _is_passkey_challenge_page(latest_url, latest_body, page):
+                return latest_url, latest_body
             if _is_contact_verification_page(latest_url, latest_body, page):
                 return latest_url, latest_body
-            if latest_state != previous_state:
+            if _is_reset_password_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            # 只要出现密码框，即使 URL/壳层文本滞后，也视为已进入下一阶段。
+            if _first_visible_locator(
+                page,
+                [
+                    'input[type="password"]',
+                    'input[name="password"]',
+                    'input[name="new-password"]',
+                    'input[autocomplete="new-password"]',
+                ],
+            ) is not None:
+                return latest_url, latest_body
+            if latest_state not in {"login_with_bridge", "add_phone", "blank"} and latest_state != previous_state:
                 return latest_url, latest_body
             if latest_url_lower and latest_url_lower != previous_url_lower:
-                return latest_url, latest_body
+                # 真正发生了导航；若仍像桥接，继续观察，不要立刻当失败。
+                if not _is_login_with_bridge_page(latest_url, latest_body, page) and not _is_phone_input_page(latest_url, latest_body, page):
+                    return latest_url, latest_body
+                previous_url_lower = latest_url_lower
+                previous_state = latest_state
+                previous_signature = latest_signature
+                same_signature_rounds = 0
+                stalled_bridge_rounds = 0
             if latest_signature == previous_signature:
                 same_signature_rounds += 1
             else:
                 previous_signature = latest_signature
                 same_signature_rounds = 0
-            if latest_state in {"login_with_bridge", "add_phone"} and same_signature_rounds >= 10:
+            still_on_origin = (
+                _is_login_with_bridge_page(latest_url, latest_body, page)
+                or _is_phone_input_page(latest_url, latest_body, page)
+                or latest_state in {"login_with_bridge", "add_phone"}
+            )
+            if still_on_origin:
+                stalled_bridge_rounds += 1
+            else:
+                stalled_bridge_rounds = 0
+                return latest_url, latest_body
+            # 约 3 秒一轮确认；至少连续观察更久，避免 SPA 跳转瞬间误判卡死。
+            if still_on_origin and same_signature_rounds >= 18 and stalled_bridge_rounds >= 18:
                 return latest_url, latest_body
             if not wait_logged:
                 wait_logged = True
                 emitter.info("步骤1手机号已提交，等待页面稳定并切换到下一阶段...", step=step)
-            _sleep_with_page(page, 250)
+            _sleep_with_page(page, 300)
         emitter.warn(
             "浏览器模式2 步骤1手机号提交后的短轮询观察超时，先返回当前页面继续主循环诊断..."
             + f" current_url={_mask_secret(latest_url, head=56, tail=12)}"
-            + f", state={_classify_page_state(latest_url, latest_body, page)}",
+            + f", state={_classify_page_state(latest_url, latest_body, page)}"
+            + f", pages={_page_navigation_debug_summary(page)}",
             step=step,
         )
         return _describe_page(page, force_refresh=True)
@@ -7064,8 +8029,9 @@ def run_browser_registration(
         previous_body: str,
         *,
         step: str = "phone_verification",
-        timeout_ms: int = 12000,
+        timeout_ms: int = 18000,
     ) -> tuple[str, str]:
+        nonlocal page
         previous_url_lower = str(previous_url or "").lower()
         previous_state = _classify_page_state(previous_url, previous_body, page)
         deadline_local = time.time() + max(2.0, float(timeout_ms) / 1000.0)
@@ -7086,22 +8052,31 @@ def run_browser_registration(
         while time.time() < deadline_local:
             if stop_event is not None and stop_event.is_set():
                 return latest_url, latest_body
-            active_page = _resolve_active_page(page, timeout_ms=300)
+            active_page = _resolve_active_page(page, timeout_ms=800)
             if active_page is None:
                 if callback_state["url"]:
                     return latest_url, latest_body
                 if not wait_logged:
                     wait_logged = True
                     emitter.info("短信验证码已提交，等待页面跳转并确认后续状态...", step=step)
-                _sleep_with_page(None, 200)
+                _sleep_with_page(None, 250)
                 continue
+            page = active_page
             if not callback_state["url"]:
                 _consume_loopback_callback()
-            latest_url, latest_body = _describe_page(page, force_refresh=True)
+            page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=8000)
             latest_url_lower = latest_url.lower()
             latest_state = _classify_page_state(latest_url, latest_body, page)
             latest_body_lower = str(latest_body or "").lower()
             if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
+                return latest_url, latest_body
+            if _is_profile_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if _is_create_account_password_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if _is_passkey_challenge_page(latest_url, latest_body, page):
+                return latest_url, latest_body
+            if "about-you" in latest_url_lower:
                 return latest_url, latest_body
             if latest_state != previous_state:
                 return latest_url, latest_body
@@ -7112,14 +8087,16 @@ def run_browser_registration(
             if not wait_logged:
                 wait_logged = True
                 emitter.info("短信验证码已提交，等待页面跳转并确认后续状态...", step=step)
-            _sleep_with_page(page, 250)
+            _sleep_with_page(page, 300)
         emitter.warn(
             "浏览器模式2 短信验证码提交后的短轮询观察超时，先返回当前页面继续主循环诊断..."
             + f" current_url={_mask_secret(latest_url, head=56, tail=12)}"
-            + f", state={_classify_page_state(latest_url, latest_body, page)}",
+            + f", state={_classify_page_state(latest_url, latest_body, page)}"
+            + f", pages={_page_navigation_debug_summary(page)}",
             step=step,
         )
-        return _describe_page(page, force_refresh=True)
+        page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=8000)
+        return latest_url, latest_body
 
     def _wait_for_manual_v2_reset_password_continue_transition(
         previous_url: str,
@@ -7440,6 +8417,21 @@ def run_browser_registration(
         )
         if not cfg["browser_headless"]:
             emitter.info("当前为可见浏览器模式，可直接观察 ChatGPT 首页到手机注册入口的切换过程", step="oauth_init")
+        try:
+            landing_url, landing_body = _describe_page(page, force_refresh=True)
+            emitter.info("浏览器模式2 回到首页后，立即重试手机号注册入口...", step="oauth_init")
+            for attempt in range(1, 4):
+                if _bootstrap_manual_v2_phone_entry(landing_url, landing_body):
+                    emitter.info(
+                        f"浏览器模式2 回首页入口启动成功（第 {attempt}/3 次尝试）",
+                        step="oauth_init",
+                    )
+                    break
+                _wait_for_load(page, timeout_ms=1200)
+                _sleep_with_page(page, 500)
+                landing_url, landing_body = _describe_page(page, force_refresh=True)
+        except Exception as exc:
+            emitter.warn(f"浏览器模式2 回首页入口预热失败，将交由主循环继续重试: {exc}", step="oauth_init")
     manual_v2_require_phone_resubmit = False
     manual_v2_reset_password_flow_started = False
     manual_v2_reset_password_continue_clicked = False
@@ -7681,7 +8673,13 @@ def run_browser_registration(
         if not manual_v2_auto_phone_mode or sms_provider is None:
             raise RuntimeError("浏览器模式2 当前未启用自动短信验证码模式")
         if not manual_v2_sms_activation_id:
-            raise RuntimeError("浏览器模式2 自动短信验证码模式缺少 activation_id")
+            # 还没完成步骤1取号就误进验证码页时，返回空串让外层回退，而不是直接炸流程。
+            emitter.warn(
+                "浏览器模式2 当前尚未拿到 SMSBower/HeroSMS activation_id，"
+                + "跳过短信验证码轮询并回到步骤1继续取号/提交手机号...",
+                step=step,
+            )
+            return ""
         if manual_v2_cached_sms_code:
             code = manual_v2_cached_sms_code
             manual_v2_cached_sms_code = ""
@@ -7721,16 +8719,79 @@ def run_browser_registration(
         nonlocal manual_v2_reset_password_continue_clicked, manual_v2_sms_code_submitted
         nonlocal manual_v2_phone_number, manual_v2_sms_activation_id, manual_v2_sms_purchased_at
         nonlocal manual_v2_sms_provider_done
-        stall_state = _classify_page_state(current_url, body_text, page)
-        manual_v2_phone_submit_stall_attempts += 1
-        if manual_v2_auto_phone_mode:
-            manual_v2_phone_submit_stall_attempts = 2
-        if manual_v2_phone_submit_stall_attempts < 2:
-            emitter.warn(
-                "浏览器模式2 步骤1手机号提交后站点仍未真正离开当前桥接/手机号页，"
-                + f"准备再重试 1 次后判定当前号码无效... state={stall_state}, attempt={manual_v2_phone_submit_stall_attempts}/2",
+        nonlocal page
+        # 再解析一次活动页，并尝试把 iframe 内的 auth 业务页提升到顶层。
+        active_page = _resolve_active_page(page, timeout_ms=1800)
+        if active_page is not None:
+            page = active_page
+        page, recheck_url, recheck_body = _promote_auth_target_if_needed(page, timeout_ms=10000)
+        password_input_visible = _first_visible_locator(
+            page,
+            [
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[name="new-password"]',
+                'input[autocomplete="new-password"]',
+            ],
+        ) is not None
+        left_bridge = (
+            _is_create_account_password_page(recheck_url, recheck_body, page)
+            or _is_login_password_page(recheck_url, recheck_body, page)
+            or _is_passkey_challenge_page(recheck_url, recheck_body, page)
+            or _is_contact_verification_page(recheck_url, recheck_body, page)
+            or password_input_visible
+            or (
+                "auth.openai.com" in str(recheck_url or "").lower()
+                and any(
+                    token in str(recheck_url or "").lower()
+                    for token in (
+                        "create-account/password",
+                        "auth_challenge",
+                        "log-in/password",
+                        "contact-verification",
+                        "about-you",
+                    )
+                )
+            )
+            or (
+                _has_recent_network_url(recent_network_events, "create-account/password", within_seconds=20.0)
+                and password_input_visible
+            )
+        )
+        # 仍停在 chatgpt 首页壳且没有真实密码控件时，不算离开。
+        if left_bridge and "chatgpt.com" in str(recheck_url or "").lower() and not password_input_visible:
+            if not any(
+                token in str(recheck_url or "").lower()
+                for token in ("create-account/password", "auth_challenge", "log-in/password")
+            ):
+                left_bridge = False
+        if left_bridge:
+            manual_v2_phone_submit_stall_attempts = 0
+            emitter.info(
+                "浏览器模式2 步骤1手机号提交后二次确认已离开桥接/手机号页，"
+                + f"继续后续流程... current_url={_mask_secret(recheck_url, head=72, tail=18)}"
+                + f", state={_classify_page_state(recheck_url, recheck_body, page)}"
+                + f", frames={_preview_text(' | '.join(_collect_auth_frame_urls(page)[:4]), 180)}",
                 step="add_phone",
             )
+            return False
+        current_url = recheck_url or current_url
+        body_text = recheck_body or body_text
+        stall_state = _classify_page_state(current_url, body_text, page)
+        manual_v2_phone_submit_stall_attempts += 1
+        stall_limit = 3
+        if manual_v2_phone_submit_stall_attempts < stall_limit:
+            emitter.warn(
+                "浏览器模式2 步骤1手机号提交后站点仍未真正离开当前桥接/手机号页，"
+                + f"准备第 {manual_v2_phone_submit_stall_attempts}/{stall_limit} 次确认后再判定当前号码无效..."
+                + f" state={stall_state}"
+                + f", current_url={_mask_secret(current_url, head=56, tail=12)}"
+                + f", pages={_page_navigation_debug_summary(page)}",
+                step="add_phone",
+            )
+            # 给 SPA 跳转留观察窗口，避免立即废弃有效号码。
+            _wait_for_load(page, timeout_ms=1800)
+            _sleep_with_page(page, 1200)
             return False
         password_submitted = False
         manual_v2_password_page_logged = False
@@ -7752,8 +8813,8 @@ def run_browser_registration(
             manual_v2_sms_purchased_at = 0.0
             manual_v2_sms_provider_done = False
             _prepare_manual_v2_signup_flow(
-                "浏览器模式2 步骤1手机号提交后仍卡在首页桥接弹层/手机号页；"
-                + f"自动模式下不再等待同号重试，已立即废弃当前 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取号..."
+                "浏览器模式2 步骤1手机号提交后连续 3 次确认仍卡在首页桥接弹层/手机号页；"
+                + f"已废弃当前 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取号..."
             )
         else:
             manual_v2_phone_number = ""
@@ -8120,6 +9181,22 @@ def run_browser_registration(
                 )
                 if not cfg["browser_headless"]:
                     emitter.info("当前为可见浏览器模式，可直接观察 ChatGPT 首页到手机注册入口的切换过程", step="oauth_init")
+                # 首页落地后立刻尝试入口点击，避免主循环前置条件卡住导致“只停在观察提示”。
+                try:
+                    landing_url, landing_body = _describe_page(page, force_refresh=True)
+                    emitter.info("浏览器模式2 检测到 ChatGPT 首页，正在尝试自动打开手机号注册入口...", step="oauth_init")
+                    for attempt in range(1, 4):
+                        if _bootstrap_manual_v2_phone_entry(landing_url, landing_body):
+                            emitter.info(
+                                f"浏览器模式2 首页入口启动成功（第 {attempt}/3 次尝试）",
+                                step="oauth_init",
+                            )
+                            break
+                        _wait_for_load(page, timeout_ms=1200)
+                        _sleep_with_page(page, 500)
+                        landing_url, landing_body = _describe_page(page, force_refresh=True)
+                except Exception as exc:
+                    emitter.warn(f"浏览器模式2 首页入口启动预热失败，将交由主循环继续重试: {exc}", step="oauth_init")
             else:
                 _start_oauth_flow(page, current_oauth, current_phase)
 
@@ -8148,11 +9225,35 @@ def run_browser_registration(
                             step="get_token",
                         )
                         callback_state["url"] = ""
+                    elif is_manual_v2_mode and not manual_v2_login_flow_started:
+                        # 步骤1注册期（含 about-you 刚完成）出现的 callback 与步骤2 PKCE 不是一套，禁止直接兑换。
+                        emitter.info(
+                            "浏览器模式2 当前仍处于步骤1注册/补资料阶段，忽略提前出现的 OAuth callback；"
+                            + ("资料已提交，准备进入步骤2登录 OAuth..." if profile_submitted else "等待注册前半段完成后再进入步骤2 OAuth..."),
+                            step="get_token",
+                        )
+                        callback_state["url"] = ""
+                        if profile_submitted and not manual_v2_login_flow_started:
+                            _prepare_manual_v2_login_flow(
+                                "浏览器模式2 步骤1已完成且捕获到注册期 callback，已丢弃该 callback，改为重新拉起步骤2 OAuth 登录链路获取 Token..."
+                            )
+                        continue
                     elif is_manual_v2_mode and not manual_v2_oauth_resumed and not callback_is_real:
                         emitter.info("浏览器模式2 当前仍处于注册前半段，忽略提前出现的 callback 线索，等待进入后续授权流程...", step="get_token")
                         callback_state["url"] = ""
                     else:
                         if is_manual_v2_mode and not manual_v2_oauth_resumed and callback_is_real:
+                            # 仅步骤2登录链路启动后，才允许用当前 login OAuth 的 PKCE 兑换。
+                            if not manual_v2_login_flow_started:
+                                emitter.warn(
+                                    "浏览器模式2 捕获到真实 callback，但步骤2登录链路尚未启动，已忽略并准备拉起步骤2 OAuth...",
+                                    step="get_token",
+                                )
+                                callback_state["url"] = ""
+                                _prepare_manual_v2_login_flow(
+                                    "浏览器模式2 捕获到过早 callback，改为正式进入步骤2 OAuth 登录获取 Token..."
+                                )
+                                continue
                             emitter.info("浏览器模式2 已捕获真实 OAuth callback，直接使用当前登录链路的 PKCE 参数兑换 Token...", step="get_token")
                             manual_v2_oauth_resumed = True
                         else:
@@ -8192,7 +9293,8 @@ def run_browser_registration(
                                     proxy=ctx.proxy or None,
                                 )
                         except Exception as exc:
-                            if is_manual_v2_mode and "state mismatch" in str(exc).lower() and callback_is_real:
+                            exc_text = str(exc or "")
+                            if is_manual_v2_mode and "state mismatch" in exc_text.lower() and callback_is_real:
                                 parsed_cb = urllib.parse.urlparse(callback_url_value)
                                 callback_state_value = (
                                     urllib.parse.parse_qs(parsed_cb.query).get("state", [""])[0] or ""
@@ -8203,40 +9305,71 @@ def run_browser_registration(
                                     + f" callback={_mask_secret(callback_state_value, head=10, tail=8)}",
                                     step="get_token",
                                 )
-                                if callable(exchange_callback_payload_func) and callable(build_token_result_func):
-                                    raw_token_payload = exchange_callback_payload_func(
-                                        callback_url=callback_url_value,
-                                        code_verifier=oauth_for_exchange.code_verifier,
-                                        redirect_uri=oauth_for_exchange.redirect_uri,
-                                        expected_state=(callback_state_value or oauth_for_exchange.state),
-                                        proxy=ctx.proxy or None,
-                                    )
-                                    emitter.info(
-                                        "浏览器模式2 state 重试兑换成功，继续用 access_token 直连补齐账号信息...",
+                                try:
+                                    if callable(exchange_callback_payload_func) and callable(build_token_result_func):
+                                        raw_token_payload = exchange_callback_payload_func(
+                                            callback_url=callback_url_value,
+                                            code_verifier=oauth_for_exchange.code_verifier,
+                                            redirect_uri=oauth_for_exchange.redirect_uri,
+                                            expected_state=(callback_state_value or oauth_for_exchange.state),
+                                            proxy=ctx.proxy or None,
+                                        )
+                                        emitter.info(
+                                            "浏览器模式2 state 重试兑换成功，继续用 access_token 直连补齐账号信息...",
+                                            step="get_token",
+                                        )
+                                        session_payload = _fetch_browser_session_payload(
+                                            context=context,
+                                            emitter=emitter,
+                                            referer_url=current_url or callback_url_value,
+                                            fallback_email=ctx.email,
+                                        ) or {}
+                                        token_json = build_token_result_func(
+                                            raw_token_payload,
+                                            session_payload,
+                                            proxy=ctx.proxy or None,
+                                            emitter=emitter,
+                                            fallback_email=ctx.email,
+                                        )
+                                    else:
+                                        token_json = submit_callback_func(
+                                            callback_url=callback_url_value,
+                                            code_verifier=oauth_for_exchange.code_verifier,
+                                            redirect_uri=oauth_for_exchange.redirect_uri,
+                                            expected_state=(callback_state_value or oauth_for_exchange.state),
+                                            proxy=ctx.proxy or None,
+                                        )
+                                except Exception as retry_exc:
+                                    # 注册期 callback 与步骤2 PKCE 不匹配时，改走正式步骤2，而不是直接失败。
+                                    emitter.warn(
+                                        "浏览器模式2 state mismatch 重试仍失败，判定当前 callback 不属于步骤2 PKCE 会话；"
+                                        + f" error={retry_exc}；丢弃该 callback 并重新拉起步骤2 OAuth 登录链路...",
                                         step="get_token",
                                     )
-                                    session_payload = _fetch_browser_session_payload(
-                                        context=context,
-                                        emitter=emitter,
-                                        referer_url=current_url or callback_url_value,
-                                        fallback_email=ctx.email,
-                                    ) or {}
-                                    token_json = build_token_result_func(
-                                        raw_token_payload,
-                                        session_payload,
-                                        proxy=ctx.proxy or None,
-                                        emitter=emitter,
-                                        fallback_email=ctx.email,
-                                    )
-                                else:
-                                    token_json = submit_callback_func(
-                                        callback_url=callback_url_value,
-                                        code_verifier=oauth_for_exchange.code_verifier,
-                                        redirect_uri=oauth_for_exchange.redirect_uri,
-                                        expected_state=(callback_state_value or oauth_for_exchange.state),
-                                        proxy=ctx.proxy or None,
-                                    )
-                            elif "token result missing email/account_id" in str(exc).lower():
+                                    callback_state["url"] = ""
+                                    manual_v2_oauth_resumed = False
+                                    if not manual_v2_login_flow_started or profile_submitted or True:
+                                        _prepare_manual_v2_login_flow(
+                                            "浏览器模式2 因 callback/PKCE 不匹配，已丢弃当前 callback，重新进入步骤2 OAuth 登录获取 Token..."
+                                        )
+                                    continue
+                            elif is_manual_v2_mode and (
+                                "token_exchange_user_error" in exc_text
+                                or "token exchange failed" in exc_text.lower()
+                                or "invalid_request_error" in exc_text.lower()
+                            ):
+                                emitter.warn(
+                                    "浏览器模式2 Token 兑换失败，可能用了注册阶段 callback/PKCE；"
+                                    + f" error={_preview_text(exc_text, 180)}；丢弃 callback 并改走步骤2 OAuth 登录链路...",
+                                    step="get_token",
+                                )
+                                callback_state["url"] = ""
+                                manual_v2_oauth_resumed = False
+                                _prepare_manual_v2_login_flow(
+                                    "浏览器模式2 Token 兑换失败后，重新拉起步骤2 OAuth 登录获取 Token..."
+                                )
+                                continue
+                            elif "token result missing email/account_id" in exc_text.lower():
                                 emitter.warn(
                                     "浏览器模式2 当前页 access_token + session 仍未补齐 email/account_id，准备再次读取一次浏览器 session payload 复核...",
                                     step="get_token",
@@ -8316,10 +9449,23 @@ def run_browser_registration(
                             + "页面里即使出现真实 callback 也先忽略，等待判定完是否需要补资料后再进入真正的步骤2 OAuth。",
                             step="get_token",
                         )
+                    elif is_manual_v2_mode and not manual_v2_login_flow_started:
+                        emitter.info(
+                            "浏览器模式2 步骤1阶段从页面提取到 OAuth callback，先忽略；"
+                            + ("资料已完成则转入步骤2 OAuth..." if profile_submitted else "等步骤1完成后再取 Token..."),
+                            step="get_token",
+                        )
+                        if profile_submitted:
+                            _prepare_manual_v2_login_flow(
+                                "浏览器模式2 步骤1已完成，忽略注册期 callback，正式进入步骤2 OAuth 登录获取 Token..."
+                            )
+                        continue
                     elif is_manual_v2_mode and not manual_v2_oauth_resumed and not callback_is_real:
                         emitter.info("浏览器模式2 注册前半段检测到 callback 线索，暂不处理，等待后续授权流程重新拉起...", step="get_token")
                     else:
                         if is_manual_v2_mode and not manual_v2_oauth_resumed and callback_is_real:
+                            if not manual_v2_login_flow_started:
+                                continue
                             emitter.info("浏览器模式2 已从页面提取到真实 OAuth callback，准备直接兑换 Token...", step="get_token")
                         else:
                             emitter.info("已从页面跳转/错误页文本中提取到 OAuth callback，准备继续交换 Token...", step="get_token")
@@ -8335,6 +9481,42 @@ def run_browser_registration(
                         emitter.warn(
                             "浏览器模式2 第二步登录后命中了会话结束提示页，先保留当前上下文，不立即重拉 OAuth，继续等待绑定邮箱链路...",
                             step="oauth_init",
+                        )
+                        _wait_for_load(page, timeout_ms=1800)
+                        _sleep_with_page(page, 800)
+                        continue
+                    # 步骤1（手机注册）中途：短信/密码/资料已进行时，禁止重拉 signup OAuth，
+                    # 否则会清掉 contact_seen 并跳到 create-account 邮箱页，把本轮注册冲掉。
+                    if is_manual_v2_mode and not manual_v2_login_flow_started and (
+                        manual_v2_contact_seen
+                        or manual_v2_sms_code_submitted
+                        or password_submitted
+                        or bool(str(manual_v2_sms_activation_id or "").strip())
+                    ):
+                        emitter.warn(
+                            "浏览器模式2 步骤1注册中途命中会话结束提示，保留本轮手机号/短信上下文，不重拉 OAuth；"
+                            + "继续提升/观察 auth 页并等待 about-you 或后续自然跳转..."
+                            + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                            step="phone_verification",
+                        )
+                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                        current_url_lower = str(current_url or "").lower()
+                        # 若是可点的会话结束壳，只点 Log in / Continue，不要清注册状态。
+                        _click_first(
+                            page,
+                            [
+                                'a:has-text("Log in")',
+                                'button:has-text("Log in")',
+                                '[role="button"]:has-text("Log in")',
+                                'a:has-text("Continue")',
+                                'button:has-text("Continue")',
+                                '[role="button"]:has-text("Continue")',
+                                'a:has-text("登录")',
+                                'button:has-text("登录")',
+                                'a:has-text("继续")',
+                                'button:has-text("继续")',
+                            ],
+                            timeout_ms=1200,
                         )
                         _wait_for_load(page, timeout_ms=1800)
                         _sleep_with_page(page, 800)
@@ -8377,13 +9559,18 @@ def run_browser_registration(
 
                 if is_manual_v2_mode:
                     _extend_manual_v2_deadline(1800)
+                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=6000)
+                    current_url_lower = str(current_url or "").lower()
+                    body_lower = str(body_text or "").lower()
                     is_create_password_page = _is_create_account_password_page(current_url, body_text, page)
                     is_reset_new_password_page = _is_reset_password_new_password_page(current_url, body_text, page)
                     is_login_password_page = _is_login_password_page(current_url, body_text, page)
+                    is_passkey_challenge_page = _is_passkey_challenge_page(current_url, body_text, page)
                     is_phone_stage_page = (
                         not is_create_password_page
                         and not is_reset_new_password_page
                         and not is_login_password_page
+                        and not is_passkey_challenge_page
                         and (
                             _is_phone_input_page(current_url, body_text, page)
                             or _is_phone_verification_page(current_url, body_text, page)
@@ -8420,8 +9607,9 @@ def run_browser_registration(
                         and not is_create_password_page
                         and not is_reset_new_password_page
                         and not is_login_password_page
+                        and not is_passkey_challenge_page
                         and "chatgpt.com" in current_url_lower
-                        and not _is_login_with_bridge_page(current_url, body_text)
+                        and not _has_phone_input(page)
                     ):
                         if not manual_v2_entry_bootstrap_logged:
                             manual_v2_entry_bootstrap_logged = True
@@ -8433,6 +9621,7 @@ def run_browser_registration(
                             is_create_password_page = _is_create_account_password_page(current_url, body_text, page)
                             is_reset_new_password_page = _is_reset_password_new_password_page(current_url, body_text, page)
                             is_login_password_page = _is_login_password_page(current_url, body_text, page)
+                            is_passkey_challenge_page = _is_passkey_challenge_page(current_url, body_text, page)
                     else:
                         manual_v2_entry_bootstrap_logged = False
                         manual_v2_entry_bootstrap_signature = ""
@@ -8788,8 +9977,34 @@ def run_browser_registration(
                     if (
                         not manual_v2_login_flow_started
                         and not manual_v2_contact_seen
+                        and is_passkey_challenge_page
+                    ):
+                        password_submitted = False
+                        manual_v2_password_page_logged = False
+                        manual_v2_create_password_submit_attempts = 0
+                        manual_v2_phone_number = ""
+                        if manual_v2_auto_phone_mode:
+                            _finish_manual_v2_sms_provider(success=False)
+                            manual_v2_sms_activation_id = ""
+                            manual_v2_sms_purchased_at = 0.0
+                            manual_v2_sms_provider_done = False
+                            _prepare_manual_v2_signup_flow(
+                                "浏览器模式2 自动接码模式在步骤1命中 passkey 挑战页，"
+                                + f"判定当前手机号已是老号；已废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                            )
+                        else:
+                            _prepare_manual_v2_signup_flow(
+                                "浏览器模式2 步骤1命中 passkey 挑战页，判定当前手机号已是老号；"
+                                + "已回到步骤1，请重新输入新的手机号..."
+                            )
+                        continue
+
+                    if (
+                        not manual_v2_login_flow_started
+                        and not manual_v2_contact_seen
                         and not is_create_password_page
                         and not is_login_password_page
+                        and not is_passkey_challenge_page
                         and _is_phone_input_page(current_url, body_text, page)
                     ):
                         if manual_v2_reset_password_flow_started or manual_v2_reset_password_continue_clicked:
@@ -8821,23 +10036,83 @@ def run_browser_registration(
                                 previous_body,
                                 timeout_ms=18000,
                             )
-                            if _is_login_with_bridge_page(current_url, body_text):
-                                emitter.warn(
-                                    "浏览器模式2 步骤1手机号提交后仍停留在首页登录弹层桥接页，当前号码可能未被站点接受...",
-                                    step="add_phone",
-                                )
-                                emitter.info(
-                                    "步骤1手机号桥接页停留诊断: actions=" + _summarize_primary_actions(page),
-                                    step="add_phone",
-                                )
-                                if _handle_manual_v2_phone_submit_stall(current_url, body_text):
-                                    continue
-                                continue
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            if _is_login_with_bridge_page(current_url, body_text, page):
+                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                # 若其实已进入密码/passkey 页，不要按桥接失败处理。
+                                if (
+                                    _is_create_account_password_page(current_url, body_text, page)
+                                    or _is_login_password_page(current_url, body_text, page)
+                                    or _is_passkey_challenge_page(current_url, body_text, page)
+                                    or _first_visible_locator(
+                                        page,
+                                        [
+                                            'input[type="password"]',
+                                            'input[name="password"]',
+                                            'input[name="new-password"]',
+                                            'input[autocomplete="new-password"]',
+                                        ],
+                                    ) is not None
+                                ):
+                                    manual_v2_phone_submit_stall_attempts = 0
+                                    emitter.info(
+                                        "浏览器模式2 步骤1手机号提交后已从桥接壳提升到认证业务页，"
+                                        + f"继续后续流程... current_url={_mask_secret(current_url, head=72, tail=18)}"
+                                        + f", state={_classify_page_state(current_url, body_text, page)}",
+                                        step="add_phone",
+                                    )
+                                else:
+                                    emitter.warn(
+                                        "浏览器模式2 步骤1手机号提交后仍停留在首页登录弹层桥接页，当前号码可能未被站点接受..."
+                                        + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
+                                        + f", state={_classify_page_state(current_url, body_text, page)}"
+                                        + f", pages={_page_navigation_debug_summary(page)}"
+                                        + f", frames={_preview_text(' | '.join(_collect_auth_frame_urls(page)[:4]), 180)}",
+                                        step="add_phone",
+                                    )
+                                    emitter.info(
+                                        "步骤1手机号桥接页停留诊断: actions=" + _summarize_primary_actions(page),
+                                        step="add_phone",
+                                    )
+                                    if _handle_manual_v2_phone_submit_stall(current_url, body_text):
+                                        continue
+                                    # stall 返回 False 后，再提升一次页面再判定；真正进入密码页则落回主循环。
+                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                    if (
+                                        _is_create_account_password_page(current_url, body_text, page)
+                                        or _is_login_password_page(current_url, body_text, page)
+                                        or _is_passkey_challenge_page(current_url, body_text, page)
+                                        or _first_visible_locator(
+                                            page,
+                                            [
+                                                'input[type="password"]',
+                                                'input[name="password"]',
+                                                'input[name="new-password"]',
+                                                'input[autocomplete="new-password"]',
+                                            ],
+                                        ) is not None
+                                    ):
+                                        manual_v2_phone_submit_stall_attempts = 0
+                                    else:
+                                        continue
                             if _is_login_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
                                 emitter.info(
                                     "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
                                     step="create_password",
+                                )
+                            elif _is_create_account_password_page(current_url, body_text, page):
+                                manual_v2_phone_submit_stall_attempts = 0
+                                emitter.info(
+                                    "浏览器模式2 步骤1手机号提交后已进入 create-account/password，下一轮将自动填写密码..."
+                                    + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                    step="create_password",
+                                )
+                            elif _is_passkey_challenge_page(current_url, body_text, page):
+                                manual_v2_phone_submit_stall_attempts = 0
+                                emitter.info(
+                                    "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页，判定当前手机号已是老号，准备回到步骤1重开...",
+                                    step="add_phone",
                                 )
                             elif _is_phone_input_page(current_url, body_text, page):
                                 emitter.warn(
@@ -8894,23 +10169,83 @@ def run_browser_registration(
                                 previous_body,
                                 timeout_ms=18000,
                             )
-                            if _is_login_with_bridge_page(current_url, body_text):
-                                emitter.warn(
-                                    "浏览器模式2 步骤1手机号提交后仍停留在首页登录弹层桥接页，当前号码可能未被站点接受...",
-                                    step="add_phone",
-                                )
-                                emitter.info(
-                                    "步骤1手机号桥接页停留诊断: actions=" + _summarize_primary_actions(page),
-                                    step="add_phone",
-                                )
-                                if _handle_manual_v2_phone_submit_stall(current_url, body_text):
-                                    continue
-                                continue
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            if _is_login_with_bridge_page(current_url, body_text, page):
+                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                # 若其实已进入密码/passkey 页，不要按桥接失败处理。
+                                if (
+                                    _is_create_account_password_page(current_url, body_text, page)
+                                    or _is_login_password_page(current_url, body_text, page)
+                                    or _is_passkey_challenge_page(current_url, body_text, page)
+                                    or _first_visible_locator(
+                                        page,
+                                        [
+                                            'input[type="password"]',
+                                            'input[name="password"]',
+                                            'input[name="new-password"]',
+                                            'input[autocomplete="new-password"]',
+                                        ],
+                                    ) is not None
+                                ):
+                                    manual_v2_phone_submit_stall_attempts = 0
+                                    emitter.info(
+                                        "浏览器模式2 步骤1手机号提交后已从桥接壳提升到认证业务页，"
+                                        + f"继续后续流程... current_url={_mask_secret(current_url, head=72, tail=18)}"
+                                        + f", state={_classify_page_state(current_url, body_text, page)}",
+                                        step="add_phone",
+                                    )
+                                else:
+                                    emitter.warn(
+                                        "浏览器模式2 步骤1手机号提交后仍停留在首页登录弹层桥接页，当前号码可能未被站点接受..."
+                                        + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
+                                        + f", state={_classify_page_state(current_url, body_text, page)}"
+                                        + f", pages={_page_navigation_debug_summary(page)}"
+                                        + f", frames={_preview_text(' | '.join(_collect_auth_frame_urls(page)[:4]), 180)}",
+                                        step="add_phone",
+                                    )
+                                    emitter.info(
+                                        "步骤1手机号桥接页停留诊断: actions=" + _summarize_primary_actions(page),
+                                        step="add_phone",
+                                    )
+                                    if _handle_manual_v2_phone_submit_stall(current_url, body_text):
+                                        continue
+                                    # stall 返回 False 后，再提升一次页面再判定；真正进入密码页则落回主循环。
+                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                    if (
+                                        _is_create_account_password_page(current_url, body_text, page)
+                                        or _is_login_password_page(current_url, body_text, page)
+                                        or _is_passkey_challenge_page(current_url, body_text, page)
+                                        or _first_visible_locator(
+                                            page,
+                                            [
+                                                'input[type="password"]',
+                                                'input[name="password"]',
+                                                'input[name="new-password"]',
+                                                'input[autocomplete="new-password"]',
+                                            ],
+                                        ) is not None
+                                    ):
+                                        manual_v2_phone_submit_stall_attempts = 0
+                                    else:
+                                        continue
                             if _is_login_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
                                 emitter.info(
                                     "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
                                     step="create_password",
+                                )
+                            elif _is_create_account_password_page(current_url, body_text, page):
+                                manual_v2_phone_submit_stall_attempts = 0
+                                emitter.info(
+                                    "浏览器模式2 步骤1手机号提交后已进入 create-account/password，下一轮将自动填写密码..."
+                                    + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                    step="create_password",
+                                )
+                            elif _is_passkey_challenge_page(current_url, body_text, page):
+                                manual_v2_phone_submit_stall_attempts = 0
+                                emitter.info(
+                                    "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页，判定当前手机号已是老号，准备回到步骤1重开...",
+                                    step="add_phone",
                                 )
                             elif _is_phone_input_page(current_url, body_text, page):
                                 emitter.warn(
@@ -8948,23 +10283,83 @@ def run_browser_registration(
                                 previous_body,
                                 timeout_ms=18000,
                             )
-                            if _is_login_with_bridge_page(current_url, body_text):
-                                emitter.warn(
-                                    "浏览器模式2 步骤1手机号提交后仍停留在首页登录弹层桥接页，当前号码可能未被站点接受...",
-                                    step="add_phone",
-                                )
-                                emitter.info(
-                                    "步骤1手机号桥接页停留诊断: actions=" + _summarize_primary_actions(page),
-                                    step="add_phone",
-                                )
-                                if _handle_manual_v2_phone_submit_stall(current_url, body_text):
-                                    continue
-                                continue
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            if _is_login_with_bridge_page(current_url, body_text, page):
+                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                # 若其实已进入密码/passkey 页，不要按桥接失败处理。
+                                if (
+                                    _is_create_account_password_page(current_url, body_text, page)
+                                    or _is_login_password_page(current_url, body_text, page)
+                                    or _is_passkey_challenge_page(current_url, body_text, page)
+                                    or _first_visible_locator(
+                                        page,
+                                        [
+                                            'input[type="password"]',
+                                            'input[name="password"]',
+                                            'input[name="new-password"]',
+                                            'input[autocomplete="new-password"]',
+                                        ],
+                                    ) is not None
+                                ):
+                                    manual_v2_phone_submit_stall_attempts = 0
+                                    emitter.info(
+                                        "浏览器模式2 步骤1手机号提交后已从桥接壳提升到认证业务页，"
+                                        + f"继续后续流程... current_url={_mask_secret(current_url, head=72, tail=18)}"
+                                        + f", state={_classify_page_state(current_url, body_text, page)}",
+                                        step="add_phone",
+                                    )
+                                else:
+                                    emitter.warn(
+                                        "浏览器模式2 步骤1手机号提交后仍停留在首页登录弹层桥接页，当前号码可能未被站点接受..."
+                                        + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
+                                        + f", state={_classify_page_state(current_url, body_text, page)}"
+                                        + f", pages={_page_navigation_debug_summary(page)}"
+                                        + f", frames={_preview_text(' | '.join(_collect_auth_frame_urls(page)[:4]), 180)}",
+                                        step="add_phone",
+                                    )
+                                    emitter.info(
+                                        "步骤1手机号桥接页停留诊断: actions=" + _summarize_primary_actions(page),
+                                        step="add_phone",
+                                    )
+                                    if _handle_manual_v2_phone_submit_stall(current_url, body_text):
+                                        continue
+                                    # stall 返回 False 后，再提升一次页面再判定；真正进入密码页则落回主循环。
+                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                    if (
+                                        _is_create_account_password_page(current_url, body_text, page)
+                                        or _is_login_password_page(current_url, body_text, page)
+                                        or _is_passkey_challenge_page(current_url, body_text, page)
+                                        or _first_visible_locator(
+                                            page,
+                                            [
+                                                'input[type="password"]',
+                                                'input[name="password"]',
+                                                'input[name="new-password"]',
+                                                'input[autocomplete="new-password"]',
+                                            ],
+                                        ) is not None
+                                    ):
+                                        manual_v2_phone_submit_stall_attempts = 0
+                                    else:
+                                        continue
                             if _is_login_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
                                 emitter.info(
                                     "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
                                     step="create_password",
+                                )
+                            elif _is_create_account_password_page(current_url, body_text, page):
+                                manual_v2_phone_submit_stall_attempts = 0
+                                emitter.info(
+                                    "浏览器模式2 步骤1手机号提交后已进入 create-account/password，下一轮将自动填写密码..."
+                                    + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                    step="create_password",
+                                )
+                            elif _is_passkey_challenge_page(current_url, body_text, page):
+                                manual_v2_phone_submit_stall_attempts = 0
+                                emitter.info(
+                                    "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页，判定当前手机号已是老号，准备回到步骤1重开...",
+                                    step="add_phone",
                                 )
                             elif _is_phone_input_page(current_url, body_text, page):
                                 emitter.warn(
@@ -8990,6 +10385,8 @@ def run_browser_registration(
                                 step="add_phone",
                             )
                         _sleep_with_page(page, 800)
+                        continue
+
                         continue
 
                     if (
@@ -9110,7 +10507,135 @@ def run_browser_registration(
                             )
                         continue
 
-                    if _is_contact_verification_page(current_url, body_text, page):
+                    # about-you 优先：一旦到资料页，立刻填写，禁止回流短信验证码循环。
+                    if (
+                        not manual_v2_login_flow_started
+                        and not profile_submitted
+                        and (
+                            _is_profile_page(current_url, body_text, page)
+                            or "about-you" in str(current_url or "").lower()
+                            or _first_visible_locator(
+                                page,
+                                [
+                                    'input[name="name"]',
+                                    'input[name="age"]',
+                                    'button:has-text("Finish creating account")',
+                                ],
+                            ) is not None
+                        )
+                    ):
+                        manual_v2_contact_seen = True
+                        manual_v2_sms_code_submitted = True
+                        _extend_manual_v2_deadline(1800)
+                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                        emitter.info("浏览器模式2 已进入 about-you 页面，开始自动填写姓名/年龄并提交...", step="create_account")
+                        emitter.info(
+                            f"浏览器本次资料: name={ctx.profile_name}, birthdate={ctx.profile_birthdate}, age={_derive_profile_age(ctx.profile_birthdate)}",
+                            step="create_account",
+                        )
+                        profile_ok, profile_mode = _fill_about_you_profile(page, ctx)
+                        if not profile_ok and profile_mode == "name":
+                            raise RuntimeError("浏览器模式2 在 about-you 页面填写姓名失败")
+                        if not profile_ok and profile_mode in {"birthdate", "age"}:
+                            emitter.warn(
+                                "浏览器模式2 about-you 年龄/生日控件诊断: " + _summarize_about_you_controls(page),
+                                step="create_account",
+                            )
+                            raise RuntimeError("浏览器模式2 在 about-you 页面填写年龄/生日失败")
+                        if not profile_ok and profile_mode == "checkbox":
+                            emitter.warn(
+                                "浏览器模式2 about-you 勾选控件诊断: " + _summarize_about_you_controls(page),
+                                step="create_account",
+                            )
+                            raise RuntimeError("浏览器模式2 在 about-you 页面勾选同意项失败")
+                        previous_url = current_url
+                        previous_body = body_text
+                        if not (
+                            _click_primary_action(
+                                page,
+                                [
+                                    "Finish creating account",
+                                    "完成帐户创建",
+                                    "完成账户创建",
+                                    "Create account",
+                                    "Continue",
+                                    "Next",
+                                    "完成",
+                                    "继续",
+                                ],
+                                allow_generic_fallback=True,
+                            )
+                            or _click_first(
+                                page,
+                                [
+                                    'button[data-dd-action-name="Continue"]',
+                                    'button[type="submit"]:has-text("Finish creating account")',
+                                    'button:has-text("Finish creating account")',
+                                    'button[type="submit"]',
+                                ],
+                                timeout_ms=1500,
+                            )
+                        ):
+                            raise RuntimeError("浏览器模式2 提交 about-you 资料失败")
+                        profile_submitted = True
+                        current_url, body_text = _wait_for_page_stabilize(
+                            previous_url,
+                            previous_body,
+                            step="create_account",
+                            action_label="about-you 资料已提交",
+                            timeout_ms=20000,
+                        )
+                        # 注册前半段 callback 与步骤2 PKCE 不是同一套；资料完成后必须重新拉起登录 OAuth。
+                        callback_state["url"] = ""
+                        if _is_about_you_missing_email_error(current_url, body_text):
+                            emitter.warn(
+                                "浏览器模式2 about-you 提交后命中 authentication missing_email，"
+                                + "资料阶段结束，直接进入步骤2 OAuth 补邮箱/取 Token 流程...",
+                                step="create_email",
+                            )
+                        else:
+                            emitter.success(
+                                "浏览器模式2 已提交 about-you 资料，开始进入步骤2：使用已注册手机号走 OAuth 登录获取 Token...",
+                                step="create_account",
+                            )
+                        _prepare_manual_v2_login_flow(
+                            "浏览器模式2 步骤1（手机注册+资料）已完成，现在进入真正的步骤2 OAuth 登录/补邮箱获取 Token 流程..."
+                        )
+                        continue
+
+                    if (
+                        _is_contact_verification_page(current_url, body_text, page)
+                        and manual_v2_auto_phone_mode
+                        and not manual_v2_login_flow_started
+                        and not str(manual_v2_sms_activation_id or "").strip()
+                        and not password_submitted
+                        and not manual_v2_contact_seen
+                    ):
+                        emitter.warn(
+                            "浏览器模式2 当前页疑似短信验证码页，但步骤1尚未取号；忽略本次识别并继续首页/手机号流程。"
+                            + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                            step="add_phone",
+                        )
+                    if (
+                        not (
+                            _is_profile_page(current_url, body_text, page)
+                            or "about-you" in str(current_url or "").lower()
+                            or "email-verification" in str(current_url or "").lower()
+                            or "add-email" in str(current_url or "").lower()
+                        )
+                        and _is_contact_verification_page(current_url, body_text, page)
+                        # 步骤2登录/补邮箱阶段禁止再走手机短信验证码分支，避免把邮箱 OTP 页当成短信页并复用旧 SMS 码。
+                        and not manual_v2_login_flow_started
+                        and not email_submitted
+                        and not (
+                            manual_v2_auto_phone_mode
+                            and not manual_v2_login_flow_started
+                            and not str(manual_v2_sms_activation_id or "").strip()
+                            and not password_submitted
+                            and not manual_v2_contact_seen
+                        )
+                        and not profile_submitted
+                    ):
                         _extend_manual_v2_deadline(3600)
                         manual_v2_contact_seen = True
                         manual_v2_contact_transition_last_key = ""
@@ -9171,12 +10696,28 @@ def run_browser_registration(
                             current_url, body_text = _wait_for_manual_v2_contact_submit_transition(
                                 current_url,
                                 body_text,
-                                timeout_ms=12000,
+                                timeout_ms=18000,
                             )
-                            if _is_contact_verification_page(current_url, body_text, page):
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            if _is_profile_page(current_url, body_text, page) or "about-you" in str(current_url or "").lower():
+                                emitter.info(
+                                    "浏览器模式2 短信验证码通过后已进入 about-you 资料页，下一轮自动填写姓名/年龄并点击 Finish creating account..."
+                                    + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                    step="create_account",
+                                )
+                            elif _is_contact_verification_page(current_url, body_text, page):
                                 manual_v2_sms_code_submitted = False
                             continue
                         if manual_v2_auto_phone_mode:
+                            if not str(manual_v2_sms_activation_id or "").strip():
+                                manual_v2_contact_seen = False
+                                manual_v2_wait_contact_logged = False
+                                emitter.warn(
+                                    "浏览器模式2 进入短信验证码处理前发现尚未取号（缺少 activation_id），"
+                                    + "回退到步骤1继续手机号流程...",
+                                    step="add_phone",
+                                )
+                                continue
                             if not manual_v2_wait_contact_logged:
                                 manual_v2_wait_contact_logged = True
                                 emitter.info(
@@ -9222,9 +10763,16 @@ def run_browser_registration(
                             current_url, body_text = _wait_for_manual_v2_contact_submit_transition(
                                 current_url,
                                 body_text,
-                                timeout_ms=12000,
+                                timeout_ms=18000,
                             )
-                            if _is_contact_verification_page(current_url, body_text, page):
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            if _is_profile_page(current_url, body_text, page) or "about-you" in str(current_url or "").lower():
+                                emitter.info(
+                                    "浏览器模式2 短信验证码通过后已进入 about-you 资料页，下一轮自动填写姓名/年龄并点击 Finish creating account..."
+                                    + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                    step="create_account",
+                                )
+                            elif _is_contact_verification_page(current_url, body_text, page):
                                 manual_v2_sms_code_submitted = False
                             continue
                         if _manual_contact_verification_ready(page):
@@ -9361,7 +10909,8 @@ def run_browser_registration(
                         and not _is_login_with_bridge_page(current_url, body_text)
                     ):
                         _extend_manual_v2_deadline(1800)
-                        if _click_first(
+                        # 补资料登录流：首页 “Log in” → Continue with phone → 直链兜底（复用步骤1逻辑）
+                        clicked_login = _click_first(
                             page,
                             [
                                 'a:has-text("Log in")',
@@ -9372,18 +10921,66 @@ def run_browser_registration(
                                 '[role="button"]:has-text("登录")',
                             ],
                             timeout_ms=1500,
-                        ):
-                            emitter.info("浏览器模式2 reset-password 后的补资料登录流已点击 ChatGPT 首页“登录”，准备进入手机登录...", step="oauth_init")
+                        )
+                        if clicked_login:
+                            emitter.info(
+                                "浏览器模式2 reset-password 后的补资料登录流已点击 ChatGPT 首页“登录”，准备进入手机登录...",
+                                step="oauth_init",
+                            )
                             _wait_for_load(page, timeout_ms=2500)
+                        current_url, body_text = _describe_page(page, force_refresh=True)
+                        current_url_lower = str(current_url or "").lower()
+                        body_lower = str(body_text or "").lower()
+                        # 若已出现手机入口/手机输入框，继续点 Continue with phone 或标记成功
+                        if _is_phone_input_page(current_url, body_text, page) or _has_phone_input(page):
+                            manual_v2_phone_entry_clicked = True
+                            emitter.info(
+                                "浏览器模式2 补资料登录流已进入手机号输入页，准备自动复用已保存手机号...",
+                                step="oauth_init",
+                            )
                             continue
+                        if _bootstrap_manual_v2_login_entry(current_url, body_text):
+                            current_url, body_text = _describe_page(page, force_refresh=True)
+                            if _is_phone_input_page(current_url, body_text, page) or _has_phone_input(page) or "auth.openai.com" in str(current_url or "").lower() or "chatgpt.com/auth/" in str(current_url or "").lower():
+                                manual_v2_phone_entry_clicked = True
+                                emitter.info(
+                                    "浏览器模式2 补资料登录流已通过手机号入口进入认证流程。",
+                                    step="oauth_init",
+                                )
+                                continue
+                        # 点击后仍停首页：直接走手机号入口直链（与步骤1一致）
+                        if "chatgpt.com" in current_url_lower and "auth.openai.com" not in current_url_lower:
+                            manual_v2_entry_fallback_attempts += 1
+                            if _goto_manual_v2_phone_auth_entry(
+                                reason=(
+                                    "补资料登录流点击登录/手机入口后仍停在首页"
+                                    if clicked_login
+                                    else "补资料登录流未点到登录按钮，准备手机号入口直链"
+                                ),
+                                prefer_login=True,
+                            ):
+                                manual_v2_phone_entry_clicked = True
+                                continue
+                            if manual_v2_entry_fallback_attempts >= 3:
+                                emitter.warn(
+                                    "浏览器模式2 补资料登录流连续多次仍未进入手机号页，下一轮继续重试直链..."
+                                    + f" attempt={manual_v2_entry_fallback_attempts}",
+                                    step="oauth_init",
+                                )
+                        continue
 
                     if (
-                        manual_v2_contact_seen
-                        and not manual_v2_login_flow_started
-                        and _is_profile_page(current_url, body_text)
+                        not manual_v2_login_flow_started
                         and not profile_submitted
+                        and (
+                            _is_profile_page(current_url, body_text, page)
+                            or "about-you" in str(current_url or "").lower()
+                        )
                     ):
+                        # 短信验证后即使 contact_seen 标志丢失，也要能进入资料页。
+                        manual_v2_contact_seen = True
                         _extend_manual_v2_deadline(1800)
+                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
                         emitter.info("浏览器模式2 已进入 about-you 页面，复用资料填写流程...", step="create_account")
                         emitter.info(
                             f"浏览器本次资料: name={ctx.profile_name}, birthdate={ctx.profile_birthdate}, age={_derive_profile_age(ctx.profile_birthdate)}",
@@ -9406,7 +11003,32 @@ def run_browser_registration(
                             raise RuntimeError("浏览器模式2 在 about-you 页面勾选同意项失败")
                         previous_url = current_url
                         previous_body = body_text
-                        if not _click_primary_action(page, ["完成帐户创建", "完成账户创建", "Continue", "Next", "Create account", "完成", "继续"]):
+                        if not (
+                            _click_primary_action(
+                                page,
+                                [
+                                    "Finish creating account",
+                                    "完成帐户创建",
+                                    "完成账户创建",
+                                    "Create account",
+                                    "Continue",
+                                    "Next",
+                                    "完成",
+                                    "继续",
+                                ],
+                                allow_generic_fallback=True,
+                            )
+                            or _click_first(
+                                page,
+                                [
+                                    'button[data-dd-action-name="Continue"]',
+                                    'button[type="submit"]:has-text("Finish creating account")',
+                                    'button:has-text("Finish creating account")',
+                                    'button[type="submit"]',
+                                ],
+                                timeout_ms=1500,
+                            )
+                        ):
                             raise RuntimeError("浏览器模式2 提交 about-you 资料失败")
                         profile_submitted = True
                         current_url, body_text = _wait_for_page_stabilize(
@@ -9465,7 +11087,20 @@ def run_browser_registration(
                             _prepare_manual_v2_login_flow("浏览器模式2 正在清理注册残留状态，并重新打开手机登录流程...")
                         continue
 
-                    if manual_v2_contact_seen and not manual_v2_login_flow_started:
+                    if (
+                        manual_v2_contact_seen
+                        and not manual_v2_login_flow_started
+                        # 仍在手机短信验证码页且还没提交时，禁止进入“提交后过渡观察”，
+                        # 否则会和上方真正的短信填码分支形成死循环空转。
+                        and not (
+                            not manual_v2_sms_code_submitted
+                            and (
+                                "contact-verification" in current_url_lower
+                                or "verify-phone" in current_url_lower
+                                or _is_contact_verification_page(current_url, body_text, page)
+                            )
+                        )
+                    ):
                         if _is_retryable_error_page(current_url, body_text):
                             if _try_recover_timeout_error_page(
                                 current_url,
@@ -9519,6 +11154,70 @@ def run_browser_registration(
                                 _wait_for_load(page, timeout_ms=2000)
                             _sleep_with_page(page, 800)
                             continue
+                        # 短信提交后已进入资料页：结束过渡观察，交给 about-you 分支。
+                        if _is_profile_page(current_url, body_text, page) or "about-you" in current_url_lower:
+                            manual_v2_sms_code_submitted = True
+                            manual_v2_contact_transition_last_key = ""
+                            emitter.info(
+                                "浏览器模式2 短信验证码提交后已进入 about-you 资料页，结束过渡观察并进入资料填写..."
+                                + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                step="create_account",
+                            )
+                            continue
+                        # 若因误重拉 OAuth 落到 create-account 邮箱页，不要当正常过渡空转；
+                        # 有 activation 说明本轮手机注册仍有效，优先尝试回到首页/auth 自然流而非卡死。
+                        if (
+                            manual_v2_sms_code_submitted
+                            and "auth.openai.com/create-account" in current_url_lower
+                            and "password" not in current_url_lower
+                            and "about-you" not in current_url_lower
+                        ):
+                            emitter.warn(
+                                "浏览器模式2 短信验证码提交后落到 create-account 邮箱页（通常由中途误重拉 OAuth 引起），"
+                                + "保留手机号上下文并继续短等/提升页面，不再空转过渡观察..."
+                                + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                step="phone_verification",
+                            )
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                            if _is_profile_page(current_url, body_text, page) or "about-you" in str(current_url or "").lower():
+                                continue
+                            # 给站点一次自然恢复机会；若持续停留再由主循环其它分支处理。
+                            _sleep_with_page(page, 1200)
+                            continue
+
+                        # 若其实还停在短信验证码页，说明要么码未提交成功，要么提交后仍需重填。
+                        if (
+                            "contact-verification" in current_url_lower
+                            or "verify-phone" in current_url_lower
+                            or _is_contact_verification_page(current_url, body_text, page)
+                        ):
+                            if manual_v2_sms_code_submitted:
+                                emitter.info(
+                                    "浏览器模式2 短信验证码提交后仍停留在 contact-verification，继续短等站点跳转..."
+                                    + f" current_url={_mask_secret(current_url, head=56, tail=12)}"
+                                    + f", state={_classify_page_state(current_url, body_text, page)}",
+                                    step="phone_verification",
+                                )
+                                current_url, body_text = _wait_for_manual_v2_contact_submit_transition(
+                                    current_url,
+                                    body_text,
+                                    timeout_ms=8000,
+                                )
+                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                                if _is_contact_verification_page(current_url, body_text, page) or (
+                                    "contact-verification" in str(current_url or "").lower()
+                                ):
+                                    manual_v2_sms_code_submitted = False
+                                    manual_v2_wait_contact_logged = False
+                                    emitter.warn(
+                                        "浏览器模式2 短信验证码提交后仍在 contact-verification，准备重新填写/提交验证码...",
+                                        step="phone_verification",
+                                    )
+                                continue
+                            # 未提交却进了过渡分支：放行回主循环真正填码。
+                            manual_v2_contact_transition_last_key = ""
+                            continue
+
                         transition_state = _classify_page_state(current_url, body_text, page)
                         transition_key = f"{transition_state}|{str(current_url or '').strip().lower()}"
                         if transition_key != manual_v2_contact_transition_last_key:
