@@ -2162,13 +2162,78 @@ def _fetch_browser_session_payload(
                 pass
 
 
+def _has_visible_password_input(page: Any) -> bool:
+    if page is None:
+        return False
+    return _first_visible_locator(
+        page,
+        [
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[name="new-password"]',
+            'input[autocomplete="new-password"]',
+            'input[autocomplete="current-password"]',
+            'input[id*="password" i]',
+        ],
+    ) is not None
+
+
+def _has_visible_about_you_controls(page: Any) -> bool:
+    if page is None:
+        return False
+    return _first_visible_locator(
+        page,
+        [
+            'input[name="name"][autocomplete="name"]',
+            'input[name="name"][placeholder*="Full name" i]',
+            'input[name="name"]',
+            'input[name="age"]',
+            'input[placeholder="Age"]',
+            'input[placeholder*="Age" i]',
+            'button:has-text("Finish creating account")',
+            '[type="submit"]:has-text("Finish creating account")',
+        ],
+    ) is not None
+
+
 def _is_profile_page(url: str, body_text: str, page: Any = None) -> bool:
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
     body_text_value = str(body_text or "")
+
+    # 密码创建/登录页绝不能当 about-you；否则会跳过短信并误填资料。
+    if any(
+        token in url_lower
+        for token in (
+            "/create-account/password",
+            "/log-in/password",
+            "/reset-password/new-password",
+            "/reset-password",
+        )
+    ):
+        return False
+
+    # 可见密码框 + 创建密码文案：明确是密码页，不是资料页。
+    # 深文案/脚本里可能误含 birthday/full name 等词，不能仅靠正文关键词。
+    if page is not None and _has_visible_password_input(page):
+        if (
+            "create a password" in body_lower
+            or "create password" in body_lower
+            or "创建密码" in body_text_value
+            or "you'll use this password" in body_lower
+            or "you will use this password" in body_lower
+            or "/create-account/" in url_lower
+        ):
+            return False
+        # 密码框仍在且没有明确 about-you 控件时，也不当资料页。
+        if "about-you" not in url_lower and not _has_visible_about_you_controls(page):
+            return False
+
     if "about-you" in url_lower:
         return True
-    if any(
+
+    # 正文关键词仅作弱信号：若有 page，必须同时看到 name/age 控件，避免脚本/隐藏文案误触发。
+    body_looks_like_profile = any(
         token in body_lower
         for token in (
             "let's confirm your age",
@@ -2194,22 +2259,20 @@ def _is_profile_page(url: str, body_text: str, page: Any = None) -> bool:
             "完成帐户创建",
             "完成账户创建",
         )
-    ):
-        return True
-    if page is not None:
-        if _first_visible_locator(
-            page,
-            [
-                'input[name="name"][autocomplete="name"]',
-                'input[name="name"][placeholder*="Full name" i]',
-                'input[name="age"]',
-                'input[placeholder="Age"]',
-                'input[placeholder*="Age" i]',
-                'button:has-text("Finish creating account")',
-                '[type="submit"]:has-text("Finish creating account")',
-            ],
-        ) is not None:
+    )
+    if body_looks_like_profile:
+        if page is None:
             return True
+        if _has_visible_about_you_controls(page):
+            return True
+        # 无可见资料控件时，不因深文案/脚本关键词误判。
+        return False
+
+    if page is not None and _has_visible_about_you_controls(page):
+        # 排除密码页残留 DOM 误命中。
+        if _has_visible_password_input(page) and "about-you" not in url_lower:
+            return False
+        return True
     return False
 
 
@@ -5684,19 +5747,26 @@ def _classify_page_state(url: str, body_text: str, page: Any) -> str:
         return "blank"
     if any(keyword in url_lower for keyword in ("consent", "workspace", "organization")):
         return "workspace"
+    # 密码页优先于 profile：create-account/password 停留时绝不能被标成 profile。
+    if (
+        "/create-account/password" in url_lower
+        or "/log-in/password" in url_lower
+        or _is_create_account_password_page(url, body_text, page)
+        or (
+            _has_visible_password_input(page)
+            and (
+                "create a password" in body_lower
+                or "create password" in body_lower
+                or "创建密码" in str(body_text or "")
+            )
+        )
+    ):
+        return "password"
     if _is_profile_page(url, body_text, page):
         return "profile"
     if _is_otp_page(url, body_text, page):
         return "otp_ready" if _is_otp_page_ready(url, body_text, page) else "otp_loading"
-    if _first_visible_locator(
-        page,
-        [
-            'input[type="password"]',
-            'input[name="password"]',
-            'input[name="new-password"]',
-            'input[autocomplete="new-password"]',
-        ],
-    ) is not None:
+    if _has_visible_password_input(page):
         return "password"
     if _first_visible_locator(
         page,
@@ -10508,26 +10578,50 @@ def run_browser_registration(
                         continue
 
                     # about-you 优先：一旦到资料页，立刻填写，禁止回流短信验证码循环。
+                    # 仍停在 create-account/password 时绝不进资料分支，否则会跳过短信并误失败。
                     if (
                         not manual_v2_login_flow_started
                         and not profile_submitted
+                        and not _is_create_account_password_page(current_url, body_text, page)
+                        and not (
+                            _has_visible_password_input(page)
+                            and (
+                                "create a password" in str(body_text or "").lower()
+                                or "create password" in str(body_text or "").lower()
+                                or "/create-account/password" in str(current_url or "").lower()
+                            )
+                        )
                         and (
-                            _is_profile_page(current_url, body_text, page)
-                            or "about-you" in str(current_url or "").lower()
-                            or _first_visible_locator(
-                                page,
-                                [
-                                    'input[name="name"]',
-                                    'input[name="age"]',
-                                    'button:has-text("Finish creating account")',
-                                ],
-                            ) is not None
+                            "about-you" in str(current_url or "").lower()
+                            or _is_profile_page(current_url, body_text, page)
+                            or (
+                                _has_visible_about_you_controls(page)
+                                and not _has_visible_password_input(page)
+                            )
                         )
                     ):
                         manual_v2_contact_seen = True
+                        # 仅在真正进入资料页后才标记短信已完成；密码页误判时不能短路接码。
                         manual_v2_sms_code_submitted = True
                         _extend_manual_v2_deadline(1800)
                         page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                        # promote 后若其实仍在密码页，立即退出本分支，交给密码/短信流程。
+                        if (
+                            _is_create_account_password_page(current_url, body_text, page)
+                            or (
+                                _has_visible_password_input(page)
+                                and "about-you" not in str(current_url or "").lower()
+                                and not _has_visible_about_you_controls(page)
+                            )
+                        ):
+                            manual_v2_sms_code_submitted = False
+                            emitter.warn(
+                                "浏览器模式2 资料页判定后复核仍为密码页，取消 about-you 短路并继续密码/短信流程..."
+                                + f" current_url={_mask_secret(current_url, head=72, tail=18)}"
+                                + f", state={_classify_page_state(current_url, body_text, page)}",
+                                step="create_password",
+                            )
+                            continue
                         emitter.info("浏览器模式2 已进入 about-you 页面，开始自动填写姓名/年龄并提交...", step="create_account")
                         emitter.info(
                             f"浏览器本次资料: name={ctx.profile_name}, birthdate={ctx.profile_birthdate}, age={_derive_profile_age(ctx.profile_birthdate)}",
@@ -10972,6 +11066,12 @@ def run_browser_registration(
                     if (
                         not manual_v2_login_flow_started
                         and not profile_submitted
+                        and not _is_create_account_password_page(current_url, body_text, page)
+                        and not (
+                            _has_visible_password_input(page)
+                            and "about-you" not in str(current_url or "").lower()
+                            and not _has_visible_about_you_controls(page)
+                        )
                         and (
                             _is_profile_page(current_url, body_text, page)
                             or "about-you" in str(current_url or "").lower()
@@ -10981,6 +11081,20 @@ def run_browser_registration(
                         manual_v2_contact_seen = True
                         _extend_manual_v2_deadline(1800)
                         page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                        if (
+                            _is_create_account_password_page(current_url, body_text, page)
+                            or (
+                                _has_visible_password_input(page)
+                                and "about-you" not in str(current_url or "").lower()
+                                and not _has_visible_about_you_controls(page)
+                            )
+                        ):
+                            emitter.warn(
+                                "浏览器模式2 复用资料流程前复核仍为密码页，跳过 about-you 填写..."
+                                + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                step="create_password",
+                            )
+                            continue
                         emitter.info("浏览器模式2 已进入 about-you 页面，复用资料填写流程...", step="create_account")
                         emitter.info(
                             f"浏览器本次资料: name={ctx.profile_name}, birthdate={ctx.profile_birthdate}, age={_derive_profile_age(ctx.profile_birthdate)}",
