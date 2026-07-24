@@ -171,6 +171,14 @@ SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "阿根廷",
 }
 
+# 自动国家：同国连续注册失败达到阈值后临时软禁，避免反复烧同国号码。
+SMS_COUNTRY_SOFT_BAN_FAIL_THRESHOLD = 3
+SMS_COUNTRY_SOFT_BAN_SECONDS = 5 * 60
+_SMS_COUNTRY_SOFT_BAN_LOCK = threading.Lock()
+_SMS_COUNTRY_FAILURE_STREAK: Dict[str, int] = {}
+_SMS_COUNTRY_SOFT_BAN_UNTIL: Dict[str, float] = {}
+_SMS_COUNTRY_SOFT_BAN_META: Dict[str, Dict[str, Any]] = {}
+
 
 def normalize_handler_api_country(value: Any, *, default: int = 16, allow_zero: bool = False) -> int:
     try:
@@ -251,6 +259,149 @@ def is_smsbower_excluded_country(*, iso_code: Any = "", name: Any = "", api_name
         str(api_name or "").strip().lower(),
     ]
     return any(any(blocked in text for blocked in SMSBOWER_EXCLUDED_COUNTRY_NAMES) for text in haystacks if text)
+
+
+def _sms_country_soft_ban_key(
+    *,
+    country_id: Any = None,
+    iso_code: Any = "",
+    name: Any = "",
+) -> str:
+    parsed_id = None
+    try:
+        if country_id is not None and str(country_id).strip() != "":
+            parsed_id = int(str(country_id).strip())
+    except (TypeError, ValueError):
+        parsed_id = None
+    if parsed_id is not None and parsed_id > 0:
+        return f"id:{parsed_id}"
+    normalized_iso = str(iso_code or "").strip().upper()
+    if normalized_iso and normalized_iso not in {"AUTO", "0"}:
+        return f"iso:{normalized_iso}"
+    display_name = str(name or "").strip().lower()
+    if display_name:
+        return f"name:{display_name}"
+    return ""
+
+
+def _purge_expired_sms_country_soft_bans(now: Optional[float] = None) -> None:
+    current = float(now if now is not None else time.time())
+    expired = [key for key, until in _SMS_COUNTRY_SOFT_BAN_UNTIL.items() if float(until or 0.0) <= current]
+    for key in expired:
+        _SMS_COUNTRY_SOFT_BAN_UNTIL.pop(key, None)
+        _SMS_COUNTRY_SOFT_BAN_META.pop(key, None)
+
+
+def is_sms_country_soft_banned(
+    *,
+    country_id: Any = None,
+    iso_code: Any = "",
+    name: Any = "",
+) -> bool:
+    key = _sms_country_soft_ban_key(country_id=country_id, iso_code=iso_code, name=name)
+    if not key:
+        return False
+    now = time.time()
+    with _SMS_COUNTRY_SOFT_BAN_LOCK:
+        _purge_expired_sms_country_soft_bans(now)
+        until = float(_SMS_COUNTRY_SOFT_BAN_UNTIL.get(key) or 0.0)
+        return until > now
+
+
+def get_sms_country_soft_ban_remaining_seconds(
+    *,
+    country_id: Any = None,
+    iso_code: Any = "",
+    name: Any = "",
+) -> int:
+    key = _sms_country_soft_ban_key(country_id=country_id, iso_code=iso_code, name=name)
+    if not key:
+        return 0
+    now = time.time()
+    with _SMS_COUNTRY_SOFT_BAN_LOCK:
+        _purge_expired_sms_country_soft_bans(now)
+        until = float(_SMS_COUNTRY_SOFT_BAN_UNTIL.get(key) or 0.0)
+        if until <= now:
+            return 0
+        return max(1, int(until - now + 0.999))
+
+
+def note_sms_country_registration_success(
+    *,
+    country_id: Any = None,
+    iso_code: Any = "",
+    name: Any = "",
+) -> Dict[str, Any]:
+    key = _sms_country_soft_ban_key(country_id=country_id, iso_code=iso_code, name=name)
+    if not key:
+        return {"ok": False, "reason": "missing_country"}
+    with _SMS_COUNTRY_SOFT_BAN_LOCK:
+        _SMS_COUNTRY_FAILURE_STREAK.pop(key, None)
+        # 成功只清连败，不提前解禁（解禁走 TTL）；若已在禁期内仍保持禁期。
+        return {
+            "ok": True,
+            "key": key,
+            "failure_streak": 0,
+            "soft_banned": bool(float(_SMS_COUNTRY_SOFT_BAN_UNTIL.get(key) or 0.0) > time.time()),
+        }
+
+
+def note_sms_country_registration_failure(
+    *,
+    country_id: Any = None,
+    iso_code: Any = "",
+    name: Any = "",
+    threshold: int = SMS_COUNTRY_SOFT_BAN_FAIL_THRESHOLD,
+    ban_seconds: int = SMS_COUNTRY_SOFT_BAN_SECONDS,
+) -> Dict[str, Any]:
+    key = _sms_country_soft_ban_key(country_id=country_id, iso_code=iso_code, name=name)
+    if not key:
+        return {"ok": False, "reason": "missing_country", "banned": False}
+    try:
+        fail_threshold = max(1, int(threshold))
+    except (TypeError, ValueError):
+        fail_threshold = SMS_COUNTRY_SOFT_BAN_FAIL_THRESHOLD
+    try:
+        ban_ttl = max(30, int(ban_seconds))
+    except (TypeError, ValueError):
+        ban_ttl = SMS_COUNTRY_SOFT_BAN_SECONDS
+    now = time.time()
+    display_name = str(name or "").strip() or str(iso_code or "").strip().upper() or str(country_id or "").strip() or key
+    with _SMS_COUNTRY_SOFT_BAN_LOCK:
+        _purge_expired_sms_country_soft_bans(now)
+        streak = int(_SMS_COUNTRY_FAILURE_STREAK.get(key) or 0) + 1
+        _SMS_COUNTRY_FAILURE_STREAK[key] = streak
+        banned = False
+        until = float(_SMS_COUNTRY_SOFT_BAN_UNTIL.get(key) or 0.0)
+        if streak >= fail_threshold:
+            until = now + float(ban_ttl)
+            _SMS_COUNTRY_SOFT_BAN_UNTIL[key] = until
+            _SMS_COUNTRY_SOFT_BAN_META[key] = {
+                "country_id": country_id,
+                "iso_code": str(iso_code or "").strip().upper(),
+                "name": display_name,
+                "failure_streak": streak,
+                "banned_at": now,
+                "ban_seconds": ban_ttl,
+            }
+            # 进入软禁后清零连败，便于解禁后重新累计。
+            _SMS_COUNTRY_FAILURE_STREAK[key] = 0
+            banned = True
+        remaining = max(0, int(until - now + 0.999)) if until > now else 0
+        return {
+            "ok": True,
+            "key": key,
+            "country_id": country_id,
+            "iso_code": str(iso_code or "").strip().upper(),
+            "name": display_name,
+            "failure_streak": 0 if banned else streak,
+            "failure_streak_before_reset": streak,
+            "threshold": fail_threshold,
+            "banned": banned or until > now,
+            "just_banned": banned,
+            "ban_seconds": ban_ttl if banned else remaining,
+            "remaining_seconds": remaining if (banned or until > now) else 0,
+        }
 
 
 def parse_price_range(value: Any) -> tuple[Optional[float], Optional[float]]:
@@ -1194,6 +1345,30 @@ class HeroSMSProvider(SMSProvider):
                 default=16,
                 allow_zero=self._supports_global_auto_country(),
             )
+        # 固定国家模式：若该国因连败被软禁，直接拒绝取号，避免 5 分钟内反复烧号。
+        if (
+            selected_country_id
+            and selected_country_id != SMSBOWER_AUTO_COUNTRY_ID
+            and is_sms_country_soft_banned(
+                country_id=selected_country_id,
+                iso_code=selection.get("iso_code") or selection.get("country_iso_code"),
+                name=selection.get("name") or selection.get("country_name"),
+            )
+        ):
+            remaining = get_sms_country_soft_ban_remaining_seconds(
+                country_id=selected_country_id,
+                iso_code=selection.get("iso_code") or selection.get("country_iso_code"),
+                name=selection.get("name") or selection.get("country_name"),
+            )
+            country_label = (
+                str(selection.get("name") or selection.get("country_name") or "").strip()
+                or str(selection.get("iso_code") or "").strip().upper()
+                or str(selected_country_id)
+            )
+            raise HeroSMSAcquireRetryableError(
+                f"{provider_label} 国家 {country_label} 因连续注册失败已被临时禁取，"
+                + f"请约 {remaining} 秒后再试，或切换其他国家/自动国家模式。"
+            )
         selected_operator = str(selection.get("selected_operator") or "").strip()
         operator_was_auto_selected = not str(self.operator or "").strip() and bool(selected_operator)
         price_tier_options = selection.get("price_tier_options") if isinstance(selection.get("price_tier_options"), list) else []
@@ -1561,6 +1736,39 @@ class HeroSMSProvider(SMSProvider):
                         raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
                     continue
                 raise HeroSMSAcquireRetryableError(_build_failure_message(last_error))
+            if (
+                auto_country_mode
+                and is_sms_country_soft_banned(
+                    country_id=selected_country_id,
+                    iso_code=str(selection.get("iso_code") or "").strip().upper(),
+                    name=selection.get("name"),
+                )
+            ):
+                remaining = get_sms_country_soft_ban_remaining_seconds(
+                    country_id=selected_country_id,
+                    iso_code=str(selection.get("iso_code") or "").strip().upper(),
+                    name=selection.get("name"),
+                )
+                debug_events.append(
+                    f"第 {attempt} 次尝试命中连败软禁国家：{str(selection.get('name') or '-')} "
+                    + f"(ID {selected_country_id})，剩余约 {remaining}s，已取消并切换下一国家候选"
+                )
+                try:
+                    self.cancel(activation_id, proxy=proxy)
+                except Exception:
+                    pass
+                last_error = (
+                    f"{provider_label} 自动国家模式命中连败软禁国家，已废弃当前号码: "
+                    + f"country={selected_country_id}, name={str(selection.get('name') or '-').strip() or '-'}, "
+                    + f"remaining={remaining}s"
+                )
+                if country_candidate_index + 1 < len(country_candidates):
+                    country_candidate_index += 1
+                    _apply_country_selection(country_candidates[country_candidate_index])
+                    if _interruptible_sleep(1.0, stop_event):
+                        raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
+                    continue
+                raise HeroSMSAcquireRetryableError(_build_failure_message(last_error))
             balance_after = self.get_balance(proxy=proxy)
             debug_events.append(
                 f"第 {attempt} 次尝试成功，运营商 {current_operator or 'ANY'}，实际成交价 ${actual_cost if actual_cost is not None else data.get('activationCost')}，"
@@ -1591,6 +1799,7 @@ class HeroSMSProvider(SMSProvider):
                 "selected_operator_count": selection.get("selected_operator_count"),
                 "auto_country_mode": auto_country_mode,
                 "country_candidates_total": len(country_candidates) if auto_country_mode else 0,
+                "soft_banned_countries_skipped": int(selection.get("soft_banned_countries_skipped") or 0),
                 "balance_before": balance_before,
                 "balance_after": balance_after,
                 "debug_events": debug_events,
@@ -1893,6 +2102,7 @@ class SMSBowerProvider(HeroSMSProvider):
                     continue
                 countries_by_id[parsed_country_id] = normalize_handler_api_country_row(country_id=parsed_country_id)
         candidates: List[Dict[str, Any]] = []
+        soft_banned_skipped = 0
         for country_id, base_country in countries_by_id.items():
             if is_virtual_phone_country_name(base_country.get("name")) or is_virtual_phone_country_name(base_country.get("api_name")):
                 continue
@@ -1901,6 +2111,13 @@ class SMSBowerProvider(HeroSMSProvider):
                 name=base_country.get("name"),
                 api_name=base_country.get("api_name"),
             ):
+                continue
+            if is_sms_country_soft_banned(
+                country_id=country_id,
+                iso_code=base_country.get("iso_code"),
+                name=base_country.get("name"),
+            ):
+                soft_banned_skipped += 1
                 continue
             parsed_rows = self._extract_country_price_options(raw_matrix, country_id, self.service)
             if not parsed_rows:
@@ -1948,6 +2165,9 @@ class SMSBowerProvider(HeroSMSProvider):
                 int(item.get("hero_sms_country") or 0),
             )
         )
+        if soft_banned_skipped > 0:
+            for item in candidates:
+                item["soft_banned_countries_skipped"] = soft_banned_skipped
         return candidates
 
     def resolve_country_and_operator(self, *, proxy: str = "") -> Dict[str, Any]:
@@ -1968,6 +2188,9 @@ class SMSBowerProvider(HeroSMSProvider):
         first["country_candidates"] = [dict(item) for item in candidates]
         first["auto_country_mode"] = True
         first["selected_country_count"] = len(candidates)
+        soft_banned_skipped = int(first.get("soft_banned_countries_skipped") or 0)
+        if soft_banned_skipped > 0:
+            first["soft_banned_countries_skipped"] = soft_banned_skipped
         return first
 
     def _get_status(self, activation_id: str, *, proxy: str = "") -> Dict[str, Any]:

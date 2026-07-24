@@ -24,9 +24,29 @@ try:
 except ImportError:
     from fingerprint_profile import FingerprintProfile, describe_fingerprint  # type: ignore
 try:
-    from .sms_providers import DEFAULT_PHONE_COUNTRIES, HANDLER_API_PROVIDER_LABELS, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, HeroSMSAcquireRetryableError, HeroSMSAcquireStoppedError, normalize_handler_api_country, schedule_hero_sms_delayed_cancel
+    from .sms_providers import (
+        DEFAULT_PHONE_COUNTRIES,
+        HANDLER_API_PROVIDER_LABELS,
+        HERO_SMS_CANCEL_MIN_WAIT_SECONDS,
+        HeroSMSAcquireRetryableError,
+        HeroSMSAcquireStoppedError,
+        normalize_handler_api_country,
+        note_sms_country_registration_failure,
+        note_sms_country_registration_success,
+        schedule_hero_sms_delayed_cancel,
+    )
 except ImportError:
-    from sms_providers import DEFAULT_PHONE_COUNTRIES, HANDLER_API_PROVIDER_LABELS, HERO_SMS_CANCEL_MIN_WAIT_SECONDS, HeroSMSAcquireRetryableError, HeroSMSAcquireStoppedError, normalize_handler_api_country, schedule_hero_sms_delayed_cancel  # type: ignore
+    from sms_providers import (  # type: ignore
+        DEFAULT_PHONE_COUNTRIES,
+        HANDLER_API_PROVIDER_LABELS,
+        HERO_SMS_CANCEL_MIN_WAIT_SECONDS,
+        HeroSMSAcquireRetryableError,
+        HeroSMSAcquireStoppedError,
+        normalize_handler_api_country,
+        note_sms_country_registration_failure,
+        note_sms_country_registration_success,
+        schedule_hero_sms_delayed_cancel,
+    )
 
 
 DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
@@ -6594,6 +6614,10 @@ def run_browser_registration(
     manual_v2_sms_activation_id = ""
     manual_v2_sms_provider_done = False
     manual_v2_sms_purchased_at = 0.0
+    manual_v2_sms_country_id: Any = None
+    manual_v2_sms_country_iso = ""
+    manual_v2_sms_country_name = ""
+    manual_v2_sms_country_result_recorded = False
     manual_v2_cached_sms_code = ""
     manual_v2_contact_network_seen = False
     manual_v2_wait_phone_logged = False
@@ -8572,6 +8596,7 @@ def run_browser_registration(
 
     def _ensure_manual_v2_auto_phone(*, step: str, prompt: str) -> str:
         nonlocal manual_v2_phone_number, manual_v2_sms_activation_id, manual_v2_sms_provider_done, manual_v2_sms_purchased_at
+        nonlocal manual_v2_sms_country_id, manual_v2_sms_country_iso, manual_v2_sms_country_name, manual_v2_sms_country_result_recorded
         if manual_v2_phone_number:
             return manual_v2_phone_number
         if not manual_v2_auto_phone_mode or sms_provider is None:
@@ -8582,6 +8607,13 @@ def run_browser_registration(
         operator_options = sms_order.get("operator_options") if isinstance(sms_order.get("operator_options"), list) else []
         auto_country_mode = bool(sms_order.get("auto_country_mode"))
         candidate_country_total = int(sms_order.get("country_candidates_total") or 0)
+        soft_banned_skipped = int(sms_order.get("soft_banned_countries_skipped") or 0)
+        if soft_banned_skipped > 0:
+            emitter.info(
+                f"浏览器模式2 {manual_v2_auto_phone_provider_label} 自动国家候选已跳过 {soft_banned_skipped} 个"
+                + "连败软禁国家（同国连续 3 次注册失败会禁 5 分钟）。",
+                step=step,
+            )
         if price_tier_options:
             preview_rows = []
             for item in price_tier_options[:8]:
@@ -8654,6 +8686,10 @@ def run_browser_registration(
         manual_v2_sms_activation_id = str(sms_order.get("activation_id") or "").strip()
         manual_v2_sms_purchased_at = time.time()
         manual_v2_sms_provider_done = False
+        manual_v2_sms_country_id = sms_order.get("country")
+        manual_v2_sms_country_iso = str(sms_order.get("country_iso_code") or "").strip().upper()
+        manual_v2_sms_country_name = str(sms_order.get("country_name") or "").strip()
+        manual_v2_sms_country_result_recorded = False
         if not manual_v2_phone_number or not manual_v2_sms_activation_id:
             raise RuntimeError("浏览器模式2 自动取号失败：缺少手机号或 activation_id")
         sms_provider.mark_ready(manual_v2_sms_activation_id, proxy=ctx.proxy)
@@ -8894,9 +8930,67 @@ def run_browser_registration(
             )
         return True
 
+    def _record_manual_v2_sms_country_result(*, success: bool) -> None:
+        nonlocal manual_v2_sms_country_result_recorded
+        if manual_v2_sms_country_result_recorded:
+            return
+        if not manual_v2_auto_phone_mode:
+            return
+        if manual_v2_sms_country_id is None and not manual_v2_sms_country_iso and not manual_v2_sms_country_name:
+            return
+        manual_v2_sms_country_result_recorded = True
+        try:
+            if success:
+                note_sms_country_registration_success(
+                    country_id=manual_v2_sms_country_id,
+                    iso_code=manual_v2_sms_country_iso,
+                    name=manual_v2_sms_country_name,
+                )
+                return
+            ban_info = note_sms_country_registration_failure(
+                country_id=manual_v2_sms_country_id,
+                iso_code=manual_v2_sms_country_iso,
+                name=manual_v2_sms_country_name,
+            )
+            if not isinstance(ban_info, dict) or not ban_info.get("ok"):
+                return
+            country_label = (
+                str(ban_info.get("name") or "").strip()
+                or manual_v2_sms_country_name
+                or manual_v2_sms_country_iso
+                or str(manual_v2_sms_country_id or "")
+                or "-"
+            )
+            if ban_info.get("just_banned"):
+                emitter.warn(
+                    f"浏览器模式2 国家 {country_label} 已连续注册失败 "
+                    + f"{ban_info.get('failure_streak_before_reset') or ban_info.get('threshold') or 3} 次，"
+                    + f"自动国家模式将禁取该国约 {ban_info.get('ban_seconds') or 300} 秒。",
+                    step="runtime",
+                )
+            else:
+                streak = int(ban_info.get("failure_streak") or 0)
+                threshold = int(ban_info.get("threshold") or 3)
+                if streak > 0:
+                    emitter.info(
+                        f"浏览器模式2 国家 {country_label} 注册失败连败 {streak}/{threshold}；"
+                        + f"达到 {threshold} 次将临时禁取该国 5 分钟。",
+                        step="runtime",
+                    )
+        except Exception as exc:
+            try:
+                emitter.warn(
+                    f"浏览器模式2 记录短信国家连败状态失败: {exc}",
+                    step="runtime",
+                )
+            except Exception:
+                pass
+
     def _finish_manual_v2_sms_provider(*, success: bool) -> None:
         nonlocal manual_v2_sms_provider_done, manual_v2_sms_purchased_at
         if sms_provider is None or not manual_v2_sms_activation_id or manual_v2_sms_provider_done:
+            if success or (manual_v2_sms_activation_id and not manual_v2_sms_country_result_recorded):
+                _record_manual_v2_sms_country_result(success=success)
             return
         try:
             if success:
@@ -8961,6 +9055,7 @@ def run_browser_registration(
                 )
             except Exception:
                 pass
+        _record_manual_v2_sms_country_result(success=success)
         manual_v2_sms_provider_done = True
 
     def _restart_manual_v2_login_oauth(reason: str) -> bool:
