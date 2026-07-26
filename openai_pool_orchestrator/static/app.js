@@ -65,6 +65,12 @@ let suppressHeroSmsPriceTierChange = false;
 let suppressHeroSmsPriceTierChangeReleaseTimer = null;
 let lastManualHeroSmsTargetPrice = '';
 
+const SMS_PROVIDER_PROFILE_MODES = ['hero_sms', 'smsbower'];
+// 两档接码平台各存一份完整表单值，切换来源时互不覆盖
+let smsProviderProfiles = { hero_sms: null, smsbower: null };
+// 记录切换前生效的来源：change 事件触发时下拉框已是新值，只能靠这个找回旧档
+let lastAutoSmsProviderMode = 'manual';
+
 function getCurrentAutoSmsProviderMode() {
   return String(DOM.browserManualV2PhoneMode?.value || 'manual').trim().toLowerCase();
 }
@@ -92,6 +98,85 @@ function normalizeHeroSmsCountryForProvider(rawCountryValue = '', providerMode =
   const text = String(rawCountryValue ?? '').trim();
   if (normalizedProviderMode !== 'smsbower' && text === '0') return '16';
   return text || '16';
+}
+
+function emptySmsProviderProfile() {
+  return {
+    hero_sms_api_key: '',
+    hero_sms_service: '',
+    hero_sms_country: 16,
+    hero_sms_operator: '',
+    hero_sms_target_price: '',
+    hero_sms_fixed_price: true,
+    hero_sms_max_acquire_retries: 5,
+  };
+}
+
+function normalizeSmsProviderProfile(raw, providerMode) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const parsedCountry = parseInt(normalizeHeroSmsCountryForProvider(source.hero_sms_country ?? '', providerMode), 10);
+  const parsedRetries = parseInt(source.hero_sms_max_acquire_retries, 10);
+  return {
+    hero_sms_api_key: String(source.hero_sms_api_key || '').trim(),
+    hero_sms_service: String(source.hero_sms_service || '').trim(),
+    hero_sms_country: Number.isNaN(parsedCountry) ? 16 : parsedCountry,
+    hero_sms_operator: String(source.hero_sms_operator || '').trim(),
+    hero_sms_target_price: String(source.hero_sms_target_price || '').trim(),
+    hero_sms_fixed_price: source.hero_sms_fixed_price !== false,
+    hero_sms_max_acquire_retries: Number.isNaN(parsedRetries) ? 5 : Math.min(20, Math.max(1, parsedRetries)),
+  };
+}
+
+// 服务名在两个平台共用一对控件（hero 用输入框、smsbower 用下拉框），取值要按档位而非当前下拉框状态判断
+function readHeroSmsServiceValueForMode(providerMode) {
+  const selectValue = String(DOM.heroSmsServiceSelect?.value || '').trim();
+  const inputValue = String(DOM.heroSmsService?.value || '').trim();
+  return String(providerMode || '').trim().toLowerCase() === 'smsbower'
+    ? (selectValue || inputValue)
+    : (inputValue || selectValue);
+}
+
+// 把当前表单里的 7 个接码字段收进指定档；providerMode 必须显式传，切换时 DOM 已是新值
+function captureSmsProviderProfileFromForm(providerMode) {
+  const mode = String(providerMode || '').trim().toLowerCase();
+  if (!SMS_PROVIDER_PROFILE_MODES.includes(mode)) return;
+  const countryValue = normalizeHeroSmsCountryForProvider(getCurrentHeroSmsCountryValue(), mode);
+  const isAutoCountry = mode === 'smsbower' && countryValue === '0';
+  smsProviderProfiles[mode] = normalizeSmsProviderProfile({
+    hero_sms_api_key: DOM.heroSmsApiKey ? DOM.heroSmsApiKey.value : '',
+    hero_sms_service: readHeroSmsServiceValueForMode(mode),
+    hero_sms_country: countryValue,
+    hero_sms_operator: DOM.heroSmsOperator && !isAutoCountry
+      ? (DOM.heroSmsOperator.dataset.selectedValue || DOM.heroSmsOperator.value || '')
+      : '',
+    hero_sms_target_price: DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value : '',
+    hero_sms_fixed_price: DOM.heroSmsFixedPrice ? DOM.heroSmsFixedPrice.value === 'true' : true,
+    hero_sms_max_acquire_retries: DOM.heroSmsMaxAcquireRetries ? DOM.heroSmsMaxAcquireRetries.value : 5,
+  }, mode);
+}
+
+// 把指定档写回表单；国家/运营商/服务的下拉选项是异步加载的，先落 dataset 再由 loadXxx 选中
+function applySmsProviderProfileToForm(providerMode) {
+  const mode = String(providerMode || '').trim().toLowerCase();
+  if (!SMS_PROVIDER_PROFILE_MODES.includes(mode)) return null;
+  const profile = normalizeSmsProviderProfile(smsProviderProfiles[mode], mode);
+  smsProviderProfiles[mode] = profile;
+  if (DOM.heroSmsApiKey) DOM.heroSmsApiKey.value = profile.hero_sms_api_key;
+  if (DOM.heroSmsService) DOM.heroSmsService.value = profile.hero_sms_service;
+  if (DOM.heroSmsServiceSelect) DOM.heroSmsServiceSelect.value = profile.hero_sms_service;
+  if (DOM.heroSmsCountry) {
+    DOM.heroSmsCountry.dataset.selectedValue = String(profile.hero_sms_country);
+    DOM.heroSmsCountry.value = String(profile.hero_sms_country);
+  }
+  if (DOM.heroSmsOperator) {
+    DOM.heroSmsOperator.dataset.selectedValue = profile.hero_sms_operator;
+    DOM.heroSmsOperator.value = profile.hero_sms_operator;
+  }
+  if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = profile.hero_sms_target_price;
+  lastManualHeroSmsTargetPrice = profile.hero_sms_target_price;
+  if (DOM.heroSmsFixedPrice) DOM.heroSmsFixedPrice.value = String(profile.hero_sms_fixed_price);
+  if (DOM.heroSmsMaxAcquireRetries) DOM.heroSmsMaxAcquireRetries.value = String(profile.hero_sms_max_acquire_retries);
+  return profile;
 }
 
 function restoreHeroSmsTargetPrice(value = '') {
@@ -351,6 +436,15 @@ document.addEventListener('DOMContentLoaded', () => {
     proxyPoolSaveBtn: $('proxyPoolSaveBtn'),
     proxyPoolStatus: $('proxyPoolStatus'),
     registerMode: $('registerMode'),
+    browserEngine: $('browserEngine'),
+    roxyConfigCard: $('roxyConfigCard'),
+    roxyApiBase: $('roxyApiBase'),
+    roxyApiKey: $('roxyApiKey'),
+    roxyWorkspaceId: $('roxyWorkspaceId'),
+    roxyProfileId: $('roxyProfileId'),
+    roxyApplyProxy: $('roxyApplyProxy'),
+    roxyClearCache: $('roxyClearCache'),
+    roxyRandomFingerprint: $('roxyRandomFingerprint'),
     browserVisible: $('browserVisible'),
     browserBlockMedia: $('browserBlockMedia'),
     browserManualV2PhoneMode: $('browserManualV2PhoneMode'),
@@ -482,24 +576,33 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   if (DOM.browserManualV2PhoneMode) {
     DOM.browserManualV2PhoneMode.addEventListener('change', () => {
-      const currentTargetPrice = lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
+      // 先把表单现值收回切换前那一档，再把目标档的凭据填进表单，两个平台的配置各存各的
+      captureSmsProviderProfileFromForm(lastAutoSmsProviderMode);
+      const providerMode = getCurrentAutoSmsProviderMode();
+      lastAutoSmsProviderMode = providerMode;
+      const profile = applySmsProviderProfileToForm(providerMode);
+      const selectedService = profile ? profile.hero_sms_service : '';
+      const selectedOperator = profile ? profile.hero_sms_operator : '';
+      const currentTargetPrice = profile
+        ? profile.hero_sms_target_price
+        : (lastManualHeroSmsTargetPrice || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : ''));
       syncHeroSmsServiceFieldVisibility();
       if (DOM.heroSmsCountry) {
         const normalizedCountry = normalizeHeroSmsCountryForProvider(
           DOM.heroSmsCountry.dataset.selectedValue || DOM.heroSmsCountry.value || '',
-          getCurrentAutoSmsProviderMode(),
+          providerMode,
         );
         DOM.heroSmsCountry.dataset.selectedValue = normalizedCountry;
         DOM.heroSmsCountry.value = normalizedCountry;
       }
-      loadHeroSmsServices('').then(() => {
-        if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = '';
+      loadHeroSmsServices(selectedService).then(() => {
+        if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = selectedOperator;
         return loadHeroSmsCountries(getCurrentHeroSmsCountryValue()).then(() => {
-          return loadHeroSmsOperators(getCurrentHeroSmsCountryValue(), '').then(() => {
+          return loadHeroSmsOperators(getCurrentHeroSmsCountryValue(), selectedOperator).then(() => {
             return loadHeroSmsPriceTiers(
               getCurrentHeroSmsCountryValue(),
               currentTargetPrice,
-              '',
+              selectedOperator,
             );
           });
         });
@@ -544,13 +647,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
   if (DOM.registerMode) {
-    DOM.registerMode.addEventListener('change', () => {
-      if (DOM.registerMode.value === 'browser_manual') {
-        if (DOM.browserVisible) { DOM.browserVisible.checked = true; DOM.browserVisible.disabled = true; }
-      } else {
-        if (DOM.browserVisible) { DOM.browserVisible.disabled = false; }
-      }
-    });
+    DOM.registerMode.addEventListener('change', syncRoxyFieldVisibility);
+  }
+  if (DOM.browserEngine) {
+    DOM.browserEngine.addEventListener('change', syncRoxyFieldVisibility);
   }
   if (DOM.uploadModeSaveBtn) DOM.uploadModeSaveBtn.addEventListener('click', saveUploadMode);
   if (DOM.cpaUploadEnabled && DOM.cpaAutoMaintain) {
@@ -1218,7 +1318,11 @@ function syncHeroSmsServiceFieldVisibility() {
 async function loadHeroSmsServices(selectedValue = '') {
   if (!DOM.heroSmsServiceSelect) return;
   try {
-    const res = await fetch('/api/browser-config/hero-sms-services');
+    // 带上当前来源，后端才知道该用哪一档的凭据去拉服务列表
+    const query = new URLSearchParams();
+    const providerMode = getCurrentAutoSmsProviderMode();
+    if (providerMode === 'hero_sms' || providerMode === 'smsbower') query.set('provider_mode', providerMode);
+    const res = await fetch(`/api/browser-config/hero-sms-services?${query.toString()}`);
     const data = await res.json();
     const rows = res.ok ? (data.services || []) : [];
     renderHeroSmsServiceOptions(rows, selectedValue);
@@ -2764,8 +2868,25 @@ async function cleanupSub2ApiDuplicates() {
 function collectBrowserConfigForm() {
   const savedHeroSmsCountry = DOM.heroSmsCountry ? DOM.heroSmsCountry.dataset.selectedValue : '';
   const parsedHeroSmsCountry = parseInt(String(savedHeroSmsCountry || DOM.heroSmsCountry?.value || '16').trim(), 10);
+  // 表单当前显示的是生效那一档，先收回去，两档才能一起提交
+  const activeProviderMode = getCurrentAutoSmsProviderMode();
+  captureSmsProviderProfileFromForm(activeProviderMode);
+  lastAutoSmsProviderMode = activeProviderMode;
+  const smsProfilesPayload = {};
+  SMS_PROVIDER_PROFILE_MODES.forEach((mode) => {
+    smsProfilesPayload[mode] = normalizeSmsProviderProfile(smsProviderProfiles[mode], mode);
+  });
   return {
+    sms_provider_profiles: smsProfilesPayload,
     register_mode: DOM.registerMode ? DOM.registerMode.value : 'browser',
+    browser_engine: DOM.browserEngine ? DOM.browserEngine.value : 'uc',
+    roxy_api_base: DOM.roxyApiBase ? DOM.roxyApiBase.value.trim() || 'http://127.0.0.1:50000' : 'http://127.0.0.1:50000',
+    roxy_api_key: DOM.roxyApiKey ? DOM.roxyApiKey.value.trim() : '',
+    roxy_workspace_id: DOM.roxyWorkspaceId ? DOM.roxyWorkspaceId.value.trim() : '',
+    roxy_profile_id: DOM.roxyProfileId ? DOM.roxyProfileId.value.trim() : '',
+    roxy_apply_proxy: DOM.roxyApplyProxy ? DOM.roxyApplyProxy.checked : true,
+    roxy_clear_cache: DOM.roxyClearCache ? DOM.roxyClearCache.checked : true,
+    roxy_random_fingerprint: DOM.roxyRandomFingerprint ? DOM.roxyRandomFingerprint.checked : true,
     browser_headless: DOM.browserVisible ? !DOM.browserVisible.checked : true,
     browser_block_media: DOM.browserBlockMedia ? DOM.browserBlockMedia.checked : false,
     browser_realistic_profile: true,
@@ -2790,35 +2911,64 @@ function collectBrowserConfigForm() {
   };
 }
 
+function syncRoxyFieldVisibility() {
+  const isRoxy = DOM.browserEngine ? DOM.browserEngine.value === 'roxy' : false;
+  if (DOM.roxyConfigCard) DOM.roxyConfigCard.style.display = isRoxy ? '' : 'none';
+  if (!DOM.browserVisible) return;
+  // 人工模式必须可见；Roxy 自身支持无头，窗口开关照常生效
+  const isManual = DOM.registerMode ? DOM.registerMode.value === 'browser_manual' : false;
+  if (isManual) {
+    DOM.browserVisible.checked = true;
+    DOM.browserVisible.disabled = true;
+  } else {
+    DOM.browserVisible.disabled = false;
+  }
+}
+
 function applyBrowserConfig(cfg) {
   if (!cfg) return;
   if (DOM.registerMode) DOM.registerMode.value = cfg.register_mode || 'browser';
+  if (DOM.browserEngine) DOM.browserEngine.value = cfg.browser_engine || 'uc';
+  if (DOM.roxyApiBase) DOM.roxyApiBase.value = cfg.roxy_api_base || 'http://127.0.0.1:50000';
+  if (DOM.roxyApiKey) DOM.roxyApiKey.value = cfg.roxy_api_key || '';
+  if (DOM.roxyWorkspaceId) DOM.roxyWorkspaceId.value = cfg.roxy_workspace_id || '';
+  if (DOM.roxyProfileId) DOM.roxyProfileId.value = cfg.roxy_profile_id || '';
+  if (DOM.roxyApplyProxy) DOM.roxyApplyProxy.checked = cfg.roxy_apply_proxy !== false;
+  if (DOM.roxyClearCache) DOM.roxyClearCache.checked = cfg.roxy_clear_cache !== false;
+  if (DOM.roxyRandomFingerprint) DOM.roxyRandomFingerprint.checked = cfg.roxy_random_fingerprint !== false;
   if (DOM.browserVisible) DOM.browserVisible.checked = !cfg.browser_headless;
-  if (cfg.register_mode === 'browser_manual' && DOM.browserVisible) {
-    DOM.browserVisible.checked = true;
-    DOM.browserVisible.disabled = true;
-  } else if (DOM.browserVisible) {
-    DOM.browserVisible.disabled = false;
-  }
+  syncRoxyFieldVisibility();
   if (DOM.browserBlockMedia) DOM.browserBlockMedia.checked = cfg.browser_block_media !== false;
   if (DOM.browserManualV2PhoneMode) DOM.browserManualV2PhoneMode.value = cfg.browser_manual_v2_phone_mode || 'manual';
   if (DOM.browserManualV2EmailMode) DOM.browserManualV2EmailMode.value = cfg.browser_manual_v2_email_mode || 'auto';
   if (DOM.browserManualV2ManualRestartOnEnterPassword) {
     DOM.browserManualV2ManualRestartOnEnterPassword.value = String(cfg.browser_manual_v2_manual_restart_on_enter_password === true);
   }
-  if (DOM.heroSmsApiKey) DOM.heroSmsApiKey.value = cfg.hero_sms_api_key || '';
-  if (DOM.heroSmsService) {
-    const providerMode = String(cfg.browser_manual_v2_phone_mode || 'manual').trim().toLowerCase();
-    DOM.heroSmsService.value = providerMode === 'smsbower' ? (cfg.hero_sms_service || '') : (cfg.hero_sms_service || '');
+  // 两档接码配置全部吃进内存，表单只显示当前生效那一档
+  const activeProviderMode = String(cfg.browser_manual_v2_phone_mode || 'manual').trim().toLowerCase();
+  lastAutoSmsProviderMode = activeProviderMode;
+  const rawProfiles = cfg.sms_provider_profiles && typeof cfg.sms_provider_profiles === 'object'
+    ? cfg.sms_provider_profiles
+    : {};
+  SMS_PROVIDER_PROFILE_MODES.forEach((mode) => {
+    // 老配置没有 profiles，把扁平字段落进当前生效那一档，避免打开页面就把凭据显示成空
+    const fallback = mode === activeProviderMode ? cfg : null;
+    smsProviderProfiles[mode] = normalizeSmsProviderProfile(rawProfiles[mode] || fallback, mode);
+  });
+  const activeProfile = applySmsProviderProfileToForm(activeProviderMode);
+  if (!activeProfile) {
+    // 人工模式没有对应档位，仍按扁平字段回填，保持切到自动模式前的可见状态
+    if (DOM.heroSmsApiKey) DOM.heroSmsApiKey.value = cfg.hero_sms_api_key || '';
+    if (DOM.heroSmsService) DOM.heroSmsService.value = cfg.hero_sms_service || '';
+    if (DOM.heroSmsServiceSelect) DOM.heroSmsServiceSelect.value = cfg.hero_sms_service || '';
+    if (DOM.heroSmsCountry) DOM.heroSmsCountry.dataset.selectedValue = String(cfg.hero_sms_country ?? 16);
+    if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = cfg.hero_sms_operator || '';
+    if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = cfg.hero_sms_target_price || '';
+    lastManualHeroSmsTargetPrice = cfg.hero_sms_target_price || '';
+    if (DOM.heroSmsFixedPrice) DOM.heroSmsFixedPrice.value = String(cfg.hero_sms_fixed_price !== false);
+    if (DOM.heroSmsMaxAcquireRetries) DOM.heroSmsMaxAcquireRetries.value = cfg.hero_sms_max_acquire_retries || 5;
   }
-  if (DOM.heroSmsServiceSelect) DOM.heroSmsServiceSelect.value = cfg.hero_sms_service || '';
   syncHeroSmsServiceFieldVisibility();
-  if (DOM.heroSmsCountry) DOM.heroSmsCountry.dataset.selectedValue = String(cfg.hero_sms_country ?? 16);
-  if (DOM.heroSmsOperator) DOM.heroSmsOperator.dataset.selectedValue = cfg.hero_sms_operator || '';
-  if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = cfg.hero_sms_target_price || '';
-  lastManualHeroSmsTargetPrice = cfg.hero_sms_target_price || '';
-  if (DOM.heroSmsFixedPrice) DOM.heroSmsFixedPrice.value = String(cfg.hero_sms_fixed_price !== false);
-  if (DOM.heroSmsMaxAcquireRetries) DOM.heroSmsMaxAcquireRetries.value = cfg.hero_sms_max_acquire_retries || 5;
   if (DOM.browserTimeoutMs) DOM.browserTimeoutMs.value = cfg.browser_timeout_ms || 90000;
   if (DOM.browserSlowMoMs) DOM.browserSlowMoMs.value = cfg.browser_slow_mo_ms || 0;
   if (DOM.browserLocale) DOM.browserLocale.value = cfg.browser_locale || 'en-US';

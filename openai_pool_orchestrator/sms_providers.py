@@ -1452,6 +1452,9 @@ class HeroSMSProvider(SMSProvider):
         else:
             _apply_country_selection(selection)
 
+        # 平台通过 WRONG_MAX_PRICE 回报的硬性最低价：本地档位表可能过时，以平台返回的为准
+        wrong_max_price_floor: Optional[float] = None
+
         def _build_failure_message(message: str) -> str:
             parts = [str(message or "").strip()]
             preview_rows: List[str] = []
@@ -1512,6 +1515,11 @@ class HeroSMSProvider(SMSProvider):
                 request_max_price = self.max_target_price if self.max_target_price is not None else expected_price
                 if exact_ceiling_mode and expected_price is not None:
                     request_max_price = expected_price
+                # 平台已明确拒绝过更低的出价，这里统一抬到它给的底价，否则固定价模式重试时参数不会变
+                if wrong_max_price_floor is not None and (
+                    request_max_price is None or request_max_price < wrong_max_price_floor
+                ):
+                    request_max_price = wrong_max_price_floor
                 request_min_price = self.min_target_price if self.min_target_price is not None else None
                 if request_max_price is not None:
                     params["maxPrice"] = request_max_price
@@ -1549,6 +1557,89 @@ class HeroSMSProvider(SMSProvider):
                 ).strip()
             elif isinstance(data, str):
                 response_code = str(data or "").strip().upper()
+
+            if response_code == "WRONG_MAX_PRICE":
+                # 平台在 info.min 里回报了该国家/服务的硬性最低价，说明本地价格档位表已经过时
+                platform_min_price = None
+                info_payload = data.get("info") if isinstance(data, dict) else None
+                if isinstance(info_payload, dict):
+                    platform_min_price = self._parse_number(info_payload.get("min"))
+                debug_events.append(
+                    f"第 {attempt} 次尝试接口返回 WRONG_MAX_PRICE："
+                    + f"出价 ${request_max_price if request_max_price is not None else '-'}"
+                    + f"，平台最低价 ${platform_min_price if platform_min_price is not None else '-'}"
+                    + f"，运营商 {current_operator or 'ANY'}"
+                )
+                if platform_min_price is None:
+                    raise RuntimeError(
+                        f"{provider_label} 拒绝当前出价且未返回平台最低价: "
+                        + f"country={selected_country_id}, service={self.service}, "
+                        + f"出价=${request_max_price if request_max_price is not None else '-'}, 原始响应={data}"
+                    )
+                if wrong_max_price_floor is not None and platform_min_price <= wrong_max_price_floor + self.PRICE_COMPARE_EPSILON:
+                    # 已经按平台给的底价出过一次还是被拒，再抬也是同样结果
+                    raise RuntimeError(
+                        f"{provider_label} 已按平台最低价 ${platform_min_price} 出价仍被拒绝: "
+                        + f"country={selected_country_id}, service={self.service}, "
+                        + f"目标价={self._price_target_label()}, 原始响应={data}"
+                    )
+                if self.max_target_price is not None and platform_min_price > self.max_target_price + self.PRICE_COMPARE_EPSILON:
+                    # 配置了目标价/上限时不能擅自超预算买号，只能让用户上调
+                    raise RuntimeError(
+                        f"{provider_label} 平台最低价高于配置的目标价，无法在预算内取号: "
+                        + f"country={selected_country_id}, service={self.service}, "
+                        + f"目标价={self._price_target_label()}, 平台最低价=${platform_min_price}；"
+                        + f"请把目标价上调到不低于 ${platform_min_price} 后重试"
+                    )
+                if self.max_target_price is None:
+                    # 自动价模式允许按平台底价修正，但不得超过「已知最贵档位」与「涨价保护上限」中较高的那个
+                    known_prices = [
+                        price
+                        for price in (self._parse_number(item.get("price")) for item in auto_price_candidates)
+                        if price is not None
+                    ]
+                    escalation_ceiling = (
+                        min(
+                            auto_price_floor * self.AUTO_PRICE_ESCALATION_RATIO,
+                            auto_price_floor + self.AUTO_PRICE_ESCALATION_DELTA,
+                        )
+                        if auto_price_floor is not None
+                        else None
+                    )
+                    allowed_values = [value for value in (max(known_prices, default=None), escalation_ceiling) if value is not None]
+                    allowed_ceiling = max(allowed_values) if allowed_values else None
+                    if allowed_ceiling is not None and platform_min_price > allowed_ceiling + self.PRICE_COMPARE_EPSILON:
+                        raise RuntimeError(
+                            f"{provider_label} 平台最低价超出自动价允许范围，停止继续抬价: "
+                            + f"country={selected_country_id}, service={self.service}, "
+                            + f"平台最低价=${platform_min_price}, 允许上限=${round(allowed_ceiling, 6)}"
+                        )
+                wrong_max_price_floor = platform_min_price
+                expected_price = platform_min_price
+                if exact_ceiling_mode:
+                    # 低于平台底价的候选档位再试也是白试，直接剔掉
+                    exact_ceiling_candidates = [
+                        price for price in exact_ceiling_candidates
+                        if price >= platform_min_price - self.PRICE_COMPARE_EPSILON
+                    ]
+                    exact_ceiling_mode = bool(exact_ceiling_candidates)
+                    exact_ceiling_index = 0
+                    if exact_ceiling_mode:
+                        expected_price = exact_ceiling_candidates[0]
+                for index, item in enumerate(auto_price_candidates):
+                    price = self._parse_number(item.get("price"))
+                    if price is not None and price >= platform_min_price - self.PRICE_COMPARE_EPSILON:
+                        auto_price_index = index
+                        break
+                last_error = (
+                    f"{provider_label} 出价低于平台最低价，已抬到 ${platform_min_price} 重试取号: "
+                    + f"country={selected_country_id}, service={self.service}"
+                )
+                if attempt < self.max_acquire_retries:
+                    if _interruptible_sleep(1.0, stop_event):
+                        raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止")
+                    continue
+                raise HeroSMSAcquireRetryableError(_build_failure_message(last_error + "（重试耗尽）"))
 
             if response_code in {"NO_BALANCE", "BAD_KEY", "NO_NUMBERS"}:
                 debug_events.append(
@@ -2426,6 +2517,80 @@ def schedule_hero_sms_delayed_cancel(
     )
     worker.start()
     return worker
+
+
+SMS_PROVIDER_PROFILE_MODES = ("hero_sms", "smsbower")
+
+SMS_PROVIDER_PROFILE_DEFAULTS: Dict[str, Any] = {
+    "hero_sms_api_key": "",
+    "hero_sms_service": "",
+    "hero_sms_country": 16,
+    "hero_sms_operator": "",
+    "hero_sms_target_price": "",
+    "hero_sms_fixed_price": True,
+    "hero_sms_max_acquire_retries": 5,
+}
+
+
+def normalize_sms_provider_profile(source: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """把一档接码平台配置归一化成固定的 7 个字段。"""
+    row = source if isinstance(source, dict) else {}
+    try:
+        country = normalize_handler_api_country(row.get("hero_sms_country", 16), default=16, allow_zero=True)
+    except (TypeError, ValueError):
+        country = 16
+    try:
+        max_retries = max(1, min(int(row.get("hero_sms_max_acquire_retries") or 5), 20))
+    except (TypeError, ValueError):
+        max_retries = 5
+    return {
+        "hero_sms_api_key": str(row.get("hero_sms_api_key", "") or "").strip(),
+        "hero_sms_service": str(row.get("hero_sms_service", "") or "").strip(),
+        "hero_sms_country": country,
+        "hero_sms_operator": str(row.get("hero_sms_operator", "") or "").strip(),
+        "hero_sms_target_price": str(row.get("hero_sms_target_price", "") or "").strip(),
+        "hero_sms_fixed_price": _as_bool(row.get("hero_sms_fixed_price", True), default=True),
+        "hero_sms_max_acquire_retries": max_retries,
+    }
+
+
+def normalize_sms_provider_profiles(source: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """归一化两档接码平台配置，profiles 是唯一真相源。
+
+    老配置只有扁平的 hero_sms_* 一份，此时按当前 phone_mode 迁进对应那一档
+    （phone_mode 为 manual 时归入 hero_sms 档），避免升级后凭据丢失。
+    """
+    cfg = source if isinstance(source, dict) else {}
+    raw_profiles = cfg.get("sms_provider_profiles")
+    profiles: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_profiles, dict) and raw_profiles:
+        for mode in SMS_PROVIDER_PROFILE_MODES:
+            profiles[mode] = normalize_sms_provider_profile(raw_profiles.get(mode))
+        # 两档都还没填过凭据时视同没有 profiles，继续走下面的老配置迁移
+        if any(profiles[mode]["hero_sms_api_key"] for mode in SMS_PROVIDER_PROFILE_MODES):
+            return profiles
+        profiles = {}
+
+    phone_mode = str(cfg.get("browser_manual_v2_phone_mode") or "").strip().lower()
+    legacy_mode = phone_mode if phone_mode in SMS_PROVIDER_PROFILE_MODES else "hero_sms"
+    for mode in SMS_PROVIDER_PROFILE_MODES:
+        profiles[mode] = normalize_sms_provider_profile(cfg if mode == legacy_mode else None)
+    return profiles
+
+
+def active_sms_provider_fields(
+    profiles: Optional[Dict[str, Dict[str, Any]]],
+    phone_mode: Any,
+) -> Dict[str, Any]:
+    """按当前 phone_mode 投影出生效的扁平 hero_sms_* 字段。
+
+    manual 模式没有对应档位，返回默认空值，避免把上一次自动模式的凭据带进来。
+    """
+    mode = str(phone_mode or "").strip().lower()
+    if mode not in SMS_PROVIDER_PROFILE_MODES:
+        return dict(SMS_PROVIDER_PROFILE_DEFAULTS)
+    rows = profiles if isinstance(profiles, dict) else {}
+    return normalize_sms_provider_profile(rows.get(mode))
 
 
 def create_sms_provider_from_browser_config(browser_config: Optional[Dict[str, Any]]) -> Optional[SMSProvider]:

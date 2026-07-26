@@ -34,7 +34,7 @@ from .mail_providers import create_provider, create_provider_by_name, MultiMailR
 from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
 from .token_compat import normalize_token_data
 from .register import generate_oauth_url, submit_callback_url, _random_password, _random_profile_name, _random_profile_birthdate
-from .sms_providers import HANDLER_API_PROVIDER_LABELS, SMSBOWER_AUTO_COUNTRY_ID, list_handler_api_services, list_hero_sms_countries, list_hero_sms_operator_quotes, list_hero_sms_price_tiers, normalize_handler_api_country
+from .sms_providers import HANDLER_API_PROVIDER_LABELS, SMS_PROVIDER_PROFILE_MODES, SMSBOWER_AUTO_COUNTRY_ID, active_sms_provider_fields, list_handler_api_services, list_hero_sms_countries, list_hero_sms_operator_quotes, list_hero_sms_price_tiers, normalize_handler_api_country, normalize_sms_provider_profiles
 
 # ==========================================
 # 同步配置（内存持久化到 data/sync_config.json）
@@ -127,6 +127,59 @@ def _normalize_auto_sms_provider_mode(value: Any) -> str:
     return phone_mode
 
 
+def _normalize_browser_engine(value: Any) -> str:
+    engine = str(value or "uc").strip().lower()
+    return engine if engine in ("uc", "roxy") else "uc"
+
+
+def _roxy_config_from(config: Dict[str, Any]) -> Dict[str, Any]:
+    """抽出 Roxy 相关配置，供各处构造 browser_config 时展开使用。"""
+    try:
+        api_timeout_sec = max(3, min(int(config.get("roxy_api_timeout_sec", 20) or 20), 120))
+    except (TypeError, ValueError):
+        api_timeout_sec = 20
+    return {
+        "browser_engine": _normalize_browser_engine(config.get("browser_engine", "uc")),
+        "roxy_api_base": str(config.get("roxy_api_base", "") or "http://127.0.0.1:50000").strip(),
+        "roxy_api_key": str(config.get("roxy_api_key", "") or "").strip(),
+        "roxy_workspace_id": str(config.get("roxy_workspace_id", "") or "").strip(),
+        "roxy_profile_id": str(
+            config.get("roxy_profile_id", "") or config.get("roxy_profile_ids", "") or ""
+        ).strip(),
+        "roxy_api_timeout_sec": api_timeout_sec,
+        "roxy_apply_proxy": _as_bool(config.get("roxy_apply_proxy", True), default=True),
+        "roxy_clear_cache": _as_bool(config.get("roxy_clear_cache", True), default=True),
+        "roxy_random_fingerprint": _as_bool(config.get("roxy_random_fingerprint", True), default=True),
+    }
+
+
+def _sms_profiles_from(
+    config: Dict[str, Any],
+    *,
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """归一化两档接码平台配置，并按当前 phone_mode 投影出生效的 hero_sms_* 字段。
+
+    existing 传入已保存的配置时，会把本次没带上内容的档位原样保留，
+    避免在一个平台上保存表单时把另一个平台的凭据清掉。
+    """
+    source = config if isinstance(config, dict) else {}
+    phone_mode = _normalize_auto_sms_provider_mode(source.get("browser_manual_v2_phone_mode", "manual"))
+    profiles = normalize_sms_provider_profiles({**source, "browser_manual_v2_phone_mode": phone_mode})
+    if isinstance(existing, dict):
+        previous = normalize_sms_provider_profiles(existing)
+        for mode in SMS_PROVIDER_PROFILE_MODES:
+            current = profiles[mode]
+            if not current["hero_sms_api_key"] and not current["hero_sms_service"]:
+                profiles[mode] = previous[mode]
+            elif not current["hero_sms_api_key"]:
+                current["hero_sms_api_key"] = previous[mode]["hero_sms_api_key"]
+    return {
+        "sms_provider_profiles": profiles,
+        **active_sms_provider_fields(profiles, phone_mode),
+    }
+
+
 def _get_browser_config_snapshot(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     config = cfg if cfg is not None else _get_sync_config()
     try:
@@ -138,6 +191,7 @@ def _get_browser_config_snapshot(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     except (TypeError, ValueError):
         browser_slow_mo_ms = 0
     return {
+        **_roxy_config_from(config),
         "register_mode": _normalize_register_mode(config.get("register_mode", "browser")),
         "browser_headless": _as_bool(config.get("browser_headless", True), default=True),
         "browser_timeout_ms": browser_timeout_ms,
@@ -154,17 +208,7 @@ def _get_browser_config_snapshot(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
             config.get("browser_manual_v2_manual_restart_on_enter_password", False),
             default=False,
         ),
-        "hero_sms_api_key": str(config.get("hero_sms_api_key", "") or "").strip(),
-        "hero_sms_service": str(config.get("hero_sms_service", "") or "").strip(),
-        "hero_sms_country": normalize_handler_api_country(
-            config.get("hero_sms_country", 16),
-            default=16,
-            allow_zero=True,
-        ),
-        "hero_sms_operator": str(config.get("hero_sms_operator", "") or "").strip(),
-        "hero_sms_target_price": str(config.get("hero_sms_target_price", "") or "").strip(),
-        "hero_sms_fixed_price": _as_bool(config.get("hero_sms_fixed_price", True), default=True),
-        "hero_sms_max_acquire_retries": int(config.get("hero_sms_max_acquire_retries", 5) or 5),
+        **_sms_profiles_from(config),
     }
 
 
@@ -338,6 +382,15 @@ def _load_sync_config() -> Dict[str, Any]:
         "proxy_pool_count": 1,
         "proxy_pool_country": "US",
         "register_mode": "browser",
+        "browser_engine": "uc",
+        "roxy_api_base": "http://127.0.0.1:50000",
+        "roxy_api_key": "",
+        "roxy_workspace_id": "",
+        "roxy_profile_id": "",
+        "roxy_api_timeout_sec": 20,
+        "roxy_apply_proxy": True,
+        "roxy_clear_cache": True,
+        "roxy_random_fingerprint": True,
         "browser_headless": True,
         "browser_timeout_ms": 90000,
         "browser_slow_mo_ms": 0,
@@ -347,6 +400,7 @@ def _load_sync_config() -> Dict[str, Any]:
         "browser_block_media": False,
         "browser_realistic_profile": True,
         "hero_sms_target_price": "",
+        "sms_provider_profiles": {mode: {} for mode in SMS_PROVIDER_PROFILE_MODES},
     }
 
 
@@ -410,6 +464,7 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg["proxy_pool_count"] = 1
     cfg["proxy_pool_country"] = str(cfg.get("proxy_pool_country", "US") or "US").strip().upper() or "US"
     cfg["register_mode"] = _normalize_register_mode(cfg.get("register_mode", "browser"))
+    cfg.update(_roxy_config_from(cfg))
     cfg["browser_headless"] = _as_bool(cfg.get("browser_headless", True), default=True)
     try:
         cfg["browser_timeout_ms"] = max(15000, min(int(cfg.get("browser_timeout_ms", 90000)), 300000))
@@ -429,23 +484,7 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["browser_manual_v2_email_mode"] = _normalize_browser_manual_v2_email_mode(
         cfg.get("browser_manual_v2_email_mode", "auto")
     )
-    cfg["hero_sms_api_key"] = str(cfg.get("hero_sms_api_key", "") or "").strip()
-    cfg["hero_sms_service"] = str(cfg.get("hero_sms_service", "") or "").strip()
-    try:
-        cfg["hero_sms_country"] = normalize_handler_api_country(
-            cfg.get("hero_sms_country", 16),
-            default=16,
-            allow_zero=True,
-        )
-    except (TypeError, ValueError):
-        cfg["hero_sms_country"] = 16
-    cfg["hero_sms_operator"] = str(cfg.get("hero_sms_operator", "") or "").strip()
-    cfg["hero_sms_target_price"] = str(cfg.get("hero_sms_target_price", "") or "").strip()
-    cfg["hero_sms_fixed_price"] = _as_bool(cfg.get("hero_sms_fixed_price", True), default=True)
-    try:
-        cfg["hero_sms_max_acquire_retries"] = max(1, min(int(cfg.get("hero_sms_max_acquire_retries", 5) or 5), 20))
-    except (TypeError, ValueError):
-        cfg["hero_sms_max_acquire_retries"] = 5
+    cfg.update(_sms_profiles_from(cfg))
     cfg["token_proxy_sync"] = _as_bool(cfg.get("token_proxy_sync", False), default=False)
     cfg["token_proxy_db_path"] = str(cfg.get("token_proxy_db_path", "") or "").strip()
     return cfg
@@ -1960,6 +1999,7 @@ class TaskState:
                             "country": str(config_snapshot.get("proxy_pool_country", "US") or "US").strip().upper(),
                         },
                         browser_config={
+                            **_roxy_config_from(config_snapshot),
                             "register_mode": str(config_snapshot.get("register_mode", "browser") or "browser").strip().lower(),
                             "browser_headless": bool(config_snapshot.get("browser_headless", True)),
                             "browser_timeout_ms": int(config_snapshot.get("browser_timeout_ms", 90000) or 90000),
@@ -1974,17 +2014,7 @@ class TaskState:
                             "browser_manual_v2_email_mode": _normalize_browser_manual_v2_email_mode(
                                 config_snapshot.get("browser_manual_v2_email_mode", "auto")
                             ),
-                            "hero_sms_api_key": str(config_snapshot.get("hero_sms_api_key", "") or "").strip(),
-                            "hero_sms_service": str(config_snapshot.get("hero_sms_service", "") or "").strip(),
-                            "hero_sms_country": normalize_handler_api_country(
-                                config_snapshot.get("hero_sms_country", 16),
-                                default=16,
-                                allow_zero=True,
-                            ),
-                            "hero_sms_operator": str(config_snapshot.get("hero_sms_operator", "") or "").strip(),
-                            "hero_sms_target_price": str(config_snapshot.get("hero_sms_target_price", "") or "").strip(),
-                            "hero_sms_fixed_price": _as_bool(config_snapshot.get("hero_sms_fixed_price", True), default=True),
-                            "hero_sms_max_acquire_retries": int(config_snapshot.get("hero_sms_max_acquire_retries", 5) or 5),
+                            **_sms_profiles_from(config_snapshot),
                         },
                         browser_manual_phone_input_func=(
                             None
@@ -2420,6 +2450,15 @@ class SyncConfigRequest(BaseModel):
     thread_count: int = 3
     auto_register: bool = False
     register_mode: str = "browser"
+    browser_engine: str = "uc"
+    roxy_api_base: str = "http://127.0.0.1:50000"
+    roxy_api_key: str = ""
+    roxy_workspace_id: str = ""
+    roxy_profile_id: str = ""
+    roxy_api_timeout_sec: int = 20
+    roxy_apply_proxy: bool = True
+    roxy_clear_cache: bool = True
+    roxy_random_fingerprint: bool = True
     browser_headless: bool = True
     browser_timeout_ms: int = 90000
     browser_slow_mo_ms: int = 0
@@ -2439,12 +2478,23 @@ class SyncConfigRequest(BaseModel):
     hero_sms_target_price: str = ""
     hero_sms_fixed_price: bool = True
     hero_sms_max_acquire_retries: int = 5
+    # 两档接码平台各自的完整配置，形如 {"hero_sms": {...}, "smsbower": {...}}
+    sms_provider_profiles: Dict[str, Any] = Field(default_factory=dict)
     token_proxy_sync: bool = False
     token_proxy_db_path: str = ""
 
 
 class BrowserConfigRequest(BaseModel):
     register_mode: str = "browser"
+    browser_engine: str = "uc"
+    roxy_api_base: str = "http://127.0.0.1:50000"
+    roxy_api_key: str = ""
+    roxy_workspace_id: str = ""
+    roxy_profile_id: str = ""
+    roxy_api_timeout_sec: int = 20
+    roxy_apply_proxy: bool = True
+    roxy_clear_cache: bool = True
+    roxy_random_fingerprint: bool = True
     browser_headless: bool = True
     browser_timeout_ms: int = 90000
     browser_slow_mo_ms: int = 0
@@ -2464,6 +2514,8 @@ class BrowserConfigRequest(BaseModel):
     hero_sms_target_price: str = ""
     hero_sms_fixed_price: bool = True
     hero_sms_max_acquire_retries: int = 5
+    # 两档接码平台各自的完整配置，形如 {"hero_sms": {...}, "smsbower": {...}}
+    sms_provider_profiles: Dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkerManualInputRequest(BaseModel):
@@ -2679,13 +2731,19 @@ async def api_get_browser_config() -> Dict[str, Any]:
     return _get_browser_config_snapshot()
 
 
+def _sms_profile_credentials(cfg: Dict[str, Any], provider_mode: Any) -> Dict[str, Any]:
+    """按平台取对应那一档的凭据，让查询接口不受当前生效档影响。"""
+    return active_sms_provider_fields(normalize_sms_provider_profiles(cfg), provider_mode)
+
+
 @app.get("/api/browser-config/hero-sms-countries")
 async def api_get_hero_sms_countries(provider_mode: str = "", service: str = "") -> Dict[str, Any]:
     cfg = _get_sync_config()
     resolved_provider_mode = _normalize_auto_sms_provider_mode(provider_mode or cfg.get("browser_manual_v2_phone_mode", "manual"))
     provider_label = HANDLER_API_PROVIDER_LABELS.get(resolved_provider_mode, "短信平台")
-    api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
-    service = str(service or cfg.get("hero_sms_service", "") or "").strip()
+    profile = _sms_profile_credentials(cfg, resolved_provider_mode)
+    api_key = profile["hero_sms_api_key"]
+    service = str(service or profile["hero_sms_service"] or "").strip()
     if not api_key:
         return {"status": "missing_api_key", "countries": []}
     try:
@@ -2710,12 +2768,13 @@ async def api_get_hero_sms_countries(provider_mode: str = "", service: str = "")
 
 
 @app.get("/api/browser-config/hero-sms-services")
-async def api_get_hero_sms_services() -> Dict[str, Any]:
+async def api_get_hero_sms_services(provider_mode: str = "") -> Dict[str, Any]:
     cfg = _get_sync_config()
-    provider_mode = _normalize_auto_sms_provider_mode(cfg.get("browser_manual_v2_phone_mode", "manual"))
+    provider_mode = _normalize_auto_sms_provider_mode(provider_mode or cfg.get("browser_manual_v2_phone_mode", "manual"))
     provider_label = HANDLER_API_PROVIDER_LABELS.get(provider_mode, "短信平台")
-    api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
-    service = str(cfg.get("hero_sms_service", "") or "").strip()
+    profile = _sms_profile_credentials(cfg, provider_mode)
+    api_key = profile["hero_sms_api_key"]
+    service = profile["hero_sms_service"]
     if not api_key:
         return {"status": "missing_api_key", "services": []}
     try:
@@ -2736,8 +2795,9 @@ async def api_get_hero_sms_operators(country: int, service: str = "", provider_m
     cfg = _get_sync_config()
     resolved_provider_mode = _normalize_auto_sms_provider_mode(provider_mode or cfg.get("browser_manual_v2_phone_mode", "manual"))
     provider_label = HANDLER_API_PROVIDER_LABELS.get(resolved_provider_mode, "短信平台")
-    api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
-    service = str(service or cfg.get("hero_sms_service", "") or "").strip()
+    profile = _sms_profile_credentials(cfg, resolved_provider_mode)
+    api_key = profile["hero_sms_api_key"]
+    service = str(service or profile["hero_sms_service"] or "").strip()
     if not api_key:
         return {"status": "missing_api_key", "operators": []}
     if not service:
@@ -2771,8 +2831,9 @@ async def api_get_hero_sms_price_tiers(country: int, operator: str = "", service
     cfg = _get_sync_config()
     resolved_provider_mode = _normalize_auto_sms_provider_mode(provider_mode or cfg.get("browser_manual_v2_phone_mode", "manual"))
     provider_label = HANDLER_API_PROVIDER_LABELS.get(resolved_provider_mode, "短信平台")
-    api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
-    service = str(service or cfg.get("hero_sms_service", "") or "").strip()
+    profile = _sms_profile_credentials(cfg, resolved_provider_mode)
+    api_key = profile["hero_sms_api_key"]
+    service = str(service or profile["hero_sms_service"] or "").strip()
     if not api_key:
         return {"status": "missing_api_key", "price_tiers": []}
     if not service:
@@ -2947,6 +3008,7 @@ async def api_set_browser_config(req: BrowserConfigRequest) -> Dict[str, Any]:
     cfg = _get_sync_config()
     normalized_phone_mode = _normalize_auto_sms_provider_mode(req.browser_manual_v2_phone_mode)
     cfg.update({
+        **_roxy_config_from(req.model_dump()),
         "register_mode": _normalize_register_mode(req.register_mode),
         "browser_headless": bool(req.browser_headless),
         "browser_timeout_ms": max(15000, min(req.browser_timeout_ms, 300000)),
@@ -2960,17 +3022,10 @@ async def api_set_browser_config(req: BrowserConfigRequest) -> Dict[str, Any]:
         "browser_manual_v2_phone_mode": normalized_phone_mode,
         "browser_manual_v2_email_mode": _normalize_browser_manual_v2_email_mode(req.browser_manual_v2_email_mode),
         "browser_manual_v2_manual_restart_on_enter_password": bool(req.browser_manual_v2_manual_restart_on_enter_password),
-        "hero_sms_api_key": req.hero_sms_api_key.strip(),
-        "hero_sms_service": req.hero_sms_service.strip(),
-        "hero_sms_country": normalize_handler_api_country(
-            req.hero_sms_country,
-            default=16,
-            allow_zero=normalized_phone_mode == "smsbower",
+        **_sms_profiles_from(
+            {**req.model_dump(), "browser_manual_v2_phone_mode": normalized_phone_mode},
+            existing=cfg,
         ),
-        "hero_sms_operator": req.hero_sms_operator.strip(),
-        "hero_sms_target_price": req.hero_sms_target_price.strip(),
-        "hero_sms_fixed_price": _as_bool(req.hero_sms_fixed_price, default=True),
-        "hero_sms_max_acquire_retries": max(1, min(int(req.hero_sms_max_acquire_retries or 5), 20)),
     })
     cfg.pop("manual_v2_test_phone", None)
     cfg.pop("manual_v2_test_password", None)
@@ -3143,9 +3198,6 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
     upload_mode = str(req.upload_mode or "snapshot").strip().lower()
     if upload_mode not in ("snapshot", "decoupled"):
         upload_mode = "snapshot"
-    hero_sms_api_key = req.hero_sms_api_key.strip() if req.hero_sms_api_key else ""
-    if not hero_sms_api_key:
-        hero_sms_api_key = str(cfg.get("hero_sms_api_key", "") or "").strip()
     normalized_phone_mode = _normalize_auto_sms_provider_mode(req.browser_manual_v2_phone_mode)
     cfg.update({
         "base_url": new_base_url,
@@ -3162,6 +3214,7 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
         "multithread": req.multithread,
         "thread_count": max(1, min(req.thread_count, 10)),
         "auto_register": req.auto_register,
+        **_roxy_config_from(req.model_dump()),
         "register_mode": _normalize_register_mode(req.register_mode),
         "browser_headless": bool(req.browser_headless),
         "browser_timeout_ms": max(15000, min(req.browser_timeout_ms, 300000)),
@@ -3175,17 +3228,10 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
         "browser_manual_v2_phone_mode": normalized_phone_mode,
         "browser_manual_v2_email_mode": _normalize_browser_manual_v2_email_mode(req.browser_manual_v2_email_mode),
         "browser_manual_v2_manual_restart_on_enter_password": bool(req.browser_manual_v2_manual_restart_on_enter_password),
-        "hero_sms_api_key": hero_sms_api_key,
-        "hero_sms_service": req.hero_sms_service.strip(),
-        "hero_sms_country": normalize_handler_api_country(
-            req.hero_sms_country,
-            default=16,
-            allow_zero=normalized_phone_mode == "smsbower",
+        **_sms_profiles_from(
+            {**req.model_dump(), "browser_manual_v2_phone_mode": normalized_phone_mode},
+            existing=cfg,
         ),
-        "hero_sms_operator": req.hero_sms_operator.strip(),
-        "hero_sms_target_price": req.hero_sms_target_price.strip(),
-        "hero_sms_fixed_price": _as_bool(req.hero_sms_fixed_price, default=True),
-        "hero_sms_max_acquire_retries": max(1, min(int(req.hero_sms_max_acquire_retries or 5), 20)),
     })
     cfg.pop("manual_v2_test_phone", None)
     cfg.pop("manual_v2_test_password", None)

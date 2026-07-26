@@ -30,7 +30,10 @@ try:
         HERO_SMS_CANCEL_MIN_WAIT_SECONDS,
         HeroSMSAcquireRetryableError,
         HeroSMSAcquireStoppedError,
+        SMS_PROVIDER_PROFILE_DEFAULTS,
+        active_sms_provider_fields,
         normalize_handler_api_country,
+        normalize_sms_provider_profiles,
         note_sms_country_registration_failure,
         note_sms_country_registration_success,
         schedule_hero_sms_delayed_cancel,
@@ -42,7 +45,10 @@ except ImportError:
         HERO_SMS_CANCEL_MIN_WAIT_SECONDS,
         HeroSMSAcquireRetryableError,
         HeroSMSAcquireStoppedError,
+        SMS_PROVIDER_PROFILE_DEFAULTS,
+        active_sms_provider_fields,
         normalize_handler_api_country,
+        normalize_sms_provider_profiles,
         note_sms_country_registration_failure,
         note_sms_country_registration_success,
         schedule_hero_sms_delayed_cancel,
@@ -51,6 +57,15 @@ except ImportError:
 
 DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
     "register_mode": "browser",
+    "browser_engine": "uc",
+    "roxy_api_base": "http://127.0.0.1:50000",
+    "roxy_api_key": "",
+    "roxy_workspace_id": "",
+    "roxy_profile_id": "",
+    "roxy_api_timeout_sec": 20,
+    "roxy_apply_proxy": True,
+    "roxy_clear_cache": True,
+    "roxy_random_fingerprint": True,
     "browser_headless": True,
     "browser_timeout_ms": 90000,
     "browser_slow_mo_ms": 0,
@@ -70,6 +85,11 @@ DEFAULT_BROWSER_CONFIG: Dict[str, Any] = {
     "hero_sms_target_price": "",
     "hero_sms_fixed_price": True,
     "hero_sms_max_acquire_retries": 5,
+    # 两档接码平台各存一份凭据，切换 browser_manual_v2_phone_mode 即切换生效档
+    "sms_provider_profiles": {
+        "hero_sms": dict(SMS_PROVIDER_PROFILE_DEFAULTS),
+        "smsbower": dict(SMS_PROVIDER_PROFILE_DEFAULTS),
+    },
 }
 
 MANUAL_V2_RESTART_PHONE_SENTINEL = "__manual_v2_restart_phone__"
@@ -156,6 +176,8 @@ class BrowserLaunchResources:
     persistent_user_data_dir: bool = False
     launch_mode: str = "uc-bridge"
     owner_thread_id: int = 0
+    roxy_client: Any = None
+    roxy_profile_id: str = ""
 
 
 class _IPv4LoopbackServer(ThreadingHTTPServer):
@@ -320,6 +342,14 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
     if register_mode not in {"browser", "browser_manual", "browser_manual_v2", "protocol"}:
         register_mode = "browser"
 
+    browser_engine = str(source.get("browser_engine") or "uc").strip().lower()
+    if browser_engine not in {"uc", "roxy"}:
+        browser_engine = "uc"
+    try:
+        roxy_api_timeout_sec = max(3, min(int(source.get("roxy_api_timeout_sec") or 20), 120))
+    except (TypeError, ValueError):
+        roxy_api_timeout_sec = 20
+
     executable_path = str(source.get("browser_executable_path") or "").strip()
     locale = str(source.get("browser_locale") or "en-US").strip() or "en-US"
     timezone_id = str(source.get("browser_timezone") or "America/New_York").strip() or "America/New_York"
@@ -336,23 +366,16 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
         phone_mode = "manual"
     email_mode = _normalize_manual_v2_email_mode(source.get("browser_manual_v2_email_mode") or "auto")
     manual_restart_on_enter_password = _as_bool(source.get("browser_manual_v2_manual_restart_on_enter_password", False), default=False)
-    hero_sms_api_key = str(source.get("hero_sms_api_key") or "").strip()
-    hero_sms_service = str(source.get("hero_sms_service") or "").strip()
-    try:
-        hero_sms_country = normalize_handler_api_country(
-            source.get("hero_sms_country"),
-            default=16,
-            allow_zero=True,
-        )
-    except (TypeError, ValueError):
-        hero_sms_country = 16
-    hero_sms_operator = str(source.get("hero_sms_operator") or "").strip()
-    hero_sms_target_price = str(source.get("hero_sms_target_price") or "").strip()
-    hero_sms_fixed_price = _as_bool(source.get("hero_sms_fixed_price", True), default=True)
-    try:
-        hero_sms_max_acquire_retries = max(1, min(int(source.get("hero_sms_max_acquire_retries") or 5), 20))
-    except (TypeError, ValueError):
-        hero_sms_max_acquire_retries = 5
+    # 两档接码平台配置各存各的，生效值按当前 phone_mode 投影出来。
+    # profiles 只认调用方真正传进来的那份，否则默认值里的空档会遮蔽老配置迁移。
+    sms_provider_profiles = normalize_sms_provider_profiles(
+        {
+            **source,
+            "browser_manual_v2_phone_mode": phone_mode,
+            "sms_provider_profiles": raw.get("sms_provider_profiles") if isinstance(raw, dict) else None,
+        }
+    )
+    active_sms_fields = active_sms_provider_fields(sms_provider_profiles, phone_mode)
 
     raw_keep_open = None
     if isinstance(raw, dict) and "browser_keep_open_on_error" in raw:
@@ -360,7 +383,20 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
 
     return {
         "register_mode": register_mode,
-        "browser_headless": False if register_mode == "browser_manual" else _as_bool(source.get("browser_headless", True), default=True),
+        "browser_engine": browser_engine,
+        "roxy_api_base": str(source.get("roxy_api_base") or "http://127.0.0.1:50000").strip(),
+        "roxy_api_key": str(source.get("roxy_api_key") or "").strip(),
+        "roxy_workspace_id": str(source.get("roxy_workspace_id") or "").strip(),
+        "roxy_profile_id": str(
+            source.get("roxy_profile_id") or source.get("roxy_profile_ids") or ""
+        ).strip(),
+        "roxy_api_timeout_sec": roxy_api_timeout_sec,
+        "roxy_apply_proxy": _as_bool(source.get("roxy_apply_proxy", True), default=True),
+        "roxy_clear_cache": _as_bool(source.get("roxy_clear_cache", True), default=True),
+        "roxy_random_fingerprint": _as_bool(source.get("roxy_random_fingerprint", True), default=True),
+        "browser_headless": False
+        if register_mode == "browser_manual"
+        else _as_bool(source.get("browser_headless", True), default=True),
         "browser_timeout_ms": timeout_ms,
         "browser_slow_mo_ms": slow_mo_ms,
         "browser_executable_path": executable_path,
@@ -372,13 +408,8 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
         "browser_manual_v2_phone_mode": phone_mode,
         "browser_manual_v2_email_mode": email_mode,
         "browser_manual_v2_manual_restart_on_enter_password": manual_restart_on_enter_password,
-        "hero_sms_api_key": hero_sms_api_key,
-        "hero_sms_service": hero_sms_service,
-        "hero_sms_country": hero_sms_country,
-        "hero_sms_operator": hero_sms_operator,
-        "hero_sms_target_price": hero_sms_target_price,
-        "hero_sms_fixed_price": hero_sms_fixed_price,
-        "hero_sms_max_acquire_retries": hero_sms_max_acquire_retries,
+        "sms_provider_profiles": sms_provider_profiles,
+        **active_sms_fields,
         "browser_keep_open_on_error": _as_bool(
             raw_keep_open if raw_keep_open is not None else (not _as_bool(source.get("browser_headless", True), default=True)),
             default=False,
@@ -417,6 +448,12 @@ def _close_launch_resources(resources: Optional[BrowserLaunchResources]) -> None
     try:
         if resources.cdp_driver is not None:
             resources.cdp_driver.quit()
+    except Exception:
+        pass
+    # Roxy 的窗口由客户端托管，必须走 API 关闭，否则窗口会一直挂着占用资料
+    try:
+        if resources.roxy_client is not None and resources.roxy_profile_id:
+            resources.roxy_client.close_browser(resources.roxy_profile_id)
     except Exception:
         pass
     temp_user_data_dir = str(resources.temp_user_data_dir or "").strip()
@@ -6474,6 +6511,122 @@ def _launch_via_local_uc_bridge(playwright: Any, ctx: BrowserRunContext, cfg: Di
         raise
 
 
+def _launch_via_roxy(playwright: Any, ctx: BrowserRunContext, cfg: Dict[str, Any]) -> BrowserLaunchResources:
+    """用 RoxyBrowser 打开指纹窗口，再让 Playwright 通过 CDP 附着。
+
+    指纹与 UA 全部交给 Roxy，本项目不再注入自建指纹（两套叠加反而会露馅）。
+    """
+    try:
+        from .roxy_browser import RoxyClient, RoxyBrowserError, wait_cdp_ready
+    except ImportError:  # pragma: no cover - 兼容以脚本方式直接运行
+        from roxy_browser import RoxyClient, RoxyBrowserError, wait_cdp_ready  # type: ignore
+
+    client, settings = RoxyClient.from_config(cfg)
+    profile_id = settings["profile_id"]
+    workspace_id = settings["workspace_id"]
+    browser = None
+
+    try:
+        # 复用同一个资料，先把上一轮可能残留的窗口关掉
+        try:
+            client.close_browser(profile_id)
+            time.sleep(0.6)
+        except RoxyBrowserError as exc:
+            ctx.emitter.info(f"Roxy 关闭残留窗口失败（忽略）: {exc}", step="oauth_init")
+
+        if cfg.get("roxy_apply_proxy", True):
+            proxy_info = client.modify_proxy(workspace_id, profile_id, ctx.proxy)
+            if proxy_info.get("proxyCategory") == "noproxy":
+                ctx.emitter.info("Roxy 资料已设为直连（本次未分配代理）", step="oauth_init")
+            else:
+                ctx.emitter.info(
+                    "Roxy 资料代理已更新: "
+                    + f"{proxy_info.get('protocol')} {proxy_info.get('host')}:{proxy_info.get('port')}",
+                    step="oauth_init",
+                )
+
+        if cfg.get("roxy_clear_cache", True):
+            # 单窗口串行注册复用同一资料，不清缓存会带着上一个号的 cookie
+            client.clear_local_cache(workspace_id, profile_id)
+            ctx.emitter.info("Roxy 本地缓存已清理", step="oauth_init")
+
+        if cfg.get("roxy_random_fingerprint", True):
+            client.random_fingerprint(workspace_id, profile_id)
+            ctx.emitter.info("Roxy 资料指纹已随机化", step="oauth_init")
+
+        headless = bool(cfg.get("browser_headless", False))
+        open_started_at = time.time()
+        ctx.emitter.info(
+            f"正在通过 Roxy 打开资料 {_mask_secret(profile_id, head=8, tail=4)} "
+            + f"（{'无头' if headless else '有头'}）...",
+            step="oauth_init",
+        )
+        if headless:
+            ctx.emitter.info("Roxy 无头模式下 Turnstile 通过率偏低，失败偏多时建议改回有头", step="oauth_init")
+        data = client.open_browser(profile_id=profile_id, headless=headless)
+        ws_url = str(data.get("ws") or "").strip()
+        http_address = str(data.get("http") or "").strip()
+        ctx.emitter.info(
+            f"Roxy 窗口已启动，耗时 {time.time() - open_started_at:.1f}s，"
+            + f"内核 {data.get('coreVersion') or '-'}",
+            step="oauth_init",
+        )
+
+        endpoint_source = ws_url or http_address
+        # 无头启动比有头慢，version 接口就绪也更晚，等待下限相应放宽
+        addr = wait_cdp_ready(
+            endpoint_source,
+            timeout_sec=max(25.0 if headless else 10.0, float(cfg["browser_timeout_ms"]) / 1000.0),
+            log=lambda message: ctx.emitter.info(message, step="oauth_init"),
+        )
+        # ws 地址带 browser 级会话标识，比 http 更直接；拿不到再退回 http
+        endpoint_url = ws_url if ws_url.startswith("ws") else f"http://{addr}"
+
+        cdp_connect_started_at = time.time()
+        browser = playwright.chromium.connect_over_cdp(
+            endpoint_url,
+            timeout=cfg["browser_timeout_ms"],
+            slow_mo=int(cfg["browser_slow_mo_ms"]),
+        )
+        ctx.emitter.info(
+            f"Roxy CDP 连接完成，耗时 {time.time() - cdp_connect_started_at:.1f}s",
+            step="oauth_init",
+        )
+
+        contexts = list(getattr(browser, "contexts", []) or [])
+        if not contexts:
+            raise RuntimeError("Roxy 窗口未提供可用的浏览器上下文")
+        context = contexts[0]
+        pages = list(getattr(context, "pages", []) or [])
+        page = pages[0] if pages else context.new_page()
+        _clear_browser_runtime_state(
+            context,
+            page,
+            ctx.emitter,
+            hard_reset=bool(cfg.get("browser_clear_runtime_state", False)),
+        )
+        return BrowserLaunchResources(
+            browser=browser,
+            context=context,
+            page=page,
+            launch_mode=f"roxy:{profile_id}",
+            owner_thread_id=threading.get_ident(),
+            roxy_client=client,
+            roxy_profile_id=profile_id,
+        )
+    except Exception:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        try:
+            client.close_browser(profile_id)
+        except Exception:
+            pass
+        raise
+
+
 def run_browser_registration(
     *,
     email: str,
@@ -6602,7 +6755,8 @@ def run_browser_registration(
         manual_v2_manual_email_mode
         and callable(wait_manual_email_code_input_func)
     )
-    use_plain_browser_env = False
+    # Roxy 自带平台侧指纹，再叠加自建指纹会让 UA 与 navigator 对不上，反而更易被识别
+    use_plain_browser_env = cfg.get("browser_engine") == "roxy"
     otp_wait_timeout_seconds = 20
     otp_max_resend_attempts = 20
     otp_same_code_retry_limit = 2
@@ -8774,6 +8928,18 @@ def run_browser_registration(
         )
         return manual_v2_phone_number
 
+    def _normalize_manual_v2_sms_code(raw: Any) -> str:
+        """只认 6 位短信码，其余一律当没收到。
+
+        OpenAI 的验证码固定 6 位；接码平台偶尔会把短信里别的数字（如 STATUS_WAIT_RETRY
+        带回的旧码）当成验证码返回，拿去填必然失败，不如直接弃号换下一个。
+        """
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        matched = re.search(r"(?<!\d)\d{6}(?!\d)", text)
+        return matched.group(0) if matched else ""
+
     def _wait_manual_v2_auto_sms_code(*, step: str, prompt: str, timeout_seconds: int = 60) -> str:
         nonlocal manual_v2_cached_sms_code
         if not manual_v2_auto_phone_mode or sms_provider is None:
@@ -8792,7 +8958,7 @@ def run_browser_registration(
             emitter.success(f"浏览器模式2 已直接复用此前收到的 {manual_v2_auto_phone_provider_label} 短信验证码: {code}", step=step)
             return code
         emitter.info(prompt, step=step)
-        code = str(
+        raw_code = str(
             sms_provider.wait_for_code(
                 manual_v2_sms_activation_id,
                 proxy=ctx.proxy,
@@ -8801,8 +8967,15 @@ def run_browser_registration(
             )
             or ""
         ).strip()
+        code = _normalize_manual_v2_sms_code(raw_code)
         if code:
             emitter.success(f"浏览器模式2 已从 {manual_v2_auto_phone_provider_label} 自动收到短信验证码: {code}", step=step)
+        elif raw_code:
+            emitter.warn(
+                f"浏览器模式2 {manual_v2_auto_phone_provider_label} 返回的短信内容不含 6 位验证码: {raw_code}；"
+                + "本地直接放弃当前号码并回到步骤1重新取号...",
+                step=step,
+            )
         return code
 
     def _probe_manual_v2_auto_sms_code() -> str:
@@ -8811,7 +8984,10 @@ def run_browser_registration(
             return ""
         if manual_v2_cached_sms_code:
             return manual_v2_cached_sms_code
-        code = str(sms_provider.peek_code(manual_v2_sms_activation_id, proxy=ctx.proxy) or "").strip()
+        # 非 6 位的码不入缓存，避免上游据此误判"验证码已就绪"
+        code = _normalize_manual_v2_sms_code(
+            sms_provider.peek_code(manual_v2_sms_activation_id, proxy=ctx.proxy)
+        )
         if code:
             manual_v2_cached_sms_code = code
         return manual_v2_cached_sms_code
@@ -9280,11 +9456,18 @@ def run_browser_registration(
     launch_resources: Optional[BrowserLaunchResources] = None
     preserve_browser_on_error = False
     try:
-        try:
-            launch_resources = _launch_via_local_uc_bridge(playwright, ctx, cfg)
-            emitter.info(f"浏览器已切换为本地 uc 桥接模式: {launch_resources.launch_mode}", step="oauth_init")
-        except Exception as exc:
-            raise RuntimeError(f"本地 uc 启动失败，无法继续注册流程: {exc}") from exc
+        if cfg.get("browser_engine") == "roxy":
+            try:
+                launch_resources = _launch_via_roxy(playwright, ctx, cfg)
+                emitter.info(f"浏览器已切换为 Roxy 指纹浏览器模式: {launch_resources.launch_mode}", step="oauth_init")
+            except Exception as exc:
+                raise RuntimeError(f"Roxy 启动失败，无法继续注册流程: {exc}") from exc
+        else:
+            try:
+                launch_resources = _launch_via_local_uc_bridge(playwright, ctx, cfg)
+                emitter.info(f"浏览器已切换为本地 uc 桥接模式: {launch_resources.launch_mode}", step="oauth_init")
+            except Exception as exc:
+                raise RuntimeError(f"本地 uc 启动失败，无法继续注册流程: {exc}") from exc
 
         browser = launch_resources.browser
         context = launch_resources.context

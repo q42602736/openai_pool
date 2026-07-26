@@ -168,6 +168,13 @@
                       <option value="protocol">协议模式</option>
                     </select>
                   </div>
+                  <div class="config-field span-2">
+                    <label>浏览器引擎</label>
+                    <select id="browserEngine">
+                      <option value="uc">本地 Chrome（uc 桥接）</option>
+                      <option value="roxy">RoxyBrowser 指纹浏览器</option>
+                    </select>
+                  </div>
                   <div class="config-field">
                     <label>模式2手机号来源</label>
                     <select id="browserManualV2PhoneMode">
@@ -175,6 +182,7 @@
                       <option value="hero_sms">HeroSMS 全自动</option>
                       <option value="smsbower">SMSBower 全自动</option>
                     </select>
+                    <div class="config-hint">HeroSMS 与 SMSBower 各存一套独立凭据，切换来源会自动套用对应那套，互不覆盖。</div>
                   </div>
                   <div class="config-field">
                     <label>模式2邮箱来源</label>
@@ -209,6 +217,55 @@
                         <span>阻止图片/字体资源</span>
                       </label>
                     </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="sidebar-config-card" id="roxyConfigCard" style="display:none">
+                <div class="sidebar-config-card-title">RoxyBrowser 配置</div>
+                <div class="sidebar-config-grid">
+                  <div class="config-field span-2">
+                    <label>本地 API 地址</label>
+                    <input type="text" id="roxyApiBase" value="http://127.0.0.1:50000" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:50000" />
+                  </div>
+                  <div class="config-field span-2">
+                    <label>API Key</label>
+                    <input type="password" id="roxyApiKey" value="" autocomplete="off" />
+                  </div>
+                  <div class="config-field">
+                    <label>工作区 ID</label>
+                    <input type="text" id="roxyWorkspaceId" value="" autocomplete="off" spellcheck="false" placeholder="数字 ID 或 CAI..." />
+                  </div>
+                  <div class="config-field">
+                    <label>资料 ID（窗口 dirId）</label>
+                    <input type="text" id="roxyProfileId" value="" autocomplete="off" spellcheck="false" placeholder="窗口 dirId" />
+                  </div>
+                  <div class="config-field span-2 config-field-toggle-group">
+                    <div class="config-mini-label">每次注册前的资料处理</div>
+                    <div class="sidebar-toggle-grid">
+                      <label class="sidebar-toggle-chip" for="roxyApplyProxy">
+                        <span class="ios-toggle ios-toggle-sm">
+                          <input type="checkbox" id="roxyApplyProxy" checked />
+                          <span class="toggle-track"></span>
+                        </span>
+                        <span>写入代理池 IP</span>
+                      </label>
+                      <label class="sidebar-toggle-chip" for="roxyClearCache">
+                        <span class="ios-toggle ios-toggle-sm">
+                          <input type="checkbox" id="roxyClearCache" checked />
+                          <span class="toggle-track"></span>
+                        </span>
+                        <span>清理本地缓存</span>
+                      </label>
+                      <label class="sidebar-toggle-chip" for="roxyRandomFingerprint">
+                        <span class="ios-toggle ios-toggle-sm">
+                          <input type="checkbox" id="roxyRandomFingerprint" checked />
+                          <span class="toggle-track"></span>
+                        </span>
+                        <span>随机化指纹</span>
+                      </label>
+                    </div>
+                    <div class="config-hint">指纹由 Roxy 平台侧接管，本项目不再叠加自建指纹。「显示浏览器窗口」开关同样生效，但无头模式下 Turnstile 通过率明显偏低，建议保持有头。</div>
                   </div>
                 </div>
               </div>
