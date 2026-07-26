@@ -150,7 +150,7 @@ HANDLER_API_PROVIDER_LABELS: Dict[str, str] = {
 }
 
 SMSBOWER_AUTO_COUNTRY_ID = 0
-SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO", "CA", "AR"}
+SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO", "CA", "AR", "IT"}
 SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "indonesia",
     "indonesian",
@@ -164,11 +164,14 @@ SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "argentinas",
     "argentine",
     "argentinian",
+    "italy",
+    "italian",
     "印度尼西亚",
     "菲律宾",
     "罗马尼亚",
     "加拿大",
     "阿根廷",
+    "意大利",
 }
 
 # 自动国家：同国连续注册失败达到阈值后临时软禁，避免反复烧同国号码。
