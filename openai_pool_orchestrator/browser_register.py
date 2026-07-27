@@ -1417,28 +1417,257 @@ def _choose_first_supported_option(page: Any, locator: Any, candidates: list[str
     return False
 
 
-def _click_primary_action(page: Any, preferred_texts: list[str], *, allow_generic_fallback: bool = True) -> bool:
-    selectors: list[str] = []
-    for text in preferred_texts:
-        safe_text = text.replace('"', '\\"')
-        selectors.extend(
-            [
-                f'button:has-text("{safe_text}")',
-                f'[role="button"]:has-text("{safe_text}")',
-                f'input[type="submit"][value*="{safe_text}"]',
-            ]
-        )
-    if allow_generic_fallback:
-        selectors.extend(
-            [
-                'button[type="submit"]',
-                'form button:not([disabled])',
-                'main button:not([disabled])',
-                'button:not([disabled])',
-            ]
-        )
-    if _click_first(page, selectors, timeout_ms=1500):
+def _is_oauth_provider_action_text(text: Any) -> bool:
+    """识别第三方登录按钮文案，避免 Continue 误点到 Continue with Google。"""
+    lower = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not lower:
+        return False
+    provider_tokens = (
+        "google",
+        "apple",
+        "microsoft",
+        "github",
+        "facebook",
+        "邮箱",
+        "email",
+        "sso",
+    )
+    if any(token in lower for token in provider_tokens):
+        # 纯 “Continue / 继续” 不含 provider 词；带 provider 的一律拒绝。
         return True
+    return False
+
+
+def _is_social_login_choice_page(url: str, body_text: str, page: Any = None) -> bool:
+    """
+    登录方式选择页（Continue with Google/Apple/Phone...）。
+    这种页绝不能当 workspace/consent 授权页去点 Continue，否则会误进 Google 登录。
+    """
+    url_lower = str(url or "").lower()
+    body_lower = str(body_text or "").lower()
+    # 已进入第三方域名则由第三方分支处理。
+    if any(
+        domain in url_lower
+        for domain in (
+            "accounts.google.com",
+            "login.microsoftonline.com",
+            "appleid.apple.com",
+            "login.live.com",
+        )
+    ):
+        return False
+    social_signals = 0
+    for token in (
+        "continue with google",
+        "continue with apple",
+        "continue with microsoft",
+        "继续使用 google",
+        "继续使用 apple",
+        "继续使用 microsoft",
+    ):
+        if token in body_lower:
+            social_signals += 1
+    phone_signal = any(
+        token in body_lower
+        for token in (
+            "continue with phone",
+            "use phone instead",
+            "继续使用手机",
+            "手机登录",
+        )
+    )
+    if social_signals >= 1 and phone_signal:
+        return True
+    if social_signals >= 2:
+        return True
+    if page is None:
+        return False
+    # 页面动作诊断级确认：可见的第三方登录按钮。
+    try:
+        actions = str(_summarize_primary_actions(page) or "").lower()
+    except Exception:
+        actions = ""
+    if not actions:
+        return False
+    provider_hits = sum(
+        1
+        for token in ("continue with google", "continue with apple", "continue with microsoft")
+        if token in actions
+    )
+    return provider_hits >= 1 and (
+        "continue with phone" in actions or phone_signal or provider_hits >= 2
+    )
+
+
+def _click_exact_action_texts(
+    page: Any,
+    preferred_texts: list[str],
+    *,
+    allow_generic_submit: bool = False,
+    timeout_ms: int = 1500,
+) -> bool:
+    """
+    按按钮完整文案精确点击。
+    禁止用 :has-text('Continue') 这种子串匹配，否则会点到 Continue with Google。
+    """
+    if page is None:
+        return False
+    wanted = [str(item or "").strip() for item in (preferred_texts or []) if str(item or "").strip()]
+    if not wanted and not allow_generic_submit:
+        return False
+    try:
+        clicked = bool(
+            page.evaluate(
+                """({ wanted, allowGenericSubmit, rejectProviders }) => {
+                    const normalize = (value) => String(value || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    const lower = (value) => normalize(value).toLowerCase();
+                    const isVisible = (node) => {
+                        if (!node) return false;
+                        const rect = node.getBoundingClientRect();
+                        const style = window.getComputedStyle(node);
+                        return rect.width > 0
+                            && rect.height > 0
+                            && style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && style.opacity !== '0';
+                    };
+                    const readText = (node) => normalize(
+                        node?.innerText
+                        || node?.textContent
+                        || node?.value
+                        || node?.getAttribute?.('aria-label')
+                        || node?.getAttribute?.('title')
+                        || ''
+                    );
+                    const isRejected = (text) => {
+                        const textLower = lower(text);
+                        if (!textLower) return true;
+                        return (rejectProviders || []).some((token) => textLower.includes(String(token || '').toLowerCase()));
+                    };
+                    const isEnabled = (node) => {
+                        if (!node || node.disabled) return false;
+                        const ariaDisabled = String(node.getAttribute?.('aria-disabled') || '').trim().toLowerCase();
+                        return ariaDisabled !== 'true';
+                    };
+                    const clickNode = (node) => {
+                        try {
+                            node.focus?.();
+                        } catch (e) {}
+                        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+                            try {
+                                node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                            } catch (e) {}
+                        });
+                        try {
+                            node.click?.();
+                        } catch (e) {}
+                    };
+                    const nodes = Array.from(document.querySelectorAll(
+                        'button, [role="button"], input[type="submit"], input[type="button"], a[href]'
+                    ));
+                    const wantedLower = (wanted || []).map((item) => lower(item)).filter(Boolean);
+                    // 1) 精确完整文案匹配（大小写不敏感）
+                    // 注意：这里不做 provider 拒绝，这样显式传入 “Continue with phone” 仍可点中。
+                    for (const want of wantedLower) {
+                        for (const node of nodes) {
+                            if (!isVisible(node) || !isEnabled(node)) continue;
+                            const text = readText(node);
+                            if (!text) continue;
+                            if (lower(text) !== want) continue;
+                            clickNode(node);
+                            return true;
+                        }
+                    }
+                    // 2) 可选：仅点击“干净”的 submit；文案带 google/apple/phone 等一律跳过
+                    if (allowGenericSubmit) {
+                        for (const node of nodes) {
+                            if (!isVisible(node) || !isEnabled(node)) continue;
+                            const tag = String(node.tagName || '').toLowerCase();
+                            const type = String(node.getAttribute?.('type') || '').toLowerCase();
+                            const text = readText(node);
+                            if (text && isRejected(text)) continue;
+                            const isSubmit = type === 'submit' || (tag === 'button' && (!type || type === 'submit'));
+                            if (!isSubmit) continue;
+                            // 没有文案的 submit，或文案恰好是 Continue/Next/继续 等短词
+                            if (!text || wantedLower.includes(lower(text))) {
+                                clickNode(node);
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }""",
+                {
+                    "wanted": wanted,
+                    "allowGenericSubmit": bool(allow_generic_submit),
+                    "rejectProviders": [
+                        "google",
+                        "apple",
+                        "microsoft",
+                        "github",
+                        "facebook",
+                        "email",
+                        "邮箱",
+                        "sso",
+                        "with phone",
+                        "使用手机",
+                        "手机登录",
+                    ],
+                },
+            )
+        )
+    except Exception:
+        clicked = False
+    if clicked:
+        return True
+    # 回退：Playwright text= 精确匹配（不是 has-text 子串）
+    for text in wanted:
+        if _is_oauth_provider_action_text(text):
+            continue
+        safe = str(text).replace('"', '\\"')
+        if _click_first(
+            page,
+            [
+                f'button:text-is("{safe}")',
+                f'[role="button"]:text-is("{safe}")',
+                f'input[type="submit"][value="{safe}"]',
+            ],
+            timeout_ms=min(800, int(timeout_ms or 800)),
+        ):
+            return True
+    return False
+
+
+def _click_primary_action(page: Any, preferred_texts: list[str], *, allow_generic_fallback: bool = True) -> bool:
+    # 先精确点目标文案，绝不用 :has-text("Continue") 去匹配 Continue with Google。
+    if _click_exact_action_texts(
+        page,
+        preferred_texts,
+        allow_generic_submit=False,
+        timeout_ms=1500,
+    ):
+        return True
+    if allow_generic_fallback and _click_exact_action_texts(
+        page,
+        preferred_texts,
+        allow_generic_submit=True,
+        timeout_ms=1200,
+    ):
+        return True
+    # 最后才按 Enter；若当前焦点在第三方登录按钮上仍可能误触，因此仅在没有社交登录选择页时使用。
+    try:
+        current_url = str(getattr(page, "url", "") or "")
+    except Exception:
+        current_url = ""
+    body_text = ""
+    try:
+        body_text = _get_body_text(page)
+    except Exception:
+        body_text = ""
+    if _is_social_login_choice_page(current_url, body_text, page):
+        return False
     try:
         page.keyboard.press("Enter")
         return True
@@ -4164,6 +4393,17 @@ def _click_choose_account_phone_card(page: Any, phone_number: str) -> Dict[str, 
 
 def _is_create_account_password_page(url: str, body_text: str, page: Any) -> bool:
     url_lower = str(url or "").lower()
+    # 绝不能把 Google/Microsoft/Apple 登录密码页当成 create-account/password。
+    if any(
+        domain in url_lower
+        for domain in (
+            "accounts.google.com",
+            "login.microsoftonline.com",
+            "appleid.apple.com",
+            "login.live.com",
+        )
+    ):
+        return False
     if page is not None:
         for frame_url in _collect_auth_frame_urls(page):
             frame_lower = str(frame_url or "").lower()
@@ -4612,6 +4852,16 @@ def _wait_for_create_account_password_ready(page: Any, *, timeout_ms: int = 1200
 
 def _is_login_password_page(url: str, body_text: str, page: Any) -> bool:
     url_lower = str(url or "").lower()
+    if any(
+        domain in url_lower
+        for domain in (
+            "accounts.google.com",
+            "login.microsoftonline.com",
+            "appleid.apple.com",
+            "login.live.com",
+        )
+    ):
+        return False
     if "/log-in/password" not in url_lower:
         return False
     if _is_create_account_password_page(url, body_text, page):
@@ -8762,9 +9012,9 @@ def run_browser_registration(
         auto_country_mode = bool(sms_order.get("auto_country_mode"))
         candidate_country_total = int(sms_order.get("country_candidates_total") or 0)
         soft_banned_skipped = int(sms_order.get("soft_banned_countries_skipped") or 0)
-        if soft_banned_skipped > 0:
+        if soft_banned_skipped > 0 and manual_v2_auto_phone_mode_name == "smsbower":
             emitter.info(
-                f"浏览器模式2 {manual_v2_auto_phone_provider_label} 自动国家候选已跳过 {soft_banned_skipped} 个"
+                f"浏览器模式2 SMSBower 自动国家候选已跳过 {soft_banned_skipped} 个"
                 + "连败软禁国家（同国连续 5 次注册失败会禁 5 分钟）。",
                 step=step,
             )
@@ -9112,6 +9362,9 @@ def run_browser_registration(
             return
         if not manual_v2_auto_phone_mode:
             return
+        # 连败国家软禁仅 SMSBower 启用；HeroSMS 不记账、不禁取。
+        if manual_v2_auto_phone_mode_name != "smsbower":
+            return
         if manual_v2_sms_country_id is None and not manual_v2_sms_country_iso and not manual_v2_sms_country_name:
             return
         manual_v2_sms_country_result_recorded = True
@@ -9139,9 +9392,9 @@ def run_browser_registration(
             )
             if ban_info.get("just_banned"):
                 emitter.warn(
-                    f"浏览器模式2 国家 {country_label} 已连续注册失败 "
+                    f"浏览器模式2 SMSBower 国家 {country_label} 已连续注册失败 "
                     + f"{ban_info.get('failure_streak_before_reset') or ban_info.get('threshold') or 5} 次，"
-                    + f"自动国家模式将禁取该国约 {ban_info.get('ban_seconds') or 300} 秒。",
+                    + f"将禁取该国约 {ban_info.get('ban_seconds') or 300} 秒。",
                     step="runtime",
                 )
             else:
@@ -9149,7 +9402,7 @@ def run_browser_registration(
                 threshold = int(ban_info.get("threshold") or 5)
                 if streak > 0:
                     emitter.info(
-                        f"浏览器模式2 国家 {country_label} 注册失败连败 {streak}/{threshold}；"
+                        f"浏览器模式2 SMSBower 国家 {country_label} 注册失败连败 {streak}/{threshold}；"
                         + f"达到 {threshold} 次将临时禁取该国 5 分钟。",
                         step="runtime",
                     )
@@ -13150,7 +13403,7 @@ def run_browser_registration(
                     continue
 
                 # 检测第三方 OAuth 登录页（Google/Microsoft/Apple 等）
-                # 如果步骤2登录提交手机号后被重定向到第三方登录页，说明该手机号绑定了第三方账户，无法继续
+                # 步骤1若误点 Continue with Google 会进这里；步骤2若手机号绑定第三方账户也会进这里。
                 _third_party_oauth_domains = (
                     "accounts.google.com",
                     "login.microsoftonline.com",
@@ -13158,17 +13411,87 @@ def run_browser_registration(
                     "login.live.com",
                 )
                 if any(domain in current_url_lower for domain in _third_party_oauth_domains):
+                    third_party_host = (
+                        current_url_lower.split("/")[2]
+                        if "/" in current_url_lower
+                        else current_url_lower
+                    )
                     if is_manual_v2_mode and manual_v2_login_flow_started:
                         raise RuntimeError(
-                            f"浏览器模式2 第二步登录后被重定向到第三方登录页 ({current_url_lower.split('/')[2] if '/' in current_url_lower else current_url_lower})，"
+                            f"浏览器模式2 第二步登录后被重定向到第三方登录页 ({third_party_host})，"
                             f"说明该手机号绑定了第三方账户（Google/Microsoft/Apple），无法继续注册，需要重新拉取浏览器重新注册"
                         )
+                    if is_manual_v2_mode and not manual_v2_login_flow_started:
+                        # 步骤1误入 Google/Apple 登录：立刻弃号重开，避免把注册密码填进 Google 密码框。
+                        emitter.warn(
+                            f"浏览器模式2 步骤1误入第三方登录页 ({third_party_host})，"
+                            + "通常是登录方式页误点了 Continue with Google/Apple；"
+                            + "已废弃当前号码并回到步骤1重开手机号流程...",
+                            step="add_phone",
+                        )
+                        if manual_v2_auto_phone_mode:
+                            _finish_manual_v2_sms_provider(success=False)
+                            manual_v2_phone_number = ""
+                            manual_v2_sms_activation_id = ""
+                            manual_v2_sms_purchased_at = 0.0
+                            manual_v2_sms_provider_done = False
+                        _prepare_manual_v2_signup_flow(
+                            f"浏览器模式2 步骤1误入第三方登录页 ({third_party_host})，回到步骤1重新取号/输号..."
+                        )
+                        continue
                     # 非 manual_v2 模式下也不应该在第三方登录页上尝试授权操作
                     _sleep_with_page(page, 1000)
                     continue
 
                 _is_third_party_page = any(domain in current_url_lower for domain in _third_party_oauth_domains)
-                if not _is_third_party_page and _is_codex_consent_page(current_url, body_text):
+                _is_social_choice_page = _is_social_login_choice_page(current_url, body_text, page)
+                if _is_social_choice_page and is_manual_v2_mode and not manual_v2_login_flow_started:
+                    # 步骤1若回到 Google/Apple/Phone 登录方式页：只允许点手机入口，绝不点 Continue/Google。
+                    emitter.warn(
+                        "浏览器模式2 步骤1当前停在社交登录方式选择页（含 Continue with Google/Apple/Phone），"
+                        + "不会执行授权页 Continue，优先点 Continue with phone 拉回手机号流程..."
+                        + f" actions={_summarize_primary_actions(page)}",
+                        step="add_phone",
+                    )
+                    phone_entry_clicked = _click_exact_action_texts(
+                        page,
+                        [
+                            "Continue with phone",
+                            "Use phone instead",
+                            "继续使用手机登录",
+                            "使用手机",
+                            "手机登录",
+                        ],
+                        allow_generic_submit=False,
+                        timeout_ms=1500,
+                    )
+                    if not phone_entry_clicked:
+                        phone_entry_clicked = _click_first(
+                            page,
+                            [
+                                'a[data-auth-provider="phone"]',
+                                'button[data-auth-provider="phone"]',
+                                'a:has-text("Continue with phone")',
+                                'button:has-text("Continue with phone")',
+                                '[role="button"]:has-text("Continue with phone")',
+                            ],
+                            timeout_ms=1200,
+                        )
+                    if phone_entry_clicked:
+                        emitter.info(
+                            "浏览器模式2 已在社交登录方式页点击 Continue with phone，等待回到手机号输入...",
+                            step="add_phone",
+                        )
+                        _wait_for_load(page, timeout_ms=2500)
+                    else:
+                        _sleep_with_page(page, 800)
+                    continue
+
+                if (
+                    not _is_third_party_page
+                    and not _is_social_choice_page
+                    and _is_codex_consent_page(current_url, body_text)
+                ):
                     if not manual_v2_workspace_logged:
                         manual_v2_workspace_logged = True
                         emitter.info(
@@ -13213,7 +13536,11 @@ def run_browser_registration(
                     _wait_for_load(page)
                     continue
 
-                if not _is_third_party_page and any(keyword in current_url_lower for keyword in ("consent", "workspace", "organization")):
+                if (
+                    not _is_third_party_page
+                    and not _is_social_choice_page
+                    and any(keyword in current_url_lower for keyword in ("consent", "workspace", "organization"))
+                ):
                     if not manual_v2_workspace_logged:
                         manual_v2_workspace_logged = True
                         emitter.info(
@@ -13258,6 +13585,7 @@ def run_browser_registration(
                     and manual_v2_login_flow_started
                     and not manual_v2_oauth_resumed
                     and not _is_third_party_page
+                    and not _is_social_choice_page
                     and (
                         manual_v2_email_otp_completed
                         or ("code=" in current_url_lower and "state=" in current_url_lower)
@@ -13275,6 +13603,7 @@ def run_browser_registration(
 
                 if (
                     not _is_third_party_page
+                    and not _is_social_choice_page
                     and not _is_codex_consent_page(current_url, body_text)
                     and any(keyword in body_lower for keyword in ("authorize", "workspace", "organization", "allow access"))
                 ):

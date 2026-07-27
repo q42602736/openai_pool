@@ -174,7 +174,8 @@ SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "意大利",
 }
 
-# 自动国家：同国连续注册失败达到阈值后临时软禁，避免反复烧同国号码。
+# 仅 SMSBower：同国连续注册失败达到阈值后临时软禁，避免反复烧同国号码。
+# HeroSMS 不启用此逻辑。
 SMS_COUNTRY_SOFT_BAN_FAIL_THRESHOLD = 5
 SMS_COUNTRY_SOFT_BAN_SECONDS = 5 * 60
 _SMS_COUNTRY_SOFT_BAN_LOCK = threading.Lock()
@@ -471,12 +472,25 @@ class HeroSMSProvider(SMSProvider):
         self.min_target_price, self.max_target_price = parse_price_range(self.target_price_raw)
         self.target_price = self.max_target_price
         self.fixed_price = _as_bool(fixed_price, default=True) and self.min_target_price is not None and self.max_target_price is not None
+        # 只作价格上限 + 单点目标价：parse_price_range 会把 min=max=同一值。
+        # 若保留 min，更低成交价（如上限 0.038 实际 0.033）会被误判为“低于区间”并取消号码。
+        if (
+            not self.fixed_price
+            and self.min_target_price is not None
+            and self.max_target_price is not None
+            and abs(self.min_target_price - self.max_target_price) <= self.PRICE_COMPARE_EPSILON
+        ):
+            self.min_target_price = None
         try:
             self.max_acquire_retries = max(1, int(max_acquire_retries or 5))
         except (TypeError, ValueError):
             self.max_acquire_retries = 5
 
     def _supports_global_auto_country(self) -> bool:
+        return False
+
+    def _supports_country_soft_ban(self) -> bool:
+        """连败国家软禁仅 SMSBower 启用；HeroSMS 永远关闭。"""
         return False
 
     def _resolve_catalog_country(self, *, proxy: str = "") -> Dict[str, Any]:
@@ -578,6 +592,10 @@ class HeroSMSProvider(SMSProvider):
     def _resolve_actual_price_floor(self, expected_price: Optional[float]) -> Optional[float]:
         if self.min_target_price is not None:
             return self.min_target_price
+        # 上限模式 / 自动最低价：更便宜完全可接受，不能用 expected 当地板，
+        # 否则会出现「上限 $0.038、实际 $0.033 反而被拒并取消号码」。
+        if not self.fixed_price:
+            return None
         return expected_price
 
     def _has_price_range(self) -> bool:
@@ -1348,9 +1366,10 @@ class HeroSMSProvider(SMSProvider):
                 default=16,
                 allow_zero=self._supports_global_auto_country(),
             )
-        # 固定国家模式：若该国因连败被软禁，直接拒绝取号，避免 5 分钟内反复烧号。
+        # 仅 SMSBower 固定国家：若该国因连败被软禁，直接拒绝取号，避免 5 分钟内反复烧号。
         if (
-            selected_country_id
+            self._supports_country_soft_ban()
+            and selected_country_id
             and selected_country_id != SMSBOWER_AUTO_COUNTRY_ID
             and is_sms_country_soft_banned(
                 country_id=selected_country_id,
@@ -1773,17 +1792,28 @@ class HeroSMSProvider(SMSProvider):
             if expected_price is not None and actual_cost is not None:
                 max_allowed_price = self._resolve_actual_price_ceiling(expected_price)
                 min_allowed_price = self._resolve_actual_price_floor(expected_price)
-                if (
-                    (max_allowed_price is not None and actual_cost > (max_allowed_price + self.PRICE_COMPARE_EPSILON))
-                    or (min_allowed_price is not None and actual_cost < (min_allowed_price - self.PRICE_COMPARE_EPSILON))
-                ):
+                too_expensive = (
+                    max_allowed_price is not None
+                    and actual_cost > (max_allowed_price + self.PRICE_COMPARE_EPSILON)
+                )
+                too_cheap = (
+                    min_allowed_price is not None
+                    and actual_cost < (min_allowed_price - self.PRICE_COMPARE_EPSILON)
+                )
+                if too_expensive or too_cheap:
                     debug_events.append(
                         f"第 {attempt} 次尝试实际成交价超出范围：预期 ${expected_price}，允许区间 ${min_allowed_price if min_allowed_price is not None else '-'}-${max_allowed_price if max_allowed_price is not None else '-'}，实际 ${actual_cost}，运营商 {current_operator or 'ANY'}"
                     )
-                    if self.max_target_price is not None or self.min_target_price is not None:
+                    if too_expensive and (self.max_target_price is not None or self.min_target_price is not None):
                         last_error = (
-                            f"{provider_label} 实际成交价超出设定价格区间: "
-                            f"target={self._price_target_label()}, actual={actual_cost}, "
+                            f"{provider_label} 实际成交价高于设定上限: "
+                            f"target={self._price_target_label()}, actual=${actual_cost}, "
+                            f"operator={current_operator or '-'}, country={selected_country_id}"
+                        )
+                    elif too_cheap and (self.max_target_price is not None or self.min_target_price is not None):
+                        last_error = (
+                            f"{provider_label} 实际成交价低于设定下限: "
+                            f"target={self._price_target_label()}, actual=${actual_cost}, "
                             f"operator={current_operator or '-'}, country={selected_country_id}"
                         )
                     else:
@@ -1832,6 +1862,7 @@ class HeroSMSProvider(SMSProvider):
                 raise HeroSMSAcquireRetryableError(_build_failure_message(last_error))
             if (
                 auto_country_mode
+                and self._supports_country_soft_ban()
                 and is_sms_country_soft_banned(
                     country_id=selected_country_id,
                     iso_code=str(selection.get("iso_code") or "").strip().upper(),
@@ -2072,6 +2103,9 @@ class SMSBowerProvider(HeroSMSProvider):
     API_V1_BASE_URL = "https://smsbower.page/api/v1"
 
     def _supports_global_auto_country(self) -> bool:
+        return True
+
+    def _supports_country_soft_ban(self) -> bool:
         return True
 
     @staticmethod

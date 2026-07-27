@@ -64,6 +64,8 @@ const state = {
 let suppressHeroSmsPriceTierChange = false;
 let suppressHeroSmsPriceTierChangeReleaseTimer = null;
 let lastManualHeroSmsTargetPrice = '';
+// 最近一次拉到的价档列表，切换「价格模式」时无需重新请求也能重绘下拉框。
+let lastHeroSmsPriceTierRows = [];
 
 const SMS_PROVIDER_PROFILE_MODES = ['hero_sms', 'smsbower'];
 // 两档接码平台各存一份完整表单值，切换来源时互不覆盖
@@ -634,16 +636,37 @@ document.addEventListener('DOMContentLoaded', () => {
       if (value) {
         if (DOM.heroSmsTargetPrice) DOM.heroSmsTargetPrice.value = value;
         lastManualHeroSmsTargetPrice = value;
+        // 从价档列表点选某一档 = 明确锁定该价，自动切到固定价模式，避免仍显示「上限+自动」。
+        if (DOM.heroSmsFixedPrice && DOM.heroSmsFixedPrice.value !== 'true') {
+          DOM.heroSmsFixedPrice.value = 'true';
+        }
+        renderHeroSmsPriceTierOptions(lastHeroSmsPriceTierRows, value);
         return;
       }
+      // 回到「自动最低价」时保留目标价/上限价（上限模式下目标价仍是天花板）。
       if (DOM.heroSmsTargetPrice && !DOM.heroSmsTargetPrice.value.trim()) {
         lastManualHeroSmsTargetPrice = '';
       }
+      renderHeroSmsPriceTierOptions(
+        lastHeroSmsPriceTierRows,
+        DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '',
+      );
     });
   }
   if (DOM.heroSmsTargetPrice) {
     DOM.heroSmsTargetPrice.addEventListener('input', () => {
       lastManualHeroSmsTargetPrice = DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '';
+      // 手改目标价后，按当前价格模式重绘档位选中态（上限模式保持自动最低价）。
+      renderHeroSmsPriceTierOptions(lastHeroSmsPriceTierRows, lastManualHeroSmsTargetPrice);
+      renderHeroSmsPriceTierList(lastHeroSmsPriceTierRows, lastManualHeroSmsTargetPrice);
+    });
+  }
+  if (DOM.heroSmsFixedPrice) {
+    DOM.heroSmsFixedPrice.addEventListener('change', () => {
+      const currentTargetPrice = lastManualHeroSmsTargetPrice
+        || (DOM.heroSmsTargetPrice ? DOM.heroSmsTargetPrice.value.trim() : '');
+      renderHeroSmsPriceTierOptions(lastHeroSmsPriceTierRows, currentTargetPrice);
+      renderHeroSmsPriceTierList(lastHeroSmsPriceTierRows, currentTargetPrice);
     });
   }
   if (DOM.registerMode) {
@@ -1153,21 +1176,51 @@ function formatHeroSmsPriceTierLabel(item) {
   return [price, count, physical, ...tags].filter(Boolean).join(' · ');
 }
 
+function isHeroSmsFixedPriceMode() {
+  // 未挂载下拉框时按固定价处理，避免误把目标价当成上限回填到档位。
+  if (!DOM.heroSmsFixedPrice) return true;
+  return String(DOM.heroSmsFixedPrice.value || 'true') === 'true';
+}
+
+function resolveHeroSmsPriceTierSelectValue(selectedPrice = '') {
+  // 价格档位下拉框只表示「锁定某一真实价档」。
+  // 只作价格上限时，目标价是天花板，不是锁定档位；应保持「自动最低价」。
+  const raw = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
+  if (!raw) return '';
+  if (/[-–—~]/.test(raw)) return '';
+  if (!isHeroSmsFixedPriceMode()) return '';
+  return raw;
+}
+
 function renderHeroSmsPriceTierList(rows, selectedPrice = '') {
   if (!DOM.heroSmsPriceTierList) return;
-  DOM.heroSmsPriceTierList.textContent = '';
+  const rawTargetPrice = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
+  if (!isHeroSmsFixedPriceMode()) {
+    DOM.heroSmsPriceTierList.textContent = rawTargetPrice
+      ? `上限模式：自动在 ≤ $${rawTargetPrice} 的档位里从低到高取号；点某一具体档位会改成固定价锁定。`
+      : '上限模式：目标价留空=不限价自动最低；填写后=不超过该上限的自动最低价。';
+    return;
+  }
+  DOM.heroSmsPriceTierList.textContent = rawTargetPrice
+    ? `固定价模式：将严格锁定目标价 ${rawTargetPrice} 对应档位。`
+    : '固定价模式：请从价档列表选择一档，或手填真实存在的价位/区间。';
 }
 
 function renderHeroSmsPriceTierOptions(rows, selectedPrice = '') {
   if (!DOM.heroSmsPriceTierSelect) return;
   const list = Array.isArray(rows) ? rows : [];
-  const normalizedSelected = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
+  lastHeroSmsPriceTierRows = list;
+  const rawTargetPrice = String(selectedPrice || DOM.heroSmsTargetPrice?.value || '').trim();
+  const normalizedSelected = resolveHeroSmsPriceTierSelectValue(rawTargetPrice);
+  const ceilingMode = !isHeroSmsFixedPriceMode() && !!rawTargetPrice;
   beginSuppressHeroSmsPriceTierChange(320);
   try {
     DOM.heroSmsPriceTierSelect.innerHTML = '';
     const autoOption = document.createElement('option');
     autoOption.value = '';
-    autoOption.textContent = '自动最低价';
+    autoOption.textContent = ceilingMode
+      ? `自动最低价（不超过 $${rawTargetPrice}）`
+      : '自动最低价';
     autoOption.selected = !normalizedSelected;
     DOM.heroSmsPriceTierSelect.appendChild(autoOption);
 
@@ -1183,6 +1236,8 @@ function renderHeroSmsPriceTierOptions(rows, selectedPrice = '') {
       DOM.heroSmsPriceTierSelect.appendChild(option);
     });
 
+    // 仅固定价模式才保留「手填且不在列表里的目标价」为选中项；
+    // 上限模式目标价只是天花板，不该伪装成某一档位。
     if (normalizedSelected && !hasSelectedPrice) {
       const preservedOption = document.createElement('option');
       preservedOption.value = normalizedSelected;
