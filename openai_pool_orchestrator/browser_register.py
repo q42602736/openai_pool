@@ -668,47 +668,232 @@ def _first_visible_locator(page: Any, selectors: list[str]) -> Any:
     return None
 
 
-def _click_first(page: Any, selectors: list[str], *, timeout_ms: int = 800) -> bool:
-    locator = _first_visible_locator(page, selectors)
-    if locator is None:
-        return False
+# 参照 grok注册机 human_input：记录每页最后鼠标位置，轨迹从真实落点续走。
+_PAGE_MOUSE_POS: Dict[int, tuple[float, float]] = {}
+
+
+def _resolve_mouse_page(page: Any, locator: Any = None) -> Any:
+    if locator is not None:
+        try:
+            owner = getattr(locator, "page", None)
+            if owner is not None:
+                return owner
+        except Exception:
+            pass
+    return page
+
+
+def _get_page_mouse_pos(page: Any) -> tuple[float, float]:
+    if page is None:
+        return 0.0, 0.0
     try:
-        locator.click(timeout=timeout_ms)
+        return _PAGE_MOUSE_POS.get(id(page), (0.0, 0.0))
+    except Exception:
+        return 0.0, 0.0
+
+
+def _set_page_mouse_pos(page: Any, x: float, y: float) -> None:
+    if page is None:
+        return
+    try:
+        _PAGE_MOUSE_POS[id(page)] = (float(x), float(y))
+    except Exception:
+        pass
+
+
+def _page_viewport_size(page: Any) -> tuple[float, float]:
+    try:
+        size = getattr(page, "viewport_size", None) or {}
+        vw = float(size.get("width") or 0)
+        vh = float(size.get("height") or 0)
+        if vw > 1 and vh > 1:
+            return vw, vh
+    except Exception:
+        pass
+    try:
+        size = page.evaluate(
+            """() => ({
+                w: window.innerWidth || document.documentElement.clientWidth || 1280,
+                h: window.innerHeight || document.documentElement.clientHeight || 800
+            })"""
+        )
+        if isinstance(size, dict):
+            return float(size.get("w") or 1280), float(size.get("h") or 800)
+    except Exception:
+        pass
+    return 1280.0, 800.0
+
+
+def _bezier_mouse_move(
+    page: Any,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    *,
+    duration_ms: Optional[int] = None,
+) -> None:
+    """二次贝塞尔轨迹移动（对齐 grok注册机 human_input._move_cursor_path）。"""
+    if page is None:
+        return
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    if duration_ms is None:
+        duration_ms = int(random.uniform(180, 520))
+    duration_ms = max(80, int(duration_ms))
+    steps = max(8, min(36, int(duration_ms / 16)))
+    mx = (sx + ex) / 2.0 + random.uniform(-40.0, 40.0)
+    my = (sy + ey) / 2.0 + random.uniform(-30.0, 30.0)
+    for i in range(1, steps + 1):
+        t = i / steps
+        u = 1.0 - t
+        x = u * u * sx + 2 * u * t * mx + t * t * ex
+        y = u * u * sy + 2 * u * t * my + t * t * ey
+        if i < steps:
+            x += random.uniform(-1.2, 1.2)
+            y += random.uniform(-1.0, 1.0)
+        try:
+            page.mouse.move(x, y)
+        except Exception:
+            return
+        _set_page_mouse_pos(page, x, y)
+        try:
+            page.wait_for_timeout(max(4, int(duration_ms / steps)))
+        except Exception:
+            time.sleep(max(0.004, duration_ms / steps / 1000.0))
+
+
+def _click_at_point_human_like(
+    page: Any,
+    x: float,
+    y: float,
+    *,
+    hold_ms_lo: int = 45,
+    hold_ms_hi: int = 130,
+) -> bool:
+    """
+    视口坐标真人点击：轨迹移入 → 短停 → press/hold/release。
+    对齐 grok注册机 CF Turnstile 的 CDP 真点思路（Playwright mouse 事件）。
+    """
+    if page is None:
+        return False
+    tx, ty = float(x), float(y)
+    sx, sy = _get_page_mouse_pos(page)
+    vw, vh = _page_viewport_size(page)
+    if sx < 2 or sy < 2:
+        sx = vw * random.uniform(0.18, 0.42)
+        sy = vh * random.uniform(0.22, 0.55)
+    try:
+        # 点击前轻微“思考”
+        if random.random() < 0.55:
+            _sleep_with_page(page, random.randint(80, 280))
+        _bezier_mouse_move(
+            page,
+            (sx, sy),
+            (tx, ty),
+            duration_ms=int(random.uniform(180, 480)),
+        )
+        # 轻微过冲再回正（更像真人）
+        if random.random() < 0.4:
+            overshoot = (
+                tx + random.uniform(-6.0, 6.0),
+                ty + random.uniform(-4.0, 4.0),
+            )
+            _bezier_mouse_move(
+                page,
+                (tx, ty),
+                overshoot,
+                duration_ms=int(random.uniform(50, 120)),
+            )
+            _bezier_mouse_move(
+                page,
+                overshoot,
+                (tx, ty),
+                duration_ms=int(random.uniform(40, 100)),
+            )
+        _sleep_with_page(page, random.randint(40, 140))
+        page.mouse.down()
+        _sleep_with_page(page, random.randint(int(hold_ms_lo), int(hold_ms_hi)))
+        page.mouse.up()
+        _set_page_mouse_pos(page, tx, ty)
+        _sleep_with_page(page, random.randint(90, 280))
         return True
     except Exception:
-        try:
-            locator.first.click(timeout=timeout_ms)
-            return True
-        except Exception:
-            return False
+        return False
 
 
 def _click_locator_human_like(page: Any, locator: Any, *, timeout_ms: int = 1200) -> bool:
+    """
+    元素真人点击（主路径）。
+    参照 grok注册机 human_click：
+    scrollIntoView → 中心附近随机落点 → 贝塞尔轨迹 → press/hold/release。
+    禁止一上来就 JS click / 瞬时 locator.click。
+    """
     if locator is None:
         return False
+    mouse_page = _resolve_mouse_page(page, locator)
+    try:
+        locator.scroll_into_view_if_needed(timeout=min(1200, int(timeout_ms or 1200)))
+    except Exception:
+        try:
+            locator.evaluate(
+                """(el) => {
+                    try { el.scrollIntoView({block:'center', inline:'nearest', behavior:'instant'}); } catch (e) {}
+                }"""
+            )
+        except Exception:
+            pass
+    _sleep_with_page(mouse_page, random.randint(50, 140))
+    box = None
     try:
         box = locator.bounding_box()
     except Exception:
         box = None
-    if box:
-        try:
-            target_x = float(box["x"]) + float(box["width"]) * 0.5 + random.uniform(-4.0, 4.0)
-            target_y = float(box["y"]) + float(box["height"]) * 0.5 + random.uniform(-3.0, 3.0)
-            page.mouse.move(target_x - random.uniform(24.0, 60.0), target_y - random.uniform(12.0, 32.0), steps=random.randint(6, 12))
-            page.wait_for_timeout(random.randint(120, 260))
-            page.mouse.move(target_x, target_y, steps=random.randint(8, 18))
-            page.wait_for_timeout(random.randint(90, 220))
-            page.mouse.down()
-            page.wait_for_timeout(random.randint(35, 90))
-            page.mouse.up()
+    if box and float(box.get("width") or 0) >= 4 and float(box.get("height") or 0) >= 4:
+        width = float(box["width"])
+        height = float(box["height"])
+        # 中心附近高斯偏移，限制在按钮内部（对齐 click_offset_ratio≈0.28）
+        ox = random.gauss(0.0, width * 0.12)
+        oy = random.gauss(0.0, height * 0.12)
+        ox = max(-width * 0.35, min(width * 0.35, ox))
+        oy = max(-height * 0.35, min(height * 0.35, oy))
+        target_x = float(box["x"]) + width * 0.5 + ox
+        target_y = float(box["y"]) + height * 0.5 + oy
+        if _click_at_point_human_like(mouse_page, target_x, target_y):
             return True
+    # 次选：Playwright 自带 delay 点击（仍带按压时长，不是瞬时 JS）
+    try:
+        locator.click(timeout=timeout_ms, delay=random.randint(60, 160))
+        try:
+            box2 = locator.bounding_box()
+            if box2:
+                _set_page_mouse_pos(
+                    mouse_page,
+                    float(box2["x"]) + float(box2["width"]) * 0.5,
+                    float(box2["y"]) + float(box2["height"]) * 0.5,
+                )
         except Exception:
             pass
-    try:
-        locator.click(timeout=timeout_ms, delay=random.randint(60, 140))
+        _sleep_with_page(mouse_page, random.randint(80, 220))
         return True
     except Exception:
         return False
+
+
+def _click_first(page: Any, selectors: list[str], *, timeout_ms: int = 800) -> bool:
+    locator = _first_visible_locator(page, selectors)
+    if locator is None:
+        return False
+    if _click_locator_human_like(page, locator, timeout_ms=timeout_ms):
+        return True
+    # 真人点击失败才退回原生 click
+    try:
+        locator.click(timeout=timeout_ms, delay=random.randint(40, 120))
+        return True
+    except Exception:
+        try:
+            locator.first.click(timeout=timeout_ms, delay=random.randint(40, 120))
+            return True
+        except Exception:
+            return False
 
 
 def _click_text_ancestor(page: Any, texts: list[str], *, timeout_ms: int = 1200) -> bool:
@@ -1507,35 +1692,51 @@ def _click_exact_action_texts(
     timeout_ms: int = 1500,
 ) -> bool:
     """
-    按按钮完整文案精确点击。
-    禁止用 :has-text('Continue') 这种子串匹配，否则会点到 Continue with Google。
+    按按钮完整文案精确点击，并走真人鼠标轨迹。
+    禁止用 :has-text('Continue') 子串匹配，也禁止纯 JS dispatchEvent 假点。
     """
     if page is None:
         return False
     wanted = [str(item or "").strip() for item in (preferred_texts or []) if str(item or "").strip()]
     if not wanted and not allow_generic_submit:
         return False
+
+    # 1) Playwright 精确文案定位 + 真人点击
+    for text in wanted:
+        safe = str(text).replace('"', '\\"')
+        locator = _first_visible_locator(
+            page,
+            [
+                f'button:text-is("{safe}")',
+                f'[role="button"]:text-is("{safe}")',
+                f'input[type="submit"][value="{safe}"]',
+                f'input[type="button"][value="{safe}"]',
+            ],
+        )
+        if locator is not None and _click_locator_human_like(page, locator, timeout_ms=timeout_ms):
+            return True
+
+    # 2) JS 只负责“找到并打标”，真正点击仍走真人轨迹（对齐 grok注册机 find + human_click）
+    marker = f"data-human-click-{int(time.time() * 1000) % 10_000_000}"
     try:
-        clicked = bool(
+        marked = bool(
             page.evaluate(
-                """({ wanted, allowGenericSubmit, rejectProviders }) => {
-                    const normalize = (value) => String(value || '')
-                        .replace(/\\s+/g, ' ')
-                        .trim();
+                """({ wanted, allowGenericSubmit, rejectProviders, marker }) => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
                     const lower = (value) => normalize(value).toLowerCase();
                     const isVisible = (node) => {
                         if (!node) return false;
                         const rect = node.getBoundingClientRect();
                         const style = window.getComputedStyle(node);
-                        return rect.width > 0
-                            && rect.height > 0
+                        return rect.width >= 8
+                            && rect.height >= 8
                             && style.display !== 'none'
                             && style.visibility !== 'hidden'
-                            && style.opacity !== '0';
+                            && style.opacity !== '0'
+                            && style.pointerEvents !== 'none';
                     };
                     const readText = (node) => normalize(
                         node?.innerText
-                        || node?.textContent
                         || node?.value
                         || node?.getAttribute?.('aria-label')
                         || node?.getAttribute?.('title')
@@ -1543,7 +1744,7 @@ def _click_exact_action_texts(
                     );
                     const isRejected = (text) => {
                         const textLower = lower(text);
-                        if (!textLower) return true;
+                        if (!textLower) return false;
                         return (rejectProviders || []).some((token) => textLower.includes(String(token || '').toLowerCase()));
                     };
                     const isEnabled = (node) => {
@@ -1551,36 +1752,25 @@ def _click_exact_action_texts(
                         const ariaDisabled = String(node.getAttribute?.('aria-disabled') || '').trim().toLowerCase();
                         return ariaDisabled !== 'true';
                     };
-                    const clickNode = (node) => {
-                        try {
-                            node.focus?.();
-                        } catch (e) {}
-                        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
-                            try {
-                                node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-                            } catch (e) {}
-                        });
-                        try {
-                            node.click?.();
-                        } catch (e) {}
-                    };
+                    try {
+                        document.querySelectorAll('[' + marker + ']').forEach((n) => n.removeAttribute(marker));
+                    } catch (e) {}
                     const nodes = Array.from(document.querySelectorAll(
                         'button, [role="button"], input[type="submit"], input[type="button"], a[href]'
                     ));
                     const wantedLower = (wanted || []).map((item) => lower(item)).filter(Boolean);
-                    // 1) 精确完整文案匹配（大小写不敏感）
-                    // 注意：这里不做 provider 拒绝，这样显式传入 “Continue with phone” 仍可点中。
+                    const mark = (node) => {
+                        try { node.setAttribute(marker, '1'); return true; } catch (e) { return false; }
+                    };
                     for (const want of wantedLower) {
                         for (const node of nodes) {
                             if (!isVisible(node) || !isEnabled(node)) continue;
                             const text = readText(node);
                             if (!text) continue;
                             if (lower(text) !== want) continue;
-                            clickNode(node);
-                            return true;
+                            if (mark(node)) return true;
                         }
                     }
-                    // 2) 可选：仅点击“干净”的 submit；文案带 google/apple/phone 等一律跳过
                     if (allowGenericSubmit) {
                         for (const node of nodes) {
                             if (!isVisible(node) || !isEnabled(node)) continue;
@@ -1590,10 +1780,8 @@ def _click_exact_action_texts(
                             if (text && isRejected(text)) continue;
                             const isSubmit = type === 'submit' || (tag === 'button' && (!type || type === 'submit'));
                             if (!isSubmit) continue;
-                            // 没有文案的 submit，或文案恰好是 Continue/Next/继续 等短词
                             if (!text || wantedLower.includes(lower(text))) {
-                                clickNode(node);
-                                return true;
+                                if (mark(node)) return true;
                             }
                         }
                     }
@@ -1615,28 +1803,34 @@ def _click_exact_action_texts(
                         "使用手机",
                         "手机登录",
                     ],
+                    "marker": marker,
                 },
             )
         )
     except Exception:
-        clicked = False
-    if clicked:
-        return True
-    # 回退：Playwright text= 精确匹配（不是 has-text 子串）
-    for text in wanted:
-        if _is_oauth_provider_action_text(text):
-            continue
-        safe = str(text).replace('"', '\\"')
-        if _click_first(
-            page,
-            [
-                f'button:text-is("{safe}")',
-                f'[role="button"]:text-is("{safe}")',
-                f'input[type="submit"][value="{safe}"]',
-            ],
-            timeout_ms=min(800, int(timeout_ms or 800)),
-        ):
+        marked = False
+    if marked:
+        locator = _first_visible_locator(page, [f'[{marker}="1"]'])
+        if locator is not None and _click_locator_human_like(page, locator, timeout_ms=timeout_ms):
+            try:
+                page.evaluate(
+                    """(marker) => {
+                        document.querySelectorAll('[' + marker + ']').forEach((n) => n.removeAttribute(marker));
+                    }""",
+                    marker,
+                )
+            except Exception:
+                pass
             return True
+        try:
+            page.evaluate(
+                """(marker) => {
+                    document.querySelectorAll('[' + marker + ']').forEach((n) => n.removeAttribute(marker));
+                }""",
+                marker,
+            )
+        except Exception:
+            pass
     return False
 
 
@@ -1895,10 +2089,27 @@ def _is_timeout_error_page(url: str, body_text: str) -> bool:
     )
 
 
+def _is_rate_limit_error_page(url: str, body_text: str) -> bool:
+    """OpenAI 限流页：Too many requests / rate_limit_exceeded。"""
+    body_lower = str(body_text or "").lower()
+    url_lower = str(url or "").lower()
+    if not body_lower and "rate" not in url_lower:
+        return False
+    return bool(
+        "rate_limit_exceeded" in body_lower
+        or "rate limit exceeded" in body_lower
+        or "too many requests" in body_lower
+        or ("rate_limit" in body_lower and ("exceeded" in body_lower or "try again later" in body_lower))
+        or ("请求过多" in str(body_text or "") or "请求太频繁" in str(body_text or ""))
+    )
+
+
 def _is_retryable_error_page(url: str, body_text: str) -> bool:
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
     if _is_timeout_error_page(url, body_text):
+        return True
+    if _is_rate_limit_error_page(url, body_text):
         return True
     return bool(
         "something went wrong" in body_lower
@@ -2562,6 +2773,69 @@ def _is_profile_page(url: str, body_text: str, page: Any = None) -> bool:
     return False
 
 
+def _is_youre_all_set_page(url: str, body_text: str, page: Any = None) -> bool:
+    """
+    about-you 完成后的引导完成页：
+    “You're all set” + Continue。
+    必须点 Continue，否则会卡在补资料分流、一直忽略真正的步骤2 callback。
+    """
+    body_lower = str(body_text or "").lower()
+    body_text_value = str(body_text or "")
+    if any(
+        token in body_lower
+        for token in (
+            "you're all set",
+            "you are all set",
+            "you’re all set",
+        )
+    ) or any(
+        token in body_text_value
+        for token in (
+            "你已准备就绪",
+            "一切就绪",
+            "全部就绪",
+        )
+    ):
+        return True
+    # 弱信号：资料完成后的免责声明页 + 可见 Continue
+    if "chatgpt can make mistakes" in body_lower and "don't share sensitive" in body_lower:
+        if page is None:
+            return True
+        return _first_visible_locator(
+            page,
+            [
+                'button:has-text("Continue")',
+                '[role="button"]:has-text("Continue")',
+                'button:has-text("继续")',
+                '[role="button"]:has-text("继续")',
+            ],
+        ) is not None
+    return False
+
+
+def _click_youre_all_set_continue(page: Any) -> bool:
+    if page is None:
+        return False
+    if _click_exact_action_texts(
+        page,
+        ["Continue", "继续", "Got it", "Done", "完成"],
+        allow_generic_submit=False,
+        timeout_ms=1500,
+    ):
+        return True
+    return _click_first(
+        page,
+        [
+            'button:has-text("Continue")',
+            '[role="button"]:has-text("Continue")',
+            'button[type="submit"]:has-text("Continue")',
+            'button:has-text("继续")',
+            '[role="button"]:has-text("继续")',
+        ],
+        timeout_ms=1500,
+    )
+
+
 def _is_logged_in_chatgpt_home(url: str, body_text: str) -> bool:
     url_lower = str(url or "").lower()
     body_lower = str(body_text or "").lower()
@@ -3039,16 +3313,26 @@ def _submit_create_account_password_like_codex_registrar(
         try:
             if emitter is not None:
                 emitter.info(
-                    "浏览器模式2 create-account/password 专用提交动作: 真实鼠标点击 "
+                    "浏览器模式2 create-account/password 专用提交动作: 真人轨迹鼠标点击 "
                     + str(submit_position.get("text") or "submit"),
                     step=step,
                 )
         except Exception:
             pass
-        try:
-            page.mouse.click(float(submit_position.get("x") or 0), float(submit_position.get("y") or 0))
-        except Exception:
-            pass
+        clicked_human = _click_at_point_human_like(
+            page,
+            float(submit_position.get("x") or 0),
+            float(submit_position.get("y") or 0),
+        )
+        if not clicked_human:
+            try:
+                page.mouse.click(
+                    float(submit_position.get("x") or 0),
+                    float(submit_position.get("y") or 0),
+                    delay=random.randint(50, 140),
+                )
+            except Exception:
+                pass
     _sleep_with_page(page, 1200)
     latest_url, latest_body = _describe_page(page, force_refresh=True)
     deep_body_text = _get_page_deep_text(page)
@@ -3787,6 +4071,191 @@ def _fill_about_you_profile(page: Any, ctx: Any) -> tuple[bool, str]:
         if any(token in body_lower for token in ("i agree", "agree to", "terms", "同意", "勾选")):
             return False, "checkbox"
     return True, ("age" if prefers_age else "birthdate")
+
+
+def _is_about_you_terms_soft_error(url: str, body_text: str, page: Any = None) -> bool:
+    """
+    about-you 红色提示：
+    “We can't create your account due to our Terms of Use”
+    实测直接再点一次 Finish creating account 经常就能过（无需重填），不当硬失败。
+    """
+    text = str(body_text or "")
+    text_lower = text.lower()
+    english_hints = (
+        "we can't create your account due to our terms of use",
+        "we cannot create your account due to our terms of use",
+        "can't create your account due to our terms of use",
+        "cannot create your account due to our terms of use",
+        "due to our terms of use",
+        "can't create your account due to our terms",
+    )
+    chinese_hints = (
+        "由于我们的服务条款无法创建",
+        "因服务条款无法创建",
+        "根据服务条款无法创建你的账户",
+        "根据服务条款无法创建您的账户",
+    )
+    if any(hint in text_lower for hint in english_hints):
+        return True
+    if any(hint in text for hint in chinese_hints):
+        return True
+    if page is None:
+        return False
+    raw_text = _get_body_raw_text(page)
+    raw_lower = str(raw_text or "").lower()
+    if any(hint in raw_lower for hint in english_hints):
+        return True
+    if any(hint in str(raw_text or "") for hint in chinese_hints):
+        return True
+    try:
+        alert_text = str(
+            page.evaluate(
+                """() => {
+                    const nodes = Array.from(document.querySelectorAll(
+                        '[role="alert"], [aria-live="assertive"], [aria-live="polite"], .text-red-500, .text-danger, [class*="error"]'
+                    ));
+                    return nodes.map((node) => String(node.innerText || node.textContent || '').trim()).filter(Boolean).join('\\n');
+                }"""
+            )
+            or ""
+        )
+    except Exception:
+        alert_text = ""
+    alert_lower = alert_text.lower()
+    if any(hint in alert_lower for hint in english_hints):
+        return True
+    if any(hint in alert_text for hint in chinese_hints):
+        return True
+    return False
+
+
+def _click_about_you_finish_button(page: Any) -> bool:
+    if page is None:
+        return False
+    if _click_exact_action_texts(
+        page,
+        [
+            "Finish creating account",
+            "完成帐户创建",
+            "完成账户创建",
+            "Create account",
+            "Continue",
+            "Next",
+            "完成",
+            "继续",
+        ],
+        allow_generic_submit=False,
+        timeout_ms=1500,
+    ):
+        return True
+    if _click_primary_action(
+        page,
+        [
+            "Finish creating account",
+            "完成帐户创建",
+            "完成账户创建",
+            "Create account",
+            "Continue",
+            "Next",
+            "完成",
+            "继续",
+        ],
+        allow_generic_fallback=True,
+    ):
+        return True
+    return _click_first(
+        page,
+        [
+            'button[data-dd-action-name="Continue"]',
+            'button[data-dd-action-name="Finish creating account"]',
+            'button[type="submit"]:has-text("Finish creating account")',
+            'button:has-text("Finish creating account")',
+            '[role="button"]:has-text("Finish creating account")',
+            'button[type="submit"]',
+        ],
+        timeout_ms=1500,
+    )
+
+
+def _about_you_form_still_visible(url: str, body_text: str, page: Any = None) -> bool:
+    if _is_youre_all_set_page(url, body_text, page):
+        return False
+    if _is_about_you_missing_email_error(url, body_text):
+        return False
+    url_lower = str(url or "").lower()
+    if "about-you" in url_lower:
+        return True
+    if _is_profile_page(url, body_text, page):
+        return True
+    return bool(page is not None and _has_visible_about_you_controls(page))
+
+
+def _submit_about_you_finish_with_terms_retry(
+    page: Any,
+    ctx: Any = None,
+    *,
+    max_attempts: int = 3,
+    settle_ms: int = 1600,
+) -> Dict[str, Any]:
+    """
+    提交 about-you。
+    若出现 Terms of Use 红色软错误，只再点 Finish，不重填资料（字段本来就在，重点即可）。
+    返回:
+      ok: 是否已离开表单页（或进入 You're all set / missing_email）
+      url/body: 最新页面
+      attempts: 实际点击次数
+      terms_retried: 是否因 Terms 软错误重试过
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "url": "",
+        "body": "",
+        "attempts": 0,
+        "terms_retried": False,
+        "clicked": False,
+    }
+    if page is None:
+        return result
+    last_url, last_body = _describe_page(page, force_refresh=True)
+    deep_body = _get_page_deep_text(page)
+    if str(deep_body or "").strip():
+        last_body = deep_body
+    result["url"] = last_url
+    result["body"] = last_body
+    attempts = max(1, int(max_attempts or 1))
+    for attempt in range(1, attempts + 1):
+        result["attempts"] = attempt
+        # 重试只点按钮，绝不重填姓名/年龄。
+        if attempt > 1:
+            _sleep_with_page(page, 250)
+        if not _click_about_you_finish_button(page):
+            continue
+        result["clicked"] = True
+        _wait_for_load(page, timeout_ms=2200)
+        _sleep_with_page(page, max(400, int(settle_ms or 0)))
+        last_url, last_body = _describe_page(page, force_refresh=True)
+        deep_body = _get_page_deep_text(page)
+        if str(deep_body or "").strip():
+            last_body = deep_body
+        result["url"] = last_url
+        result["body"] = last_body
+        if _is_youre_all_set_page(last_url, last_body, page) or _is_about_you_missing_email_error(last_url, last_body):
+            result["ok"] = True
+            return result
+        if not _about_you_form_still_visible(last_url, last_body, page):
+            result["ok"] = True
+            return result
+        if _is_about_you_terms_soft_error(last_url, last_body, page):
+            result["terms_retried"] = True
+            # 红色 Terms：资料已在，直接再点 Finish。
+            continue
+        # 仍停在 about-you 但没有明确 Terms 文案，也再点一次（偶发提交未生效）。
+        if attempt < attempts:
+            continue
+    result["ok"] = not _about_you_form_still_visible(result["url"], result["body"], page)
+    if _is_youre_all_set_page(result["url"], result["body"], page) or _is_about_you_missing_email_error(result["url"], result["body"]):
+        result["ok"] = True
+    return result
 
 
 def _summarize_birthdate_controls(page: Any) -> str:
@@ -5412,6 +5881,26 @@ def _ensure_manual_v2_phone_country(
     return False
 
 
+def _click_phone_form_continue_human(page: Any) -> bool:
+    """手机号页 Continue：优先真人轨迹点击，避免 JS 假点。"""
+    return _click_exact_action_texts(
+        page,
+        ["Continue", "Next", "继续", "下一步"],
+        allow_generic_submit=True,
+        timeout_ms=1500,
+    ) or _click_first(
+        page,
+        [
+            'button[type="submit"]:text-is("Continue")',
+            'button:text-is("Continue")',
+            'button[type="submit"]:text-is("继续")',
+            'button:text-is("继续")',
+            'button[type="submit"]',
+        ],
+        timeout_ms=1200,
+    )
+
+
 def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "add_phone") -> bool:
     phone_text = str(phone_number or "").strip()
     if page is None or not phone_text:
@@ -5439,12 +5928,19 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
     # 先直接写完整国际号码，让站点自己识别区号；只有失败时才回退到手动切国家+本地号。
     if normalized_phone_text.startswith("+") and _write_phone_text_to_locator(phone_input, normalized_phone_text):
         try:
-            phone_input.click(timeout=1200)
+            _click_locator_human_like(page, phone_input, timeout_ms=1200)
         except Exception:
-            pass
-        phone_form_submitted = False
+            try:
+                phone_input.click(timeout=1200)
+            except Exception:
+                pass
+        # 优先真人点 Continue（参照 grok 注册机 CF 真点），JS 假点仅兜底。
+        if _click_phone_form_continue_human(page):
+            _sleep_with_page(page, 800)
+            return True
+        phone_form_result = ""
         try:
-            phone_form_submitted = bool(
+            phone_form_result = str(
                 phone_input.evaluate(
                     """(el) => {
                         const isVisible = (node) => {
@@ -5455,11 +5951,6 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
                         };
                         const safeTexts = new Set(['继续', 'Continue', 'Next', '下一步']);
                         const rejectTokens = ['google', 'apple', 'microsoft', 'email', '邮箱'];
-                        const clickButton = (button) => {
-                            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
-                                button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-                            });
-                        };
                         const normalizedText = (node) => String(
                             node?.innerText
                             || node?.textContent
@@ -5492,36 +5983,45 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
                             current = current.parentElement;
                             depth += 1;
                         }
+                        // 仅打标，不在 JS 里 click；外层用真人轨迹点。
+                        const marker = 'data-phone-continue-human';
+                        document.querySelectorAll('[' + marker + ']').forEach((n) => n.removeAttribute(marker));
                         for (const scope of scopes) {
                             const strictButtons = Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"]'));
                             for (const button of strictButtons) {
                                 if (!isSafeSubmitButton(button)) continue;
-                                clickButton(button);
-                                return true;
+                                button.setAttribute(marker, '1');
+                                return 'marked';
                             }
                             const fallbackButtons = Array.from(scope.querySelectorAll('button, [role="button"]'));
                             for (const button of fallbackButtons) {
                                 if (!isSafeSubmitButton(button)) continue;
-                                clickButton(button);
-                                return true;
+                                button.setAttribute(marker, '1');
+                                return 'marked';
                             }
                         }
                         const form = el.closest('form');
                         if (form && typeof form.requestSubmit === 'function') {
                             form.requestSubmit();
-                            return true;
+                            return 'form';
                         }
                         if (form && typeof form.submit === 'function') {
                             form.submit();
-                            return true;
+                            return 'form';
                         }
-                        return false;
+                        return '';
                     }"""
                 )
+                or ""
             )
         except Exception:
-            phone_form_submitted = False
-        if phone_form_submitted:
+            phone_form_result = ""
+        if phone_form_result == "marked":
+            marked_btn = _first_visible_locator(page, ['[data-phone-continue-human="1"]'])
+            if marked_btn is not None and _click_locator_human_like(page, marked_btn, timeout_ms=1500):
+                _sleep_with_page(page, 800)
+                return True
+        if phone_form_result == "form":
             _sleep_with_page(page, 800)
             return True
         if _request_submit_with_button(phone_input):
@@ -5561,12 +6061,18 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
     if not write_ok:
         return False
     try:
-        phone_input.click(timeout=1200)
+        _click_locator_human_like(page, phone_input, timeout_ms=1200)
     except Exception:
-        pass
-    phone_form_submitted = False
+        try:
+            phone_input.click(timeout=1200)
+        except Exception:
+            pass
+    if _click_phone_form_continue_human(page):
+        _sleep_with_page(page, 800)
+        return True
+    phone_form_result = ""
     try:
-        phone_form_submitted = bool(
+        phone_form_result = str(
             phone_input.evaluate(
                 """(el) => {
                     const isVisible = (node) => {
@@ -5577,11 +6083,6 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
                     };
                     const safeTexts = new Set(['继续', 'Continue', 'Next', '下一步']);
                     const rejectTokens = ['google', 'apple', 'microsoft', 'email', '邮箱'];
-                    const clickButton = (button) => {
-                        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(type => {
-                            button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-                        });
-                    };
                     const normalizedText = (node) => String(
                         node?.innerText
                         || node?.textContent
@@ -5614,40 +6115,49 @@ def _submit_manual_v2_phone_input(page: Any, phone_number: str, *, step: str = "
                         current = current.parentElement;
                         depth += 1;
                     }
+                    const marker = 'data-phone-continue-human';
+                    document.querySelectorAll('[' + marker + ']').forEach((n) => n.removeAttribute(marker));
                     for (const scope of scopes) {
                         const strictButtons = Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"]'));
                         for (const button of strictButtons) {
                             if (!isSafeSubmitButton(button)) continue;
-                            clickButton(button);
-                            return true;
+                            button.setAttribute(marker, '1');
+                            return 'marked';
                         }
                         const fallbackButtons = Array.from(scope.querySelectorAll('button, [role="button"]'));
                         for (const button of fallbackButtons) {
                             if (!isSafeSubmitButton(button)) continue;
-                            clickButton(button);
-                            return true;
+                            button.setAttribute(marker, '1');
+                            return 'marked';
                         }
                     }
                     const form = el.closest('form');
                     if (form && typeof form.requestSubmit === 'function') {
                         form.requestSubmit();
-                        return true;
+                        return 'form';
                     }
                     if (form && typeof form.submit === 'function') {
                         form.submit();
-                        return true;
+                        return 'form';
                     }
-                    return false;
+                    return '';
                 }"""
             )
+            or ""
         )
     except Exception:
-        phone_form_submitted = False
-    if phone_form_submitted:
+        phone_form_result = ""
+    if phone_form_result == "marked":
+        marked_btn = _first_visible_locator(page, ['[data-phone-continue-human="1"]'])
+        if marked_btn is not None and _click_locator_human_like(page, marked_btn, timeout_ms=1500):
+            _sleep_with_page(page, 800)
+            return True
+    if phone_form_result == "form":
         _sleep_with_page(page, 800)
-    if not phone_form_submitted:
-        phone_form_submitted = _request_submit_with_button(phone_input)
-    return phone_form_submitted
+        return True
+    if _request_submit_with_button(phone_input):
+        return True
+    return False
 
 
 def _is_phone_input_page(url: str, body_text: str, page: Any) -> bool:
@@ -6957,6 +7467,7 @@ def run_browser_registration(
     browser_session_fast_path_attempts = 0
     session_recover_attempts = 0
     timeout_recover_attempts = 0
+    rate_limit_recover_attempts = 0
     login_add_phone_retry_attempts = 0
     login_add_phone_retry_limit = 3
     register_mode = str(cfg.get("register_mode") or "browser").strip().lower()
@@ -8130,7 +8641,18 @@ def run_browser_registration(
         if active_page is None:
             emitter.warn("检测到超时错误页，但当前没有可用活动页面，改走后续兜底恢复...", step=step)
             return False
-        if _is_timeout_error_page(current_url, body_text):
+        is_rate_limited = _is_rate_limit_error_page(current_url, body_text)
+        if is_rate_limited:
+            # 限流页立刻狂点 Try again 只会更限；先冷却再点。
+            emitter.warn(
+                "检测到 OpenAI 限流页（rate_limit_exceeded / Too many requests），"
+                + "先冷却约 20 秒再点 Try again，避免继续触发限流..."
+                + f" detail={_preview_text(body_text, 160)}",
+                step=step,
+            )
+            if _sleep_with_page_until(page, 20000, ctx.stop_event):
+                return False
+        elif _is_timeout_error_page(current_url, body_text):
             emitter.warn("检测到 Operation timed out，先在当前页面点击 Try again/Retry 原地恢复...", step=step)
         else:
             emitter.warn(
@@ -8141,7 +8663,11 @@ def run_browser_registration(
         previous_url = current_url
         previous_body = body_text
         if not _click_retryable_error_action(page):
-            emitter.warn("超时错误页当前未找到 Try again/Retry/重试 按钮，改走后续兜底恢复...", step=step)
+            emitter.warn(
+                ("限流页" if is_rate_limited else "超时错误页")
+                + "当前未找到 Try again/Retry/重试 按钮，改走后续兜底恢复...",
+                step=step,
+            )
             return False
         _wait_for_load(page, timeout_ms=2500)
         blocker_wait_deadline = time.time() + 30.0
@@ -9309,6 +9835,24 @@ def run_browser_registration(
             return False
         current_url = recheck_url or current_url
         body_text = recheck_body or body_text
+        # 若其实已是限流/可重试错误页，不要当成“号码无效”反复重提手机号（会加速限流）。
+        if _is_rate_limit_error_page(current_url, body_text) or _is_retryable_error_page(current_url, body_text):
+            manual_v2_phone_submit_stall_attempts = 0
+            emitter.warn(
+                "浏览器模式2 步骤1手机号提交后命中错误/限流页，不再按号码无效重提："
+                + f" rate_limit={_is_rate_limit_error_page(current_url, body_text)}"
+                + f", detail={_preview_text(body_text, 160)}",
+                step="add_phone",
+            )
+            if _try_recover_timeout_error_page(
+                current_url,
+                body_text,
+                step="add_phone",
+                action_label="步骤1手机号提交后错误/限流页已触发当前页重试",
+                timeout_ms=20000,
+            ):
+                return True
+            return True
         stall_state = _classify_page_state(current_url, body_text, page)
         manual_v2_phone_submit_stall_attempts += 1
         stall_limit = 3
@@ -11175,43 +11719,56 @@ def run_browser_registration(
                             raise RuntimeError("浏览器模式2 在 about-you 页面勾选同意项失败")
                         previous_url = current_url
                         previous_body = body_text
-                        if not (
-                            _click_primary_action(
-                                page,
-                                [
-                                    "Finish creating account",
-                                    "完成帐户创建",
-                                    "完成账户创建",
-                                    "Create account",
-                                    "Continue",
-                                    "Next",
-                                    "完成",
-                                    "继续",
-                                ],
-                                allow_generic_fallback=True,
-                            )
-                            or _click_first(
-                                page,
-                                [
-                                    'button[data-dd-action-name="Continue"]',
-                                    'button[type="submit"]:has-text("Finish creating account")',
-                                    'button:has-text("Finish creating account")',
-                                    'button[type="submit"]',
-                                ],
-                                timeout_ms=1500,
-                            )
-                        ):
-                            raise RuntimeError("浏览器模式2 提交 about-you 资料失败")
-                        profile_submitted = True
-                        current_url, body_text = _wait_for_page_stabilize(
-                            previous_url,
-                            previous_body,
-                            step="create_account",
-                            action_label="about-you 资料已提交",
-                            timeout_ms=20000,
+                        finish_result = _submit_about_you_finish_with_terms_retry(
+                            page,
+                            ctx,
+                            max_attempts=3,
+                            settle_ms=1600,
                         )
+                        if finish_result.get("terms_retried"):
+                            emitter.warn(
+                                "浏览器模式2 about-you 出现 Terms of Use 红色提示，"
+                                + f"未重填资料，已直接再点 Finish creating account（共 {finish_result.get('attempts') or 0} 次）...",
+                                step="create_account",
+                            )
+                        if not finish_result.get("clicked"):
+                            raise RuntimeError("浏览器模式2 提交 about-you 资料失败：未点到 Finish creating account")
+                        current_url = str(finish_result.get("url") or current_url)
+                        body_text = str(finish_result.get("body") or body_text)
+                        # 仍停在 about-you 且还是 Terms 软错误：不标记已完成，下一轮只再点，不重填。
+                        if _about_you_form_still_visible(current_url, body_text, page):
+                            if _is_about_you_terms_soft_error(current_url, body_text, page):
+                                emitter.warn(
+                                    "浏览器模式2 about-you 多次直接点击 Finish 后仍显示 Terms 红字，"
+                                    + "本轮不结束资料页；下一轮继续只点 Finish，不重填...",
+                                    step="create_account",
+                                )
+                                _sleep_with_page(page, 800)
+                                continue
+                            current_url, body_text = _wait_for_page_stabilize(
+                                previous_url,
+                                previous_body,
+                                step="create_account",
+                                action_label="about-you 资料已提交",
+                                timeout_ms=12000,
+                            )
+                            if _about_you_form_still_visible(current_url, body_text, page):
+                                emitter.warn(
+                                    "浏览器模式2 about-you 提交后仍停留在资料页，暂不进入步骤2，下一轮重试..."
+                                    + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                    step="create_account",
+                                )
+                                continue
+                        profile_submitted = True
                         # 注册前半段 callback 与步骤2 PKCE 不是同一套；资料完成后必须重新拉起登录 OAuth。
                         callback_state["url"] = ""
+                        if _is_youre_all_set_page(current_url, body_text, page):
+                            if _click_youre_all_set_continue(page):
+                                emitter.info(
+                                    "浏览器模式2 about-you 后进入 You're all set，已点击 Continue...",
+                                    step="create_account",
+                                )
+                                _wait_for_load(page, timeout_ms=2500)
                         if _is_about_you_missing_email_error(current_url, body_text):
                             emitter.warn(
                                 "浏览器模式2 about-you 提交后命中 authentication missing_email，"
@@ -11525,6 +12082,100 @@ def run_browser_registration(
                         )
                         continue
 
+                    # about-you 已有 Terms 红字：只再点 Finish，绝不重填姓名/年龄。
+                    if (
+                        _about_you_form_still_visible(current_url, body_text, page)
+                        and _is_about_you_terms_soft_error(current_url, body_text, page)
+                    ):
+                        profile_submitted = False
+                        emitter.warn(
+                            "浏览器模式2 about-you 已有 Terms of Use 红色提示；"
+                            + "不重填资料，直接再点 Finish creating account...",
+                            step="create_account",
+                        )
+                        finish_result = _submit_about_you_finish_with_terms_retry(
+                            page,
+                            ctx,
+                            max_attempts=3,
+                            settle_ms=1400,
+                        )
+                        current_url = str(finish_result.get("url") or current_url)
+                        body_text = str(finish_result.get("body") or body_text)
+                        if finish_result.get("terms_retried") or int(finish_result.get("attempts") or 0) > 1:
+                            emitter.info(
+                                f"浏览器模式2 Terms 红字场景已连续点击 Finish {finish_result.get('attempts') or 0} 次"
+                                + ("（仍未离开则下轮继续只点）" if _about_you_form_still_visible(current_url, body_text, page) else "，已离开资料页"),
+                                step="create_account",
+                            )
+                        if _about_you_form_still_visible(current_url, body_text, page):
+                            _sleep_with_page(page, 800)
+                            continue
+                        profile_submitted = True
+                        callback_state["url"] = ""
+                        if _is_youre_all_set_page(current_url, body_text, page):
+                            if _click_youre_all_set_continue(page):
+                                emitter.info(
+                                    "浏览器模式2 Terms 重点后进入 You're all set，已点击 Continue...",
+                                    step="create_account",
+                                )
+                                _wait_for_load(page, timeout_ms=2500)
+                        if manual_v2_profile_completion_mode:
+                            manual_v2_profile_completion_mode = False
+                            manual_v2_post_login_pending_email = False
+                            manual_v2_bridge_entered_at = 0.0
+                            manual_v2_bridge_logged = False
+                            _prepare_manual_v2_login_flow(
+                                "浏览器模式2 Terms 红字重点 Finish 成功，结束补资料分流并进入真正的步骤2 OAuth..."
+                            )
+                        elif not manual_v2_login_flow_started:
+                            _prepare_manual_v2_login_flow(
+                                "浏览器模式2 Terms 红字重点 Finish 成功，进入真正的步骤2 OAuth 登录/补邮箱获取 Token 流程..."
+                            )
+                        else:
+                            emitter.success(
+                                "浏览器模式2 Terms 红字重点 Finish 成功，资料页已通过，继续后续流程...",
+                                step="create_account",
+                            )
+                        continue
+
+                    # about-you 完成后的 You're all set：点 Continue 并结束补资料分流，否则会一直忽略步骤2 callback。
+                    if (
+                        is_manual_v2_mode
+                        and _is_youre_all_set_page(current_url, body_text, page)
+                    ):
+                        _extend_manual_v2_deadline(1800)
+                        clicked_all_set = _click_youre_all_set_continue(page)
+                        if clicked_all_set:
+                            emitter.info(
+                                "浏览器模式2 命中 You're all set 完成页，已点击 Continue 继续后续流程...",
+                                step="create_account",
+                            )
+                            _wait_for_load(page, timeout_ms=2500)
+                        else:
+                            emitter.warn(
+                                "浏览器模式2 命中 You're all set 完成页，但未点到 Continue，稍后重试..."
+                                + f" actions={_summarize_primary_actions(page)}",
+                                step="create_account",
+                            )
+                        profile_submitted = True
+                        if manual_v2_profile_completion_mode or (
+                            manual_v2_login_flow_started and not manual_v2_oauth_resumed
+                        ):
+                            if manual_v2_profile_completion_mode:
+                                emitter.success(
+                                    "浏览器模式2 You're all set 表示补资料已完成，结束分流并进入真正的步骤2 OAuth...",
+                                    step="create_account",
+                                )
+                            manual_v2_profile_completion_mode = False
+                            manual_v2_post_login_pending_email = False
+                            manual_v2_bridge_entered_at = 0.0
+                            manual_v2_bridge_logged = False
+                            callback_state["url"] = ""
+                            _prepare_manual_v2_login_flow(
+                                "浏览器模式2 You're all set 后进入真正的步骤2 OAuth 获取 Token / 绑定邮箱流程..."
+                            )
+                        continue
+
                     if (
                         manual_v2_login_flow_started
                         and manual_v2_profile_completion_mode
@@ -11648,41 +12299,46 @@ def run_browser_registration(
                             raise RuntimeError("浏览器模式2 在 about-you 页面勾选同意项失败")
                         previous_url = current_url
                         previous_body = body_text
-                        if not (
-                            _click_primary_action(
-                                page,
-                                [
-                                    "Finish creating account",
-                                    "完成帐户创建",
-                                    "完成账户创建",
-                                    "Create account",
-                                    "Continue",
-                                    "Next",
-                                    "完成",
-                                    "继续",
-                                ],
-                                allow_generic_fallback=True,
-                            )
-                            or _click_first(
-                                page,
-                                [
-                                    'button[data-dd-action-name="Continue"]',
-                                    'button[type="submit"]:has-text("Finish creating account")',
-                                    'button:has-text("Finish creating account")',
-                                    'button[type="submit"]',
-                                ],
-                                timeout_ms=1500,
-                            )
-                        ):
-                            raise RuntimeError("浏览器模式2 提交 about-you 资料失败")
-                        profile_submitted = True
-                        current_url, body_text = _wait_for_page_stabilize(
-                            previous_url,
-                            previous_body,
-                            step="create_account",
-                            action_label="about-you 资料已提交",
-                            timeout_ms=20000,
+                        finish_result = _submit_about_you_finish_with_terms_retry(
+                            page,
+                            ctx,
+                            max_attempts=3,
+                            settle_ms=1600,
                         )
+                        if finish_result.get("terms_retried"):
+                            emitter.warn(
+                                "浏览器模式2 about-you 出现 Terms of Use 红色提示，"
+                                + f"未重填资料，已直接再点 Finish creating account（共 {finish_result.get('attempts') or 0} 次）...",
+                                step="create_account",
+                            )
+                        if not finish_result.get("clicked"):
+                            raise RuntimeError("浏览器模式2 提交 about-you 资料失败：未点到 Finish creating account")
+                        current_url = str(finish_result.get("url") or current_url)
+                        body_text = str(finish_result.get("body") or body_text)
+                        if _about_you_form_still_visible(current_url, body_text, page):
+                            if _is_about_you_terms_soft_error(current_url, body_text, page):
+                                emitter.warn(
+                                    "浏览器模式2 about-you 多次直接点击 Finish 后仍显示 Terms 红字，"
+                                    + "本轮不结束资料页；下一轮继续只点 Finish，不重填...",
+                                    step="create_account",
+                                )
+                                _sleep_with_page(page, 800)
+                                continue
+                            current_url, body_text = _wait_for_page_stabilize(
+                                previous_url,
+                                previous_body,
+                                step="create_account",
+                                action_label="about-you 资料已提交",
+                                timeout_ms=12000,
+                            )
+                            if _about_you_form_still_visible(current_url, body_text, page):
+                                emitter.warn(
+                                    "浏览器模式2 about-you 提交后仍停留在资料页，暂不进入下一步，下一轮重试..."
+                                    + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                    step="create_account",
+                                )
+                                continue
+                        profile_submitted = True
                         if _is_about_you_missing_email_error(current_url, body_text):
                             if manual_v2_profile_completion_mode:
                                 emitter.warn(
@@ -11721,9 +12377,17 @@ def run_browser_registration(
                                 profile_completion_only=True,
                             )
                             continue
+                        if _is_youre_all_set_page(current_url, body_text, page):
+                            if _click_youre_all_set_continue(page):
+                                emitter.info(
+                                    "浏览器模式2 about-you 提交后进入 You're all set，已点击 Continue...",
+                                    step="create_account",
+                                )
+                                _wait_for_load(page, timeout_ms=2500)
                         emitter.success("浏览器模式2 已完成 about-you，转入手机登录补邮箱流程...", step="create_account")
                         if manual_v2_profile_completion_mode:
                             manual_v2_profile_completion_mode = False
+                            callback_state["url"] = ""
                             _prepare_manual_v2_login_flow(
                                 "浏览器模式2 已完成 about-you 资料填写，"
                                 + "现在进入真正的步骤2 OAuth 获取 Token 流程..."
@@ -12912,16 +13576,46 @@ def run_browser_registration(
                         raise RuntimeError("浏览器模式勾选 about-you 同意项失败")
                     previous_url = current_url
                     previous_body = body_text
-                    if not _click_primary_action(page, ["完成帐户创建", "完成账户创建", "Continue", "Next", "Create account", "完成", "继续"]):
-                        raise RuntimeError("浏览器模式提交账户资料失败")
-                    profile_submitted = True
-                    current_url, body_text = _wait_for_page_stabilize(
-                        previous_url,
-                        previous_body,
-                        step="create_account",
-                        action_label="账户资料已提交",
-                        timeout_ms=20000,
+                    finish_result = _submit_about_you_finish_with_terms_retry(
+                        page,
+                        ctx,
+                        max_attempts=3,
+                        settle_ms=1600,
                     )
+                    if finish_result.get("terms_retried"):
+                        emitter.warn(
+                            "浏览器 about-you 出现 Terms of Use 红色提示，"
+                            + f"未重填资料，已直接再点 Finish creating account（共 {finish_result.get('attempts') or 0} 次）...",
+                            step="create_account",
+                        )
+                    if not finish_result.get("clicked"):
+                        raise RuntimeError("浏览器模式提交账户资料失败：未点到 Finish creating account")
+                    current_url = str(finish_result.get("url") or current_url)
+                    body_text = str(finish_result.get("body") or body_text)
+                    if _about_you_form_still_visible(current_url, body_text, page):
+                        if _is_about_you_terms_soft_error(current_url, body_text, page):
+                            emitter.warn(
+                                "浏览器 about-you 多次直接点击 Finish 后仍显示 Terms 红字，"
+                                + "本轮不结束资料页；下一轮继续只点 Finish，不重填...",
+                                step="create_account",
+                            )
+                            _sleep_with_page(page, 800)
+                            continue
+                        current_url, body_text = _wait_for_page_stabilize(
+                            previous_url,
+                            previous_body,
+                            step="create_account",
+                            action_label="账户资料已提交",
+                            timeout_ms=12000,
+                        )
+                        if _about_you_form_still_visible(current_url, body_text, page):
+                            emitter.warn(
+                                "浏览器 about-you 提交后仍停留在资料页，暂不标记完成，下一轮重试..."
+                                + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
+                                step="create_account",
+                            )
+                            continue
+                    profile_submitted = True
                     if is_manual_v2_mode and _is_about_you_missing_email_error(current_url, body_text):
                         if manual_v2_profile_completion_mode:
                             emitter.warn(
@@ -12960,6 +13654,32 @@ def run_browser_registration(
                             profile_completion_only=True,
                         )
                         continue
+                    # about-you 成功后常见 “You're all set”：必须点 Continue，并结束补资料分流。
+                    if is_manual_v2_mode and _is_youre_all_set_page(current_url, body_text, page):
+                        if _click_youre_all_set_continue(page):
+                            emitter.info(
+                                "浏览器模式2 about-you 提交后进入 You're all set，已点击 Continue...",
+                                step="create_account",
+                            )
+                            _wait_for_load(page, timeout_ms=2500)
+                        else:
+                            emitter.warn(
+                                "浏览器模式2 about-you 提交后命中 You're all set，但未点到 Continue，下一轮重试...",
+                                step="create_account",
+                            )
+                    if is_manual_v2_mode and manual_v2_profile_completion_mode:
+                        emitter.success(
+                            "浏览器模式2 登录后补资料（about-you）已完成，结束分流并进入真正的步骤2 OAuth 获取 Token...",
+                            step="create_account",
+                        )
+                        manual_v2_profile_completion_mode = False
+                        manual_v2_post_login_pending_email = False
+                        manual_v2_bridge_entered_at = 0.0
+                        manual_v2_bridge_logged = False
+                        callback_state["url"] = ""
+                        _prepare_manual_v2_login_flow(
+                            "浏览器模式2 补资料分流已结束，现在进入真正的步骤2 OAuth 获取 Token / 绑定邮箱流程..."
+                        )
                     continue
 
                 if (
@@ -13402,6 +14122,50 @@ def run_browser_registration(
                         manual_v2_email_otp_completed = True
                     continue
 
+                # 限流页优先于授权/社交登录分支，避免被误判成 workspace 继续乱点。
+                if _is_rate_limit_error_page(current_url, body_text):
+                    rate_limit_recover_attempts += 1
+                    emitter.warn(
+                        "浏览器注册命中 OpenAI 限流页（Too many requests / rate_limit_exceeded），"
+                        + f"第 {rate_limit_recover_attempts}/3 次处理；"
+                        + "这通常是同一 IP/指纹短时间提交过频，不是 HeroSMS 取号失败。"
+                        + f" detail={_preview_text(body_text, 180)}",
+                        step="runtime",
+                    )
+                    if rate_limit_recover_attempts > 3:
+                        raise RuntimeError(
+                            "浏览器注册连续命中 OpenAI 限流（rate_limit_exceeded），请更换代理/冷却后再试: "
+                            + _preview_text(body_text, 180)
+                        )
+                    if _try_recover_timeout_error_page(
+                        current_url,
+                        body_text,
+                        step="runtime",
+                        action_label="限流页已冷却并触发 Try again",
+                        timeout_ms=25000,
+                    ):
+                        latest_url, latest_body = _describe_page(page, force_refresh=True)
+                        if not _is_rate_limit_error_page(latest_url, latest_body):
+                            rate_limit_recover_attempts = 0
+                        continue
+                    if is_manual_v2_mode and not manual_v2_login_flow_started:
+                        if manual_v2_auto_phone_mode:
+                            _finish_manual_v2_sms_provider(success=False)
+                            manual_v2_phone_number = ""
+                            manual_v2_sms_activation_id = ""
+                            manual_v2_sms_purchased_at = 0.0
+                            manual_v2_sms_provider_done = False
+                        _prepare_manual_v2_signup_flow(
+                            "浏览器模式2 步骤1命中 OpenAI 限流且 Try again 未恢复，冷却后回到步骤1重新取号/输号..."
+                        )
+                        if _sleep_with_page_until(page, 15000, ctx.stop_event):
+                            return None
+                        continue
+                    raise RuntimeError(
+                        "浏览器注册命中 OpenAI 限流且无法自动恢复: "
+                        + _preview_text(body_text, 180)
+                    )
+
                 # 检测第三方 OAuth 登录页（Google/Microsoft/Apple 等）
                 # 步骤1若误点 Continue with Google 会进这里；步骤2若手机号绑定第三方账户也会进这里。
                 _third_party_oauth_domains = (
@@ -13490,6 +14254,8 @@ def run_browser_registration(
                 if (
                     not _is_third_party_page
                     and not _is_social_choice_page
+                    and not _is_rate_limit_error_page(current_url, body_text)
+                    and not _is_retryable_error_page(current_url, body_text)
                     and _is_codex_consent_page(current_url, body_text)
                 ):
                     if not manual_v2_workspace_logged:
@@ -13539,6 +14305,8 @@ def run_browser_registration(
                 if (
                     not _is_third_party_page
                     and not _is_social_choice_page
+                    and not _is_rate_limit_error_page(current_url, body_text)
+                    and not _is_retryable_error_page(current_url, body_text)
                     and any(keyword in current_url_lower for keyword in ("consent", "workspace", "organization"))
                 ):
                     if not manual_v2_workspace_logged:
@@ -13604,6 +14372,8 @@ def run_browser_registration(
                 if (
                     not _is_third_party_page
                     and not _is_social_choice_page
+                    and not _is_rate_limit_error_page(current_url, body_text)
+                    and not _is_retryable_error_page(current_url, body_text)
                     and not _is_codex_consent_page(current_url, body_text)
                     and any(keyword in body_lower for keyword in ("authorize", "workspace", "organization", "allow access"))
                 ):
