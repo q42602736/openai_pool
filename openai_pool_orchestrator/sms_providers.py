@@ -150,7 +150,7 @@ HANDLER_API_PROVIDER_LABELS: Dict[str, str] = {
 }
 
 SMSBOWER_AUTO_COUNTRY_ID = 0
-SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO", "CA", "AR", "IT"}
+SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO", "CA", "AR", "IT", "BR", "UA", "MA", "GE", "NO"}
 SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "indonesia",
     "indonesian",
@@ -166,16 +166,33 @@ SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "argentinian",
     "italy",
     "italian",
+    "brazil",
+    "brazilian",
+    "brasil",
+    "ukraine",
+    "ukrainian",
+    "morocco",
+    "moroccan",
+    "georgia",
+    "georgian",
+    "norway",
+    "norwegian",
     "印度尼西亚",
     "菲律宾",
     "罗马尼亚",
     "加拿大",
     "阿根廷",
     "意大利",
+    "巴西",
+    "乌克兰",
+    "摩洛哥",
+    "格鲁吉亚",
+    "挪威",
 }
 
-# 仅 SMSBower：同国连续注册失败达到阈值后临时软禁，避免反复烧同国号码。
-# HeroSMS 不启用此逻辑。
+# 连败国家软禁已停用（原：同国连续失败 5 次禁 5 分钟）。
+# 保留常量/接口以免外部调用报错，行为全部为空操作。
+SMS_COUNTRY_SOFT_BAN_ENABLED = False
 SMS_COUNTRY_SOFT_BAN_FAIL_THRESHOLD = 5
 SMS_COUNTRY_SOFT_BAN_SECONDS = 5 * 60
 _SMS_COUNTRY_SOFT_BAN_LOCK = threading.Lock()
@@ -302,6 +319,8 @@ def is_sms_country_soft_banned(
     iso_code: Any = "",
     name: Any = "",
 ) -> bool:
+    if not SMS_COUNTRY_SOFT_BAN_ENABLED:
+        return False
     key = _sms_country_soft_ban_key(country_id=country_id, iso_code=iso_code, name=name)
     if not key:
         return False
@@ -318,6 +337,8 @@ def get_sms_country_soft_ban_remaining_seconds(
     iso_code: Any = "",
     name: Any = "",
 ) -> int:
+    if not SMS_COUNTRY_SOFT_BAN_ENABLED:
+        return 0
     key = _sms_country_soft_ban_key(country_id=country_id, iso_code=iso_code, name=name)
     if not key:
         return 0
@@ -336,6 +357,8 @@ def note_sms_country_registration_success(
     iso_code: Any = "",
     name: Any = "",
 ) -> Dict[str, Any]:
+    if not SMS_COUNTRY_SOFT_BAN_ENABLED:
+        return {"ok": True, "disabled": True, "failure_streak": 0, "soft_banned": False}
     key = _sms_country_soft_ban_key(country_id=country_id, iso_code=iso_code, name=name)
     if not key:
         return {"ok": False, "reason": "missing_country"}
@@ -358,6 +381,16 @@ def note_sms_country_registration_failure(
     threshold: int = SMS_COUNTRY_SOFT_BAN_FAIL_THRESHOLD,
     ban_seconds: int = SMS_COUNTRY_SOFT_BAN_SECONDS,
 ) -> Dict[str, Any]:
+    if not SMS_COUNTRY_SOFT_BAN_ENABLED:
+        return {
+            "ok": True,
+            "disabled": True,
+            "banned": False,
+            "just_banned": False,
+            "failure_streak": 0,
+            "threshold": int(threshold or SMS_COUNTRY_SOFT_BAN_FAIL_THRESHOLD),
+            "remaining_seconds": 0,
+        }
     key = _sms_country_soft_ban_key(country_id=country_id, iso_code=iso_code, name=name)
     if not key:
         return {"ok": False, "reason": "missing_country", "banned": False}
@@ -2106,7 +2139,8 @@ class SMSBowerProvider(HeroSMSProvider):
         return True
 
     def _supports_country_soft_ban(self) -> bool:
-        return True
+        # 连败国家软禁已全局停用。
+        return bool(SMS_COUNTRY_SOFT_BAN_ENABLED)
 
     @staticmethod
     def _coerce_json_payload(data: Any) -> Any:

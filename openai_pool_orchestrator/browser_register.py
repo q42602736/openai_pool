@@ -34,8 +34,6 @@ try:
         active_sms_provider_fields,
         normalize_handler_api_country,
         normalize_sms_provider_profiles,
-        note_sms_country_registration_failure,
-        note_sms_country_registration_success,
         schedule_hero_sms_delayed_cancel,
     )
 except ImportError:
@@ -49,8 +47,6 @@ except ImportError:
         active_sms_provider_fields,
         normalize_handler_api_country,
         normalize_sms_provider_profiles,
-        note_sms_country_registration_failure,
-        note_sms_country_registration_success,
         schedule_hero_sms_delayed_cancel,
     )
 
@@ -2427,7 +2423,10 @@ def _try_build_token_from_browser_session(
     referer_url: str = "",
     fallback_email: str = "",
     timeout_ms: int = 15000,
+    page: Any = None,
+    proxy: str = "",
 ) -> Optional[str]:
+    """通过临时标签读取 /api/auth/session 并组装 Token（恢复原逻辑）。"""
     if not callable(build_browser_session_token_func):
         return None
     session_page = None
@@ -2557,7 +2556,10 @@ def _fetch_browser_session_payload(
     referer_url: str = "",
     fallback_email: str = "",
     timeout_ms: int = 15000,
+    page: Any = None,
+    proxy: str = "",
 ) -> Optional[Dict[str, Any]]:
+    """通过临时标签读取 /api/auth/session（恢复原逻辑）。"""
     session_page = None
     try:
         session_page = context.new_page()
@@ -2773,59 +2775,301 @@ def _is_profile_page(url: str, body_text: str, page: Any = None) -> bool:
     return False
 
 
-def _is_youre_all_set_page(url: str, body_text: str, page: Any = None) -> bool:
-    """
-    about-you 完成后的引导完成页：
-    “You're all set” + Continue。
-    必须点 Continue，否则会卡在补资料分流、一直忽略真正的步骤2 callback。
-    """
-    body_lower = str(body_text or "").lower()
-    body_text_value = str(body_text or "")
+def _normalize_youre_all_set_text(text: str) -> str:
+    """统一弯引号/空白，便于匹配 You're all set 文案。"""
+    value = str(text or "").lower()
+    for src_ch, dst in (
+        ("\u2019", "'"),
+        ("\u2018", "'"),
+        ("\u201c", '"'),
+        ("\u201d", '"'),
+        ("\u00a0", " "),
+    ):
+        value = value.replace(src_ch, dst)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _body_has_youre_all_set_title(body_text: str) -> bool:
+    body_norm = _normalize_youre_all_set_text(body_text)
+    body_raw = str(body_text or "")
     if any(
-        token in body_lower
+        token in body_norm
         for token in (
             "you're all set",
             "you are all set",
-            "you’re all set",
+            "youre all set",
+            "you are ready",
+            "you're ready",
         )
-    ) or any(
-        token in body_text_value
+    ):
+        return True
+    return any(
+        token in body_raw
         for token in (
             "你已准备就绪",
             "一切就绪",
             "全部就绪",
+            "准备就绪",
         )
-    ):
+    )
+
+
+def _body_has_youre_all_set_disclaimer(body_text: str) -> bool:
+    body_norm = _normalize_youre_all_set_text(body_text)
+    return any(
+        token in body_norm
+        for token in (
+            "chatgpt can make mistakes",
+            "don't share sensitive",
+            "dont share sensitive",
+            "by continuing, you agree",
+            "by continuing you agree",
+            "chatgpts may make mistakes",
+            "chatgpt 可能会出错",
+            "chatgpt可能会出错",
+            "继续即表示你同意",
+            "继续即表示您同意",
+        )
+    )
+
+
+def _find_youre_all_set_continue_locator(page: Any) -> Any:
+    """定位 You're all set 页的 Continue 黑按钮。"""
+    if page is None:
+        return None
+    return _first_visible_locator(
+        page,
+        [
+            'button:text-is("Continue")',
+            '[role="button"]:text-is("Continue")',
+            'button:text-is("继续")',
+            '[role="button"]:text-is("继续")',
+            'button:has-text("Continue")',
+            '[role="button"]:has-text("Continue")',
+            'button[type="submit"]:has-text("Continue")',
+            'button:has-text("继续")',
+            '[role="button"]:has-text("继续")',
+            'button:text-is("Got it")',
+            'button:has-text("Got it")',
+            'button:text-is("Done")',
+            'button:text-is("完成")',
+        ],
+    )
+
+
+def _is_youre_all_set_page(url: str, body_text: str, page: Any = None) -> bool:
+    """
+    about-you 完成后的引导完成页：
+    "You're all set" + Continue。
+    必须点 Continue，否则会卡死在完成页。
+    """
+    if page is not None and _has_visible_about_you_controls(page):
+        # 资料表单还在时，绝不当完成页。
+        return False
+    if _body_has_youre_all_set_title(body_text):
         return True
-    # 弱信号：资料完成后的免责声明页 + 可见 Continue
-    if "chatgpt can make mistakes" in body_lower and "don't share sensitive" in body_lower:
+    # 弱信号：免责声明 + 可见 Continue 大按钮（SPA 标题偶发读不到）
+    if _body_has_youre_all_set_disclaimer(body_text):
         if page is None:
+            body_norm = _normalize_youre_all_set_text(body_text)
+            return "continue" in body_norm or "继续" in str(body_text or "")
+        if _find_youre_all_set_continue_locator(page) is not None:
             return True
-        return _first_visible_locator(
-            page,
-            [
-                'button:has-text("Continue")',
-                '[role="button"]:has-text("Continue")',
-                'button:has-text("继续")',
-                '[role="button"]:has-text("继续")',
-            ],
-        ) is not None
+    # DOM 直读标题（_describe_page 有时拿不全 SPA 文案）
+    if page is not None:
+        try:
+            has_title = bool(
+                page.evaluate(
+                    """() => {
+                        const raw = String(
+                            (document.body && (document.body.innerText || document.body.textContent)) || ''
+                        );
+                        const t = raw.toLowerCase()
+                            .replace(/[\\u2018\\u2019]/g, "'")
+                            .replace(/\\s+/g, ' ');
+                        if (
+                            t.includes("you're all set")
+                            || t.includes('you are all set')
+                            || t.includes('youre all set')
+                            || t.includes('you are ready')
+                        ) {
+                            return true;
+                        }
+                        if (
+                            raw.includes('你已准备就绪')
+                            || raw.includes('一切就绪')
+                            || raw.includes('全部就绪')
+                            || raw.includes('准备就绪')
+                        ) {
+                            return true;
+                        }
+                        const h = Array.from(document.querySelectorAll('h1,h2,[role="heading"]'))
+                            .map((n) => String(n.innerText || n.textContent || '').trim().toLowerCase())
+                            .join(' | ');
+                        return h.includes("you're all set")
+                            || h.includes('you are all set')
+                            || h.includes('youre all set')
+                            || h.includes('准备就绪');
+                    }"""
+                )
+            )
+            if has_title:
+                return True
+        except Exception:
+            pass
+        # 最弱信号：无 about-you 表单 + 免责声明 + Continue 主按钮
+        try:
+            weak = bool(
+                page.evaluate(
+                    """() => {
+                        const raw = String(
+                            (document.body && (document.body.innerText || document.body.textContent)) || ''
+                        ).toLowerCase();
+                        const hasDisclaimer = raw.includes('chatgpt can make mistakes')
+                            || raw.includes('by continuing, you agree')
+                            || raw.includes('by continuing you agree')
+                            || raw.includes("don't share sensitive")
+                            || raw.includes('chatgpt 可能会出错')
+                            || raw.includes('继续即表示');
+                        if (!hasDisclaimer) return false;
+                        const nodes = Array.from(document.querySelectorAll('button, [role="button"]'));
+                        const isVisible = (el) => {
+                            if (!el || el.disabled) return false;
+                            const r = el.getBoundingClientRect();
+                            const s = window.getComputedStyle(el);
+                            return r.width > 40 && r.height > 20
+                                && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+                        };
+                        return nodes.some((el) => {
+                            if (!isVisible(el)) return false;
+                            const t = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                            return t === 'continue' || t === '继续' || t === 'got it' || t === 'done' || t === '完成';
+                        });
+                    }"""
+                )
+            )
+            if weak:
+                return True
+        except Exception:
+            pass
     return False
 
 
 def _click_youre_all_set_continue(page: Any) -> bool:
+    """点 You're all set 页的 Continue；多策略重试，避免点不到黑按钮。"""
     if page is None:
         return False
+    # 0) 按钮可能刚渲染：短暂等可见
+    for _ in range(4):
+        if _find_youre_all_set_continue_locator(page) is not None:
+            break
+        _sleep_with_page(page, 250)
+    # 1) 精确文案 + 真人轨迹
     if _click_exact_action_texts(
         page,
         ["Continue", "继续", "Got it", "Done", "完成"],
         allow_generic_submit=False,
-        timeout_ms=1500,
+        timeout_ms=2000,
     ):
         return True
+    # 2) 常见选择器 + 真人 / force / JS
+    loc = _find_youre_all_set_continue_locator(page)
+    if loc is not None and _click_locator_human_like(page, loc, timeout_ms=2000):
+        return True
+    if loc is not None:
+        try:
+            loc.click(timeout=1800, force=True, delay=random.randint(40, 120))
+            return True
+        except Exception:
+            pass
+        try:
+            ok = bool(
+                loc.evaluate(
+                    """(el) => {
+                        try { el.focus(); } catch (e) {}
+                        try { el.click(); return true; } catch (e) {}
+                        try {
+                            el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                            return true;
+                        } catch (e2) {}
+                        return false;
+                    }"""
+                )
+            )
+            if ok:
+                return True
+        except Exception:
+            pass
+    # 3) 坐标兜底：找含 Continue 的大黑按钮中心
+    try:
+        pos = page.evaluate(
+            """() => {
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, div[role="button"]'));
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 40 && r.height > 20
+                        && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+                };
+                const wanted = new Set(['continue', '继续', 'got it', 'done', '完成']);
+                let best = null;
+                for (const el of nodes) {
+                    if (!isVisible(el) || el.disabled) continue;
+                    const t = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    if (!wanted.has(t)) continue;
+                    const r = el.getBoundingClientRect();
+                    const area = r.width * r.height;
+                    if (!best || area > best.area) {
+                        best = { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, area };
+                    }
+                }
+                return best;
+            }"""
+        )
+        if isinstance(pos, dict) and pos.get("x") is not None:
+            if _click_at_point_human_like(page, float(pos["x"]), float(pos["y"])):
+                return True
+            try:
+                page.mouse.click(float(pos["x"]), float(pos["y"]), delay=random.randint(40, 100))
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # 4) 键盘兜底：焦点在 Continue 时按 Enter / Space
+    try:
+        focused = bool(
+            page.evaluate(
+                """() => {
+                    const wanted = new Set(['continue', '继续', 'got it', 'done', '完成']);
+                    const nodes = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    for (const el of nodes) {
+                        const t = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        if (!wanted.has(t)) continue;
+                        try { el.focus(); return true; } catch (e) {}
+                    }
+                    return false;
+                }"""
+            )
+        )
+        if focused:
+            try:
+                page.keyboard.press("Enter")
+                return True
+            except Exception:
+                pass
+            try:
+                page.keyboard.press(" ")
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
     return _click_first(
         page,
         [
+            'button:text-is("Continue")',
             'button:has-text("Continue")',
             '[role="button"]:has-text("Continue")',
             'button[type="submit"]:has-text("Continue")',
@@ -2834,6 +3078,321 @@ def _click_youre_all_set_continue(page: Any) -> bool:
         ],
         timeout_ms=1500,
     )
+
+
+def _read_page_url_body(page: Any) -> tuple[str, str]:
+    """刷新读取当前 url + 深文案，供 You're all set / about-you 判定。"""
+    url, body = "", ""
+    try:
+        url, body = _describe_page(page, force_refresh=True)
+    except Exception:
+        url, body = "", ""
+    try:
+        deep = _get_page_deep_text(page)
+        if str(deep or "").strip():
+            body = deep
+    except Exception:
+        pass
+    return str(url or ""), str(body or "")
+
+
+def _looks_like_chatgpt_composer_home(page: Any, body_text: str) -> bool:
+    """真正对话首页信号（有输入框），区别于 You're all set 引导页。"""
+    body_norm = _normalize_youre_all_set_text(body_text)
+    if any(
+        token in body_norm
+        for token in (
+            "message chatgpt",
+            "ask anything",
+            "ask chatgpt",
+            "向 chatgpt 提问",
+            "询问任何问题",
+            "发送消息",
+        )
+    ):
+        return True
+    if page is None:
+        return False
+    try:
+        loc = _first_visible_locator(
+            page,
+            [
+                '#prompt-textarea',
+                'textarea[placeholder*="Message"]',
+                'textarea[placeholder*="Ask"]',
+                'div[contenteditable="true"]#prompt-textarea',
+                '[data-testid="composer"]',
+                'textarea[name="prompt-textarea"]',
+            ],
+        )
+        return loc is not None
+    except Exception:
+        return False
+
+
+def _wait_for_post_about_you_page(
+    page: Any,
+    *,
+    emitter: Any = None,
+    step: str = "create_account",
+    timeout_ms: int = 12000,
+) -> Dict[str, Any]:
+    """
+    about-you 提交后等待下一状态。
+    注意：You're all set 本身就在 chatgpt.com（无 about-you），
+    绝不能把“到了 chatgpt.com”当成已离开完成页。
+    返回: {url, body, kind}  kind in youre_all_set|missing_email|still_form|home|auth|other
+    """
+    result: Dict[str, Any] = {"url": "", "body": "", "kind": "other"}
+    if page is None:
+        return result
+    started = time.time()
+    deadline = started + max(1.0, float(timeout_ms or 0) / 1000.0)
+    # 给 SPA 渲染 You're all set 的最短观察窗，避免空页被误判成首页
+    min_observe_s = min(3.0, max(1.2, (deadline - started) * 0.35))
+    logged_all_set = False
+    while time.time() < deadline:
+        url, body = _read_page_url_body(page)
+        result["url"], result["body"] = url, body
+        if _is_youre_all_set_page(url, body, page):
+            result["kind"] = "youre_all_set"
+            if not logged_all_set and emitter is not None:
+                logged_all_set = True
+                try:
+                    emitter.info(
+                        "浏览器模式2 about-you 提交后已出现 You're all set 完成页，准备点 Continue...",
+                        step=step,
+                    )
+                except Exception:
+                    pass
+            return result
+        # 无完整文案时，仅凭 Continue 黑按钮也先按完成页处理（标题晚渲染）
+        if (
+            not _has_visible_about_you_controls(page)
+            and _find_youre_all_set_continue_locator(page) is not None
+            and (
+                _body_has_youre_all_set_disclaimer(body)
+                or _body_has_youre_all_set_title(body)
+                or len(str(body or "").strip()) < 40
+            )
+        ):
+            # 正文极短 + 只有 Continue：多半是完成页正在渲染
+            if _find_youre_all_set_continue_locator(page) is not None and not _looks_like_chatgpt_composer_home(page, body):
+                result["kind"] = "youre_all_set"
+                if not logged_all_set and emitter is not None:
+                    logged_all_set = True
+                    try:
+                        emitter.info(
+                            "浏览器模式2 about-you 提交后检测到 Continue 引导按钮（疑似 You're all set），准备点击...",
+                            step=step,
+                        )
+                    except Exception:
+                        pass
+                return result
+        if _is_about_you_missing_email_error(url, body):
+            result["kind"] = "missing_email"
+            return result
+        if _about_you_form_still_visible(url, body, page):
+            result["kind"] = "still_form"
+            # 表单还在可能是短暂过渡；接近超时再返回
+            if time.time() + 1.5 >= deadline:
+                return result
+            _sleep_with_page(page, 400)
+            continue
+        url_l = str(url or "").lower()
+        elapsed = time.time() - started
+        # 明确进入登录/OAuth/验证码页，可结束等待
+        if any(
+            token in url_l
+            for token in (
+                "auth.openai.com",
+                "email-verification",
+                "contact-verification",
+                "add-phone",
+            )
+        ) and "about-you" not in url_l:
+            result["kind"] = "auth"
+            return result
+        # oauth/login 也要避开过早误判；最短观察窗后再认
+        if elapsed >= min_observe_s and any(
+            token in url_l for token in ("/api/auth", "oauth", "authorize")
+        ) and "about-you" not in url_l:
+            result["kind"] = "auth"
+            return result
+        # 真正的 ChatGPT 主站对话页：必须看到输入框，且没有 Continue 引导
+        if (
+            elapsed >= min_observe_s
+            and _is_logged_in_chatgpt_home(url, body)
+            and not _body_has_youre_all_set_title(body)
+            and not _body_has_youre_all_set_disclaimer(body)
+            and _find_youre_all_set_continue_locator(page) is None
+            and _looks_like_chatgpt_composer_home(page, body)
+        ):
+            result["kind"] = "home"
+            return result
+        # 有 Continue 但主站 URL：按完成页
+        if (
+            _is_logged_in_chatgpt_home(url, body)
+            and _find_youre_all_set_continue_locator(page) is not None
+            and not _looks_like_chatgpt_composer_home(page, body)
+        ):
+            result["kind"] = "youre_all_set"
+            return result
+        _sleep_with_page(page, 450)
+    # 超时前最后一次判定
+    url, body = _read_page_url_body(page)
+    result["url"], result["body"] = url, body
+    if _is_youre_all_set_page(url, body, page):
+        result["kind"] = "youre_all_set"
+    elif _is_about_you_missing_email_error(url, body):
+        result["kind"] = "missing_email"
+    elif _about_you_form_still_visible(url, body, page):
+        result["kind"] = "still_form"
+    elif _find_youre_all_set_continue_locator(page) is not None and not _has_visible_about_you_controls(page):
+        # 超时仍见 Continue 且无资料表单：按完成页处理，避免漏点
+        result["kind"] = "youre_all_set"
+        if emitter is not None:
+            try:
+                emitter.warn(
+                    "浏览器模式2 about-you 提交后超时，仍看到 Continue 按钮，按 You're all set 处理...",
+                    step=step,
+                )
+            except Exception:
+                pass
+    else:
+        result["kind"] = "other"
+    return result
+
+
+def _pass_youre_all_set_page(
+    page: Any,
+    *,
+    emitter: Any = None,
+    step: str = "create_account",
+    max_attempts: int = 8,
+    settle_ms: int = 1800,
+    wait_appear_ms: int = 0,
+) -> Dict[str, Any]:
+    """
+    若当前在 You're all set，持续点 Continue 直到离开该页。
+    wait_appear_ms>0 时先等完成页出现（about-you 提交后 SPA 渲染有延迟）。
+    返回: {was_page, clicked, left, attempts, url, body}
+    """
+    result: Dict[str, Any] = {
+        "was_page": False,
+        "clicked": False,
+        "left": False,
+        "attempts": 0,
+        "url": "",
+        "body": "",
+    }
+    if page is None:
+        return result
+
+    # 提交后可能还没渲染出完成页：先等一会儿
+    if int(wait_appear_ms or 0) > 0:
+        appear = _wait_for_post_about_you_page(
+            page,
+            emitter=emitter,
+            step=step,
+            timeout_ms=int(wait_appear_ms),
+        )
+        result["url"] = str(appear.get("url") or "")
+        result["body"] = str(appear.get("body") or "")
+        kind = str(appear.get("kind") or "")
+        if kind == "youre_all_set":
+            result["was_page"] = True
+        elif kind in {"missing_email", "home", "auth"}:
+            # 没有完成页，直接视为已通过
+            result["left"] = True
+            return result
+        elif kind == "still_form":
+            result["left"] = False
+            return result
+
+    url, body = _read_page_url_body(page)
+    result["url"], result["body"] = url, body
+    if not result["was_page"]:
+        if _is_youre_all_set_page(url, body, page):
+            result["was_page"] = True
+        elif (
+            _find_youre_all_set_continue_locator(page) is not None
+            and not _has_visible_about_you_controls(page)
+            and (
+                _body_has_youre_all_set_disclaimer(body)
+                or _body_has_youre_all_set_title(body)
+            )
+        ):
+            result["was_page"] = True
+
+    if not result["was_page"]:
+        # 当前确实不是完成页
+        result["left"] = True
+        return result
+
+    attempts = max(1, int(max_attempts or 1))
+    for i in range(1, attempts + 1):
+        result["attempts"] = i
+        if emitter is not None:
+            try:
+                emitter.info(
+                    f"浏览器模式2 检测到 You're all set，准备点击 Continue（第 {i}/{attempts} 次）...",
+                    step=step,
+                )
+            except Exception:
+                pass
+        clicked = _click_youre_all_set_continue(page)
+        if clicked:
+            result["clicked"] = True
+            if emitter is not None:
+                try:
+                    emitter.info(
+                        f"浏览器模式2 You're all set 已点击 Continue（第 {i} 次），等待离开完成页...",
+                        step=step,
+                    )
+                except Exception:
+                    pass
+        else:
+            if emitter is not None:
+                try:
+                    emitter.warn(
+                        f"浏览器模式2 You're all set 第 {i} 次未点到 Continue，稍后重试..."
+                        + f" actions={_summarize_primary_actions(page)}",
+                        step=step,
+                    )
+                except Exception:
+                    pass
+        _wait_for_load(page, timeout_ms=min(3000, int(settle_ms or 1800) + 800))
+        _sleep_with_page(page, max(500, int(settle_ms or 0)))
+        url, body = _read_page_url_body(page)
+        result["url"], result["body"] = url, body
+        if not _is_youre_all_set_page(url, body, page):
+            # 离开完成页：也可能短暂空白，再确认 Continue 引导是否消失
+            still_has_continue = False
+            try:
+                still_has_continue = (
+                    _find_youre_all_set_continue_locator(page) is not None
+                    and _body_has_youre_all_set_disclaimer(body)
+                )
+            except Exception:
+                still_has_continue = False
+            if not still_has_continue:
+                result["left"] = True
+                if emitter is not None:
+                    try:
+                        emitter.success(
+                            "浏览器模式2 已离开 You're all set 完成页，继续后续流程...",
+                            step=step,
+                        )
+                    except Exception:
+                        pass
+                return result
+        # 点过但仍在页上：下轮换策略前稍等
+        if clicked:
+            _sleep_with_page(page, 400 + i * 120)
+    # 最后仍未离开
+    result["left"] = not _is_youre_all_set_page(result.get("url") or "", result.get("body") or "", page)
+    return result
 
 
 def _is_logged_in_chatgpt_home(url: str, body_text: str) -> bool:
@@ -2846,6 +3405,9 @@ def _is_logged_in_chatgpt_home(url: str, body_text: str) -> bool:
     if _is_profile_page(url, body_text):
         return False
     if _is_session_ended_page(url, body_text):
+        return False
+    # You're all set 引导页也在 chatgpt.com，绝不能当已登录首页。
+    if _body_has_youre_all_set_title(body_text) or _body_has_youre_all_set_disclaimer(body_text):
         return False
     if any(
         token in body_lower
@@ -8609,6 +9171,8 @@ def run_browser_registration(
             build_browser_session_token_func=build_browser_session_token_func,
             referer_url=current_url,
             fallback_email=ctx.email,
+            page=page,
+            proxy=str(ctx.proxy or ""),
         )
 
     def _restart_current_page_oauth_flow(*, target_phase: str, reason: str) -> None:
@@ -9537,13 +10101,6 @@ def run_browser_registration(
         operator_options = sms_order.get("operator_options") if isinstance(sms_order.get("operator_options"), list) else []
         auto_country_mode = bool(sms_order.get("auto_country_mode"))
         candidate_country_total = int(sms_order.get("country_candidates_total") or 0)
-        soft_banned_skipped = int(sms_order.get("soft_banned_countries_skipped") or 0)
-        if soft_banned_skipped > 0 and manual_v2_auto_phone_mode_name == "smsbower":
-            emitter.info(
-                f"浏览器模式2 SMSBower 自动国家候选已跳过 {soft_banned_skipped} 个"
-                + "连败软禁国家（同国连续 5 次注册失败会禁 5 分钟）。",
-                step=step,
-            )
         if price_tier_options:
             preview_rows = []
             for item in price_tier_options[:8]:
@@ -9901,63 +10458,12 @@ def run_browser_registration(
         return True
 
     def _record_manual_v2_sms_country_result(*, success: bool) -> None:
+        # 连败国家软禁已停用：不再记账、不禁取、不输出连败日志。
         nonlocal manual_v2_sms_country_result_recorded
         if manual_v2_sms_country_result_recorded:
             return
-        if not manual_v2_auto_phone_mode:
-            return
-        # 连败国家软禁仅 SMSBower 启用；HeroSMS 不记账、不禁取。
-        if manual_v2_auto_phone_mode_name != "smsbower":
-            return
-        if manual_v2_sms_country_id is None and not manual_v2_sms_country_iso and not manual_v2_sms_country_name:
-            return
         manual_v2_sms_country_result_recorded = True
-        try:
-            if success:
-                note_sms_country_registration_success(
-                    country_id=manual_v2_sms_country_id,
-                    iso_code=manual_v2_sms_country_iso,
-                    name=manual_v2_sms_country_name,
-                )
-                return
-            ban_info = note_sms_country_registration_failure(
-                country_id=manual_v2_sms_country_id,
-                iso_code=manual_v2_sms_country_iso,
-                name=manual_v2_sms_country_name,
-            )
-            if not isinstance(ban_info, dict) or not ban_info.get("ok"):
-                return
-            country_label = (
-                str(ban_info.get("name") or "").strip()
-                or manual_v2_sms_country_name
-                or manual_v2_sms_country_iso
-                or str(manual_v2_sms_country_id or "")
-                or "-"
-            )
-            if ban_info.get("just_banned"):
-                emitter.warn(
-                    f"浏览器模式2 SMSBower 国家 {country_label} 已连续注册失败 "
-                    + f"{ban_info.get('failure_streak_before_reset') or ban_info.get('threshold') or 5} 次，"
-                    + f"将禁取该国约 {ban_info.get('ban_seconds') or 300} 秒。",
-                    step="runtime",
-                )
-            else:
-                streak = int(ban_info.get("failure_streak") or 0)
-                threshold = int(ban_info.get("threshold") or 5)
-                if streak > 0:
-                    emitter.info(
-                        f"浏览器模式2 SMSBower 国家 {country_label} 注册失败连败 {streak}/{threshold}；"
-                        + f"达到 {threshold} 次将临时禁取该国 5 分钟。",
-                        step="runtime",
-                    )
-        except Exception as exc:
-            try:
-                emitter.warn(
-                    f"浏览器模式2 记录短信国家连败状态失败: {exc}",
-                    step="runtime",
-                )
-            except Exception:
-                pass
+        return
 
     def _finish_manual_v2_sms_provider(*, success: bool) -> None:
         nonlocal manual_v2_sms_provider_done, manual_v2_sms_purchased_at
@@ -10421,6 +10927,8 @@ def run_browser_registration(
                                     emitter=emitter,
                                     referer_url=current_url or callback_url_value,
                                     fallback_email=ctx.email,
+                                    page=page,
+                                    proxy=str(ctx.proxy or ""),
                                 ) or {}
                                 token_json = build_token_result_func(
                                     raw_token_payload,
@@ -10468,6 +10976,8 @@ def run_browser_registration(
                                             emitter=emitter,
                                             referer_url=current_url or callback_url_value,
                                             fallback_email=ctx.email,
+                                            page=page,
+                                            proxy=str(ctx.proxy or ""),
                                         ) or {}
                                         token_json = build_token_result_func(
                                             raw_token_payload,
@@ -10527,6 +11037,8 @@ def run_browser_registration(
                                         emitter=emitter,
                                         referer_url=current_url or callback_url_value,
                                         fallback_email=ctx.email,
+                                        page=page,
+                                        proxy=str(ctx.proxy or ""),
                                     ) or {}
                                     token_json = build_token_result_func(
                                         raw_token_payload,
@@ -11762,13 +12274,47 @@ def run_browser_registration(
                         profile_submitted = True
                         # 注册前半段 callback 与步骤2 PKCE 不是同一套；资料完成后必须重新拉起登录 OAuth。
                         callback_state["url"] = ""
+                        # about-you 提交后常见 You're all set（在 chatgpt.com 上）：
+                        # 必须等完成页出现并点完 Continue，绝不能把“到了 chatgpt.com”当成已离开。
+                        all_set = _pass_youre_all_set_page(
+                            page,
+                            emitter=emitter,
+                            step="create_account",
+                            max_attempts=8,
+                            settle_ms=1600,
+                            wait_appear_ms=12000,
+                        )
+                        try:
+                            current_url = str(all_set.get("url") or current_url)
+                            body_text = str(all_set.get("body") or body_text)
+                            if not current_url or not body_text:
+                                current_url, body_text = _read_page_url_body(page)
+                        except Exception:
+                            try:
+                                current_url, body_text = _read_page_url_body(page)
+                            except Exception:
+                                pass
+                        if all_set.get("was_page") and not all_set.get("left"):
+                            emitter.warn(
+                                "浏览器模式2 about-you 后仍停在 You're all set，本轮不进步骤2，下一轮继续点 Continue..."
+                                + f" attempts={all_set.get('attempts') or 0}"
+                                + f" actions={_summarize_primary_actions(page)}",
+                                step="create_account",
+                            )
+                            continue
+                        if (not all_set.get("left")) and (not all_set.get("was_page")):
+                            emitter.warn(
+                                "浏览器模式2 about-you 提交后页面未离开资料/过渡态，本轮不进步骤2，下一轮重试...",
+                                step="create_account",
+                            )
+                            continue
+                        # 若其实还在完成页（检测漏了），下一轮主循环会再点
                         if _is_youre_all_set_page(current_url, body_text, page):
-                            if _click_youre_all_set_continue(page):
-                                emitter.info(
-                                    "浏览器模式2 about-you 后进入 You're all set，已点击 Continue...",
-                                    step="create_account",
-                                )
-                                _wait_for_load(page, timeout_ms=2500)
+                            emitter.warn(
+                                "浏览器模式2 仍检测到 You're all set，本轮不进步骤2，交给主循环继续点 Continue...",
+                                step="create_account",
+                            )
+                            continue
                         if _is_about_you_missing_email_error(current_url, body_text):
                             emitter.warn(
                                 "浏览器模式2 about-you 提交后命中 authentication missing_email，"
@@ -11777,7 +12323,9 @@ def run_browser_registration(
                             )
                         else:
                             emitter.success(
-                                "浏览器模式2 已提交 about-you 资料，开始进入步骤2：使用已注册手机号走 OAuth 登录获取 Token...",
+                                "浏览器模式2 已提交 about-you 资料"
+                                + ("并离开 You're all set" if all_set.get("was_page") else "")
+                                + "，开始进入步骤2：使用已注册手机号走 OAuth 登录获取 Token...",
                                 step="create_account",
                             )
                         _prepare_manual_v2_login_flow(
@@ -12112,13 +12660,37 @@ def run_browser_registration(
                             continue
                         profile_submitted = True
                         callback_state["url"] = ""
+                        all_set = _pass_youre_all_set_page(
+                            page,
+                            emitter=emitter,
+                            step="create_account",
+                            max_attempts=8,
+                            settle_ms=1600,
+                            wait_appear_ms=10000,
+                        )
+                        try:
+                            current_url = str(all_set.get("url") or current_url)
+                            body_text = str(all_set.get("body") or body_text)
+                        except Exception:
+                            pass
+                        if all_set.get("was_page") and not all_set.get("left"):
+                            emitter.warn(
+                                "浏览器模式2 Terms 重点后仍停在 You're all set，本轮不进步骤2，下一轮继续点 Continue...",
+                                step="create_account",
+                            )
+                            continue
+                        if (not all_set.get("left")) and (not all_set.get("was_page")):
+                            emitter.warn(
+                                "浏览器模式2 Terms 重点后页面未离开资料/过渡态，本轮不进步骤2，下一轮重试...",
+                                step="create_account",
+                            )
+                            continue
                         if _is_youre_all_set_page(current_url, body_text, page):
-                            if _click_youre_all_set_continue(page):
-                                emitter.info(
-                                    "浏览器模式2 Terms 重点后进入 You're all set，已点击 Continue...",
-                                    step="create_account",
-                                )
-                                _wait_for_load(page, timeout_ms=2500)
+                            emitter.warn(
+                                "浏览器模式2 Terms 重点后仍检测到 You're all set，交给主循环继续点 Continue...",
+                                step="create_account",
+                            )
+                            continue
                         if manual_v2_profile_completion_mode:
                             manual_v2_profile_completion_mode = False
                             manual_v2_post_login_pending_email = False
@@ -12138,32 +12710,35 @@ def run_browser_registration(
                             )
                         continue
 
-                    # about-you 完成后的 You're all set：点 Continue 并结束补资料分流，否则会一直忽略步骤2 callback。
-                    if (
-                        is_manual_v2_mode
-                        and _is_youre_all_set_page(current_url, body_text, page)
-                    ):
+                    # about-you 完成后的 You're all set：必须点 Continue 离开，再进步骤2。
+                    if is_manual_v2_mode and _is_youre_all_set_page(current_url, body_text, page):
                         _extend_manual_v2_deadline(1800)
-                        clicked_all_set = _click_youre_all_set_continue(page)
-                        if clicked_all_set:
-                            emitter.info(
-                                "浏览器模式2 命中 You're all set 完成页，已点击 Continue 继续后续流程...",
-                                step="create_account",
-                            )
-                            _wait_for_load(page, timeout_ms=2500)
-                        else:
-                            emitter.warn(
-                                "浏览器模式2 命中 You're all set 完成页，但未点到 Continue，稍后重试..."
-                                + f" actions={_summarize_primary_actions(page)}",
-                                step="create_account",
-                            )
+                        all_set = _pass_youre_all_set_page(
+                            page,
+                            emitter=emitter,
+                            step="create_account",
+                            max_attempts=8,
+                            settle_ms=1600,
+                            wait_appear_ms=0,
+                        )
                         profile_submitted = True
-                        if manual_v2_profile_completion_mode or (
-                            manual_v2_login_flow_started and not manual_v2_oauth_resumed
+                        if not all_set.get("left"):
+                            # 仍在完成页：不拉 OAuth，下一轮继续点
+                            continue
+                        # 已离开完成页
+                        if (
+                            not manual_v2_login_flow_started
+                            or manual_v2_profile_completion_mode
+                            or (manual_v2_login_flow_started and not manual_v2_oauth_resumed)
                         ):
                             if manual_v2_profile_completion_mode:
                                 emitter.success(
-                                    "浏览器模式2 You're all set 表示补资料已完成，结束分流并进入真正的步骤2 OAuth...",
+                                    "浏览器模式2 You're all set 已通过，结束补资料分流并进入真正的步骤2 OAuth...",
+                                    step="create_account",
+                                )
+                            else:
+                                emitter.success(
+                                    "浏览器模式2 You're all set 已通过，进入真正的步骤2 OAuth 获取 Token...",
                                     step="create_account",
                                 )
                             manual_v2_profile_completion_mode = False
@@ -12377,14 +12952,43 @@ def run_browser_registration(
                                 profile_completion_only=True,
                             )
                             continue
+                        all_set = _pass_youre_all_set_page(
+                            page,
+                            emitter=emitter,
+                            step="create_account",
+                            max_attempts=8,
+                            settle_ms=1600,
+                            wait_appear_ms=12000,
+                        )
+                        try:
+                            current_url = str(all_set.get("url") or current_url)
+                            body_text = str(all_set.get("body") or body_text)
+                        except Exception:
+                            pass
+                        if all_set.get("was_page") and not all_set.get("left"):
+                            emitter.warn(
+                                "浏览器模式2 about-you 提交后仍停在 You're all set，本轮不进入下一步，下一轮继续点 Continue...",
+                                step="create_account",
+                            )
+                            continue
+                        if (not all_set.get("left")) and (not all_set.get("was_page")):
+                            emitter.warn(
+                                "浏览器模式2 about-you 提交后页面未离开资料/过渡态，本轮不进入下一步，下一轮重试...",
+                                step="create_account",
+                            )
+                            continue
                         if _is_youre_all_set_page(current_url, body_text, page):
-                            if _click_youre_all_set_continue(page):
-                                emitter.info(
-                                    "浏览器模式2 about-you 提交后进入 You're all set，已点击 Continue...",
-                                    step="create_account",
-                                )
-                                _wait_for_load(page, timeout_ms=2500)
-                        emitter.success("浏览器模式2 已完成 about-you，转入手机登录补邮箱流程...", step="create_account")
+                            emitter.warn(
+                                "浏览器模式2 about-you 后仍检测到 You're all set，交给主循环继续点 Continue...",
+                                step="create_account",
+                            )
+                            continue
+                        emitter.success(
+                            "浏览器模式2 已完成 about-you"
+                            + ("并离开 You're all set" if all_set.get("was_page") else "")
+                            + "，转入手机登录补邮箱流程...",
+                            step="create_account",
+                        )
                         if manual_v2_profile_completion_mode:
                             manual_v2_profile_completion_mode = False
                             callback_state["url"] = ""
@@ -13654,19 +14258,39 @@ def run_browser_registration(
                             profile_completion_only=True,
                         )
                         continue
-                    # about-you 成功后常见 “You're all set”：必须点 Continue，并结束补资料分流。
-                    if is_manual_v2_mode and _is_youre_all_set_page(current_url, body_text, page):
-                        if _click_youre_all_set_continue(page):
-                            emitter.info(
-                                "浏览器模式2 about-you 提交后进入 You're all set，已点击 Continue...",
-                                step="create_account",
-                            )
-                            _wait_for_load(page, timeout_ms=2500)
-                        else:
+                    # about-you 成功后常见 “You're all set”：必须点完 Continue 再结束补资料分流。
+                    if is_manual_v2_mode:
+                        all_set = _pass_youre_all_set_page(
+                            page,
+                            emitter=emitter,
+                            step="create_account",
+                            max_attempts=8,
+                            settle_ms=1600,
+                            wait_appear_ms=12000,
+                        )
+                        try:
+                            current_url = str(all_set.get("url") or current_url)
+                            body_text = str(all_set.get("body") or body_text)
+                        except Exception:
+                            pass
+                        if all_set.get("was_page") and not all_set.get("left"):
                             emitter.warn(
-                                "浏览器模式2 about-you 提交后命中 You're all set，但未点到 Continue，下一轮重试...",
+                                "浏览器模式2 about-you 提交后仍停在 You're all set，下一轮继续点 Continue...",
                                 step="create_account",
                             )
+                            continue
+                        if (not all_set.get("left")) and (not all_set.get("was_page")):
+                            emitter.warn(
+                                "浏览器模式2 about-you 提交后页面未离开资料/过渡态，下一轮重试...",
+                                step="create_account",
+                            )
+                            continue
+                        if _is_youre_all_set_page(current_url, body_text, page):
+                            emitter.warn(
+                                "浏览器模式2 仍检测到 You're all set，交给主循环继续点 Continue...",
+                                step="create_account",
+                            )
+                            continue
                     if is_manual_v2_mode and manual_v2_profile_completion_mode:
                         emitter.success(
                             "浏览器模式2 登录后补资料（about-you）已完成，结束分流并进入真正的步骤2 OAuth 获取 Token...",
