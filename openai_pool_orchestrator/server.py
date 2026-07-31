@@ -81,6 +81,34 @@ class ExtensionV2Session:
 
 _extension_v2_sessions_lock = threading.RLock()
 _extension_v2_sessions: Dict[str, ExtensionV2Session] = {}
+_EXTENSION_V2_SESSION_TTL_SECONDS = 30 * 60
+_EXTENSION_V2_COMPLETED_TTL_SECONDS = 5 * 60
+_EXTENSION_V2_SESSION_MAX = 256
+
+
+def _prune_extension_v2_sessions_locked(now: Optional[float] = None) -> int:
+    """清理扩展 V2 过期会话，防止长期运行进程的会话字典无界增长。"""
+    current_time = float(now if now is not None else time.time())
+    removed = 0
+    stale_ids = []
+    for session_id, session in _extension_v2_sessions.items():
+        age = current_time - float(session.created_at or 0.0)
+        ttl = _EXTENSION_V2_COMPLETED_TTL_SECONDS if session.completed else _EXTENSION_V2_SESSION_TTL_SECONDS
+        if age > ttl:
+            stale_ids.append(session_id)
+    for session_id in stale_ids:
+        if _extension_v2_sessions.pop(session_id, None) is not None:
+            removed += 1
+    overflow = len(_extension_v2_sessions) - _EXTENSION_V2_SESSION_MAX
+    if overflow > 0:
+        oldest = sorted(
+            _extension_v2_sessions.values(),
+            key=lambda session: float(session.created_at or 0.0),
+        )[:overflow]
+        for session in oldest:
+            if _extension_v2_sessions.pop(session.session_id, None) is not None:
+                removed += 1
+    return removed
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -2230,7 +2258,25 @@ class TaskState:
                 if self.stop_event.is_set():
                     break
 
-                wait = random.randint(5, 30)
+                # 取号库存/价档暂时没有：短歇后立刻再开一轮，不必睡满 5~30 秒。
+                last_err = str(getattr(self, "last_error", "") or "")
+                stock_like = any(
+                    token in last_err
+                    for token in (
+                        "没有国家",
+                        "无可用号码",
+                        "无可用国家",
+                        "价格区间",
+                        "价档",
+                        "NO_NUMBERS",
+                        "继续轮询取号",
+                        "取号入口轮询",
+                    )
+                )
+                if stock_like:
+                    wait = random.randint(2, 5)
+                else:
+                    wait = random.randint(5, 30)
                 attempt_emitter.info(f"{prefix}休息 {wait} 秒后继续...", step="wait")
                 self.stop_event.wait(wait)
 
@@ -3059,6 +3105,7 @@ async def api_extension_v2_start_session() -> Dict[str, Any]:
             profile_birthdate=_random_profile_birthdate(),
         )
         with _extension_v2_sessions_lock:
+            _prune_extension_v2_sessions_locked()
             _extension_v2_sessions[session.session_id] = session
         return {
             "ok": True,
@@ -4056,6 +4103,7 @@ def _get_extension_v2_session(session_id: str) -> ExtensionV2Session:
     if not sid:
         raise HTTPException(status_code=400, detail="session_id 不能为空")
     with _extension_v2_sessions_lock:
+        _prune_extension_v2_sessions_locked()
         session = _extension_v2_sessions.get(sid)
     if session is None:
         raise HTTPException(status_code=404, detail="扩展 V2 会话不存在或已失效")

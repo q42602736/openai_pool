@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import gc
 import json
 import os
 import random
 import re
+import resource
+import signal
 import shutil
 import socket
 import subprocess
@@ -12,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 from collections import deque
 from dataclasses import dataclass
@@ -108,8 +112,155 @@ _LOOPBACK_CALLBACK_TTL_SECONDS = 30 * 60
 _LOOPBACK_CALLBACK_HUB_LOCK = threading.Lock()
 _LOOPBACK_CALLBACK_HUB: Optional["_LoopbackCallbackHub"] = None
 _PAGE_SNAPSHOT_CACHE_TTL_SECONDS = 0.45
+_PAGE_SNAPSHOT_CACHE_MAX_ENTRIES = 64
+_PAGE_SNAPSHOT_MAX_BODY_CHARS = 65536
 _PAGE_SNAPSHOT_CACHE_LOCK = threading.Lock()
 _PAGE_SNAPSHOT_CACHE: dict[int, tuple[float, str, str]] = {}
+_BROWSER_MEMORY_CHECK_INTERVAL_SECONDS = 15.0
+_BROWSER_MEMORY_SOFT_RATIO = 0.78
+_BROWSER_MEMORY_HARD_RATIO = 0.90
+# Chrome for Testing + Playwright 进程树可占用数 GB，默认与 PM2 4G 限额对齐。
+_DEFAULT_MEMORY_LIMIT_MB = 4096
+_UC_PROCESS_SHUTDOWN_WAIT_SECONDS = 3.0
+_BROWSER_STALL_WATCHDOG_SECONDS = 120.0
+
+
+def _read_process_table() -> tuple[dict[int, tuple[int, int, str]], dict[int, list[int]]]:
+    """读取进程父子关系、RSS 和命令行；命令行只用于识别本项目临时浏览器。"""
+    output = subprocess.check_output(
+        ["ps", "-axo", "pid=,ppid=,rss=,command="],
+        text=True,
+        stderr=subprocess.DEVNULL,
+        timeout=1.5,
+    )
+    rows: dict[int, tuple[int, int, str]] = {}
+    children: dict[int, list[int]] = {}
+    for line in output.splitlines():
+        parts = line.strip().split(maxsplit=3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid, rss_kb = int(parts[0]), int(parts[1]), int(parts[2])
+        except (TypeError, ValueError):
+            continue
+        command = str(parts[3] if len(parts) > 3 else "").strip()
+        rows[pid] = (ppid, max(0, rss_kb), command)
+        children.setdefault(ppid, []).append(pid)
+    return rows, children
+
+
+def _process_descendants(
+    root_pid: int,
+    children: dict[int, list[int]],
+) -> set[int]:
+    descendants = {int(root_pid)}
+    pending = [int(root_pid)]
+    while pending:
+        parent = pending.pop()
+        for child in children.get(parent, []):
+            if child not in descendants:
+                descendants.add(child)
+                pending.append(child)
+    return descendants
+
+
+def _browser_memory_thresholds() -> tuple[int, int, int]:
+    """返回总进程树内存上限、软阈值、硬阈值；默认与 PM2 2G 限额对齐。"""
+    try:
+        configured_mb = int(float(os.environ.get("OPO_MEMORY_LIMIT_MB", _DEFAULT_MEMORY_LIMIT_MB)))
+    except (TypeError, ValueError):
+        configured_mb = _DEFAULT_MEMORY_LIMIT_MB
+    configured_mb = max(256, min(configured_mb, 32768))
+    limit_bytes = configured_mb * 1024 * 1024
+    return (
+        limit_bytes,
+        int(limit_bytes * _BROWSER_MEMORY_SOFT_RATIO),
+        int(limit_bytes * _BROWSER_MEMORY_HARD_RATIO),
+    )
+
+
+def _process_tree_rss_bytes() -> int:
+    """读取当前 Python 进程及其浏览器子进程 RSS，失败时退回当前进程峰值。"""
+    root_pid = os.getpid()
+    try:
+        rows, children = _read_process_table()
+        descendants = _process_descendants(root_pid, children)
+        total_kb = sum(rows.get(pid, (0, 0, ""))[1] for pid in descendants)
+        if total_kb > 0:
+            return total_kb * 1024
+    except Exception:
+        pass
+
+    try:
+        peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # macOS reports bytes, Linux reports KiB.
+        return int(peak if sys.platform == "darwin" else peak * 1024)
+    except Exception:
+        return 0
+
+
+def _process_tree_rss_report(limit: int = 8) -> str:
+    """返回当前进程树的高占用进程，便于判断 RSS 是否来自 Chrome 原生进程。"""
+    root_pid = os.getpid()
+    try:
+        rows, children = _read_process_table()
+        descendants = _process_descendants(root_pid, children)
+        top_rows = sorted(
+            (
+                (pid, rows.get(pid, (0, 0, ""))[1], rows.get(pid, (0, 0, ""))[2])
+                for pid in descendants
+                if pid in rows
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )[: max(1, int(limit or 1))]
+        if not top_rows:
+            return "count=0"
+        report_rows = []
+        for pid, rss_kb, command in top_rows:
+            safe_command = re.sub(r"(--proxy-server=)\S+", r"\1***", str(command or ""))
+            safe_command = " ".join(safe_command.split())[:180]
+            report_rows.append(f"pid={pid},rss={rss_kb / 1024:.0f}MB,cmd={safe_command or '-'}")
+        return f"count={len(descendants)}; " + "; ".join(report_rows)
+    except Exception as exc:
+        return f"unavailable={type(exc).__name__}"
+
+
+def _prune_page_snapshot_cache(
+    *,
+    page_ids: Optional[set[int]] = None,
+    force: bool = False,
+) -> int:
+    """清理快照缓存，避免页面句柄或超大 body 文本跨轮残留。"""
+    now = time.time()
+    removed = 0
+    with _PAGE_SNAPSHOT_CACHE_LOCK:
+        if page_ids:
+            for page_id in page_ids:
+                if _PAGE_SNAPSHOT_CACHE.pop(page_id, None) is not None:
+                    removed += 1
+        if force:
+            removed += len(_PAGE_SNAPSHOT_CACHE)
+            _PAGE_SNAPSHOT_CACHE.clear()
+        else:
+            stale_keys = [
+                key
+                for key, (created_at, _, _) in _PAGE_SNAPSHOT_CACHE.items()
+                if now - float(created_at or 0.0) > _PAGE_SNAPSHOT_CACHE_TTL_SECONDS * 4
+            ]
+            for key in stale_keys:
+                if _PAGE_SNAPSHOT_CACHE.pop(key, None) is not None:
+                    removed += 1
+            overflow = len(_PAGE_SNAPSHOT_CACHE) - _PAGE_SNAPSHOT_CACHE_MAX_ENTRIES
+            if overflow > 0:
+                oldest = sorted(
+                    _PAGE_SNAPSHOT_CACHE.items(),
+                    key=lambda item: float(item[1][0] or 0.0),
+                )[:overflow]
+                for key, _ in oldest:
+                    if _PAGE_SNAPSHOT_CACHE.pop(key, None) is not None:
+                        removed += 1
+    return removed
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -413,39 +564,44 @@ def normalize_browser_config(raw: Optional[Dict[str, Any]] = None) -> Dict[str, 
     }
 
 
-def _close_launch_resources(resources: Optional[BrowserLaunchResources]) -> None:
+def _close_launch_resources(
+    resources: Optional[BrowserLaunchResources],
+    *,
+    skip_browser_protocol: bool = False,
+) -> None:
     if resources is None:
         return
     page_cache_keys: set[int] = set()
-    try:
-        if resources.page is not None:
-            page_cache_keys.add(id(resources.page))
-    except Exception:
-        pass
-    try:
-        context_pages = list(getattr(resources.context, "pages", []) or [])
-    except Exception:
-        context_pages = []
-    for candidate_page in context_pages:
+    if not skip_browser_protocol:
         try:
-            page_cache_keys.add(id(candidate_page))
+            if resources.page is not None:
+                page_cache_keys.add(id(resources.page))
         except Exception:
-            continue
-    try:
-        if resources.context is not None:
-            resources.context.close()
-    except Exception:
-        pass
-    try:
-        if resources.browser is not None:
-            resources.browser.close()
-    except Exception:
-        pass
-    try:
-        if resources.cdp_driver is not None:
-            resources.cdp_driver.quit()
-    except Exception:
-        pass
+            pass
+        try:
+            context_pages = list(getattr(resources.context, "pages", []) or [])
+        except Exception:
+            context_pages = []
+        for candidate_page in context_pages:
+            try:
+                page_cache_keys.add(id(candidate_page))
+            except Exception:
+                continue
+        try:
+            if resources.context is not None:
+                resources.context.close()
+        except Exception:
+            pass
+        try:
+            if resources.browser is not None:
+                resources.browser.close()
+        except Exception:
+            pass
+        try:
+            if resources.cdp_driver is not None:
+                resources.cdp_driver.quit()
+        except Exception:
+            pass
     # Roxy 的窗口由客户端托管，必须走 API 关闭，否则窗口会一直挂着占用资料
     try:
         if resources.roxy_client is not None and resources.roxy_profile_id:
@@ -453,19 +609,20 @@ def _close_launch_resources(resources: Optional[BrowserLaunchResources]) -> None
     except Exception:
         pass
     temp_user_data_dir = str(resources.temp_user_data_dir or "").strip()
+    process_profile = _canonical_uc_temp_profile(temp_user_data_dir)
     if temp_user_data_dir:
         _unregister_active_temp_user_data_dir(temp_user_data_dir)
         if not bool(getattr(resources, "persistent_user_data_dir", False)):
             shutil.rmtree(temp_user_data_dir, ignore_errors=True)
+    if process_profile:
+        _cleanup_orphan_uc_processes(profile_dirs={process_profile})
     try:
         if resources.playwright is not None:
             resources.playwright.stop()
     except Exception:
         pass
     if page_cache_keys:
-        with _PAGE_SNAPSHOT_CACHE_LOCK:
-            for cache_key in page_cache_keys:
-                _PAGE_SNAPSHOT_CACHE.pop(cache_key, None)
+        _prune_page_snapshot_cache(page_ids=page_cache_keys)
 
 
 def _cleanup_preserved_browser_resources(
@@ -495,6 +652,43 @@ def _cleanup_preserved_browser_resources(
     return len(stale_resources)
 
 
+def _release_memory_pressure(emitter: Any = None) -> tuple[int, int, int]:
+    """关闭历史保留现场、清空快照缓存并触发 GC，返回回收前后 RSS 与对象数。"""
+    before = _process_tree_rss_bytes()
+    _cleanup_preserved_browser_resources(emitter)
+    _prune_page_snapshot_cache(force=True)
+    collected = gc.collect()
+    after = _process_tree_rss_bytes()
+    return before, after, collected
+
+
+def _purge_active_browser_memory(context: Any, page: Any) -> int:
+    """通过 CDP 停止当前页面加载并请求 Chromium 回收 JavaScript 内存。"""
+    if context is None or page is None:
+        return 0
+    completed = 0
+    try:
+        cdp_session = context.new_cdp_session(page)
+        for method in ("Page.stopLoading", "Memory.forciblyPurgeJavaScriptMemory"):
+            try:
+                cdp_session.send(method)
+                completed += 1
+            except Exception:
+                continue
+        try:
+            cdp_session.send("Network.clearBrowserCache")
+            completed += 1
+        except Exception:
+            pass
+        try:
+            cdp_session.detach()
+        except Exception:
+            pass
+    except Exception:
+        return completed
+    return completed
+
+
 def _stopped(stop_event: Any) -> bool:
     return bool(stop_event is not None and getattr(stop_event, "is_set", lambda: False)())
 
@@ -521,12 +715,8 @@ def _sleep_with_page(page: Any, milliseconds: int) -> None:
     wait_seconds = max(0.0, float(milliseconds or 0) / 1000.0)
     if wait_seconds <= 0:
         return
-    if page is not None:
-        try:
-            page.wait_for_timeout(int(milliseconds))
-            return
-        except Exception:
-            pass
+    # 不经 Playwright/CDP 做纯等待：渲染器失联时 wait_for_timeout 可能永久阻塞，
+    # Python 等待同样给页面留下墙钟时间，但不会把自动化线程锁死。
     time.sleep(wait_seconds)
 
 
@@ -549,7 +739,8 @@ def _safe_page_title(page: Any) -> str:
     if page is None:
         return ""
     try:
-        return str(page.title() or "").strip()
+        # Page.title 没有 timeout；title 元素读取可受 Playwright timeout 约束。
+        return str(page.locator("title").text_content(timeout=300) or "").strip()
     except Exception:
         return ""
 
@@ -604,10 +795,10 @@ def _wait_for_load(page: Any, timeout_ms: int = 2500) -> None:
     except Exception:
         pass
     try:
-        page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 1800))
+        page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 1200))
     except Exception:
         pass
-    _sleep_with_page(page, 350)
+    _sleep_with_page(page, 180)
 
 
 def _page_snapshot_signature(url: str, body_text: str) -> str:
@@ -651,14 +842,16 @@ def _first_visible_locator(page: Any, selectors: list[str]) -> Any:
     for target in _iter_page_targets(page):
         for selector in selectors:
             try:
-                locator = target.locator(selector)
-                count = min(locator.count(), 8)
-                if count <= 0:
+                # CSS :visible 在浏览器侧过滤掉隐藏占位元素，避免逐个 nth 候选跨 CDP 往返。
+                # text/xpath 等非 CSS selector 保留首元素兜底，避免改变 Playwright selector 语义。
+                if not str(selector).lstrip().startswith(("text=", "xpath=", "id=")):
+                    visible_locator = target.locator(f"{selector}:visible").first
+                    if visible_locator.is_visible(timeout=250):
+                        return visible_locator
                     continue
-                for index in range(count):
-                    item = locator.nth(index)
-                    if item.is_visible():
-                        return item
+                locator = target.locator(selector).first
+                if locator.is_visible(timeout=250):
+                    return locator
             except Exception:
                 continue
     return None
@@ -706,17 +899,7 @@ def _page_viewport_size(page: Any) -> tuple[float, float]:
             return vw, vh
     except Exception:
         pass
-    try:
-        size = page.evaluate(
-            """() => ({
-                w: window.innerWidth || document.documentElement.clientWidth || 1280,
-                h: window.innerHeight || document.documentElement.clientHeight || 800
-            })"""
-        )
-        if isinstance(size, dict):
-            return float(size.get("w") or 1280), float(size.get("h") or 800)
-    except Exception:
-        pass
+    # page.evaluate 没有 timeout；没有 viewport 信息时使用稳定默认值。
     return 1280.0, 800.0
 
 
@@ -733,8 +916,8 @@ def _bezier_mouse_move(
     sx, sy = float(start[0]), float(start[1])
     ex, ey = float(end[0]), float(end[1])
     if duration_ms is None:
-        duration_ms = int(random.uniform(180, 520))
-    duration_ms = max(80, int(duration_ms))
+        duration_ms = int(random.uniform(120, 320))
+    duration_ms = max(60, int(duration_ms))
     steps = max(8, min(36, int(duration_ms / 16)))
     mx = (sx + ex) / 2.0 + random.uniform(-40.0, 40.0)
     my = (sy + ey) / 2.0 + random.uniform(-30.0, 30.0)
@@ -779,16 +962,16 @@ def _click_at_point_human_like(
         sy = vh * random.uniform(0.22, 0.55)
     try:
         # 点击前轻微“思考”
-        if random.random() < 0.55:
-            _sleep_with_page(page, random.randint(80, 280))
+        if random.random() < 0.28:
+            _sleep_with_page(page, random.randint(40, 120))
         _bezier_mouse_move(
             page,
             (sx, sy),
             (tx, ty),
-            duration_ms=int(random.uniform(180, 480)),
+            duration_ms=int(random.uniform(100, 280)),
         )
-        # 轻微过冲再回正（更像真人）
-        if random.random() < 0.4:
+        # 轻微过冲再回正（更像真人；概率略降以提速）
+        if random.random() < 0.22:
             overshoot = (
                 tx + random.uniform(-6.0, 6.0),
                 ty + random.uniform(-4.0, 4.0),
@@ -805,12 +988,12 @@ def _click_at_point_human_like(
                 (tx, ty),
                 duration_ms=int(random.uniform(40, 100)),
             )
-        _sleep_with_page(page, random.randint(40, 140))
+        _sleep_with_page(page, random.randint(20, 80))
         page.mouse.down()
         _sleep_with_page(page, random.randint(int(hold_ms_lo), int(hold_ms_hi)))
         page.mouse.up()
         _set_page_mouse_pos(page, tx, ty)
-        _sleep_with_page(page, random.randint(90, 280))
+        _sleep_with_page(page, random.randint(40, 140))
         return True
     except Exception:
         return False
@@ -829,14 +1012,8 @@ def _click_locator_human_like(page: Any, locator: Any, *, timeout_ms: int = 1200
     try:
         locator.scroll_into_view_if_needed(timeout=min(1200, int(timeout_ms or 1200)))
     except Exception:
-        try:
-            locator.evaluate(
-                """(el) => {
-                    try { el.scrollIntoView({block:'center', inline:'nearest', behavior:'instant'}); } catch (e) {}
-                }"""
-            )
-        except Exception:
-            pass
+        # scroll 失败时继续尝试 bounding_box/click；不使用无 timeout 的 locator.evaluate。
+        pass
     _sleep_with_page(mouse_page, random.randint(50, 140))
     box = None
     try:
@@ -901,7 +1078,7 @@ def _click_text_ancestor(page: Any, texts: list[str], *, timeout_ms: int = 1200)
             continue
         try:
             candidate = page.locator(f"text={needle}").first
-            if candidate.count() <= 0 or not candidate.is_visible():
+            if not candidate.is_visible(timeout=300):
                 continue
         except Exception:
             continue
@@ -913,7 +1090,7 @@ def _click_text_ancestor(page: Any, texts: list[str], *, timeout_ms: int = 1200)
         ):
             try:
                 ancestor = candidate.locator(selector).first
-                if ancestor.count() <= 0 or not ancestor.is_visible():
+                if not ancestor.is_visible(timeout=300):
                     continue
                 if _click_locator_human_like(page, ancestor, timeout_ms=timeout_ms):
                     return True
@@ -1021,14 +1198,15 @@ def _fill_input_by_label(page: Any, label_hints: list[str], value: str, *, timeo
         return False
     try:
         labels = page.locator("label")
-        count = min(labels.count(), 24)
     except Exception:
         return False
 
-    for index in range(count):
+    for index in range(24):
         try:
             label = labels.nth(index)
-            if not label.is_visible():
+            if not label.is_visible(timeout=300):
+                if index == 0:
+                    break
                 continue
             label_text = str(label.inner_text(timeout=timeout_ms) or "").strip().lower()
             if not label_text or not any(hint in label_text for hint in normalized_hints):
@@ -1060,11 +1238,12 @@ def _fill_input_by_label(page: Any, label_hints: list[str], value: str, *, timeo
             if target is None:
                 try:
                     nested = label.locator('input, textarea, [role="textbox"], [contenteditable="true"]')
-                    nested_count = min(nested.count(), 4)
-                    for nested_index in range(nested_count):
+                    for nested_index in range(4):
                         candidate = nested.nth(nested_index)
-                        if candidate.is_visible():
+                        if candidate.is_visible(timeout=300):
                             target = candidate
+                            break
+                        if nested_index == 0:
                             break
                 except Exception:
                     target = None
@@ -1108,15 +1287,18 @@ def _collect_visible_locators(page: Any, selectors: list[str], *, limit: int = 8
     for selector in selectors:
         try:
             locator = page.locator(selector)
-            count = min(locator.count(), limit)
-            for index in range(count):
+            for index in range(max(1, int(limit or 1))):
                 item = locator.nth(index)
                 try:
-                    if item.is_visible():
+                    if item.is_visible(timeout=300):
                         results.append(item)
                         if len(results) >= limit:
                             return results
+                    elif index == 0:
+                        break
                 except Exception:
+                    if index == 0:
+                        break
                     continue
         except Exception:
             continue
@@ -1124,6 +1306,10 @@ def _collect_visible_locators(page: Any, selectors: list[str], *, limit: int = 8
 
 
 def _locator_metadata(locator: Any) -> Dict[str, str]:
+    """批量读取控件元数据；失败时返回空结果交给调用方跳过。"""
+
+    # 健康页面走一次浏览器内读取，避免每个属性都跨 Playwright 同步桥接往返。
+    # 活动页选择不走此函数；若渲染器失联，由看门狗终止当前 driver 并让外层重试。
     try:
         data = locator.evaluate(
             """(el) => {
@@ -1141,35 +1327,99 @@ def _locator_metadata(locator: Any) -> Dict[str, str]:
                 }
                 const nestedEditable = el.querySelector && el.querySelector('input, textarea, [contenteditable="true"]');
                 const parent = el.parentElement;
+                const attr = (name) => String(el.getAttribute?.(name) || '').toLowerCase();
                 return {
                     tag: (el.tagName || '').toLowerCase(),
-                    type: (el.getAttribute('type') || '').toLowerCase(),
-                    role: (el.getAttribute('role') || '').toLowerCase(),
-                    name: (el.getAttribute('name') || '').toLowerCase(),
-                    id: (el.getAttribute('id') || '').toLowerCase(),
-                    aria_label: (el.getAttribute('aria-label') || '').toLowerCase(),
-                    placeholder: (el.getAttribute('placeholder') || '').toLowerCase(),
-                    autocomplete: (el.getAttribute('autocomplete') || '').toLowerCase(),
-                    aria_haspopup: (el.getAttribute('aria-haspopup') || '').toLowerCase(),
-                    aria_valuemin: (el.getAttribute('aria-valuemin') || '').toLowerCase(),
-                    aria_valuemax: (el.getAttribute('aria-valuemax') || '').toLowerCase(),
-                    aria_valuenow: (el.getAttribute('aria-valuenow') || '').toLowerCase(),
-                    aria_valuetext: (el.getAttribute('aria-valuetext') || '').toLowerCase(),
-                    data_type: (el.getAttribute('data-type') || '').toLowerCase(),
-                    contenteditable: (el.getAttribute('contenteditable') || '').toLowerCase(),
+                    type: attr('type'),
+                    role: attr('role'),
+                    name: attr('name'),
+                    id: attr('id'),
+                    aria_label: attr('aria-label'),
+                    placeholder: attr('placeholder'),
+                    autocomplete: attr('autocomplete'),
+                    aria_haspopup: attr('aria-haspopup'),
+                    aria_valuemin: attr('aria-valuemin'),
+                    aria_valuemax: attr('aria-valuemax'),
+                    aria_valuenow: attr('aria-valuenow'),
+                    aria_valuetext: attr('aria-valuetext'),
+                    data_type: attr('data-type'),
+                    contenteditable: attr('contenteditable'),
                     value: (typeof el.value === 'string' ? el.value : '').trim().toLowerCase(),
-                    nested_value: nestedEditable ? (((typeof nestedEditable.value === 'string' ? nestedEditable.value : '') || nestedEditable.textContent || '')).trim().toLowerCase() : '',
+                    nested_value: nestedEditable
+                        ? (((typeof nestedEditable.value === 'string' ? nestedEditable.value : '') || nestedEditable.textContent || '')).trim().toLowerCase()
+                        : '',
                     text: ((el.innerText || el.textContent || '')).trim().toLowerCase(),
                     parent_text: parent ? ((parent.innerText || parent.textContent || '')).trim().toLowerCase() : '',
                     labels: labels.filter(Boolean).join(' ').toLowerCase(),
                 };
-            }"""
+            }""",
+            timeout=500,
         )
         if isinstance(data, dict):
-            return {str(k): str(v or "") for k, v in data.items()}
+            return {str(key): str(value or '') for key, value in data.items()}
     except Exception:
         pass
-    return {}
+
+    # 仅在批量读取失败时保留少量属性兜底；正常路径不会执行这里。
+    def _attr(name: str) -> str:
+        try:
+            return str(locator.get_attribute(name, timeout=300) or "").strip().lower()
+        except Exception:
+            return ""
+
+    attrs = {
+        "type": _attr("type"),
+        "role": _attr("role"),
+        "name": _attr("name"),
+        "id": _attr("id"),
+        "aria_label": _attr("aria-label"),
+        "placeholder": _attr("placeholder"),
+        "autocomplete": _attr("autocomplete"),
+        "aria_haspopup": _attr("aria-haspopup"),
+        "aria_valuemin": _attr("aria-valuemin"),
+        "aria_valuemax": _attr("aria-valuemax"),
+        "aria_valuenow": _attr("aria-valuenow"),
+        "aria_valuetext": _attr("aria-valuetext"),
+        "data_type": _attr("data-type"),
+        "contenteditable": _attr("contenteditable"),
+    }
+    value = ""
+    try:
+        value = str(locator.input_value(timeout=300) or "").strip().lower()
+    except Exception:
+        value = _attr("value")
+    text = ""
+    try:
+        text = str(locator.inner_text(timeout=300) or "").strip().lower()
+    except Exception:
+        try:
+            text = str(locator.text_content(timeout=300) or "").strip().lower()
+        except Exception:
+            text = ""
+    parent_text = ""
+    try:
+        parent_text = str(locator.locator("xpath=..").inner_text(timeout=300) or "").strip().lower()
+    except Exception:
+        parent_text = ""
+    if attrs["role"] == "combobox" or attrs["aria_haspopup"] == "listbox":
+        tag = "select"
+    elif attrs["role"] == "button" or attrs["type"] in {"submit", "button"}:
+        tag = "button"
+    elif attrs["type"]:
+        tag = "input"
+    else:
+        tag = ""
+    attrs.update(
+        {
+            "tag": tag,
+            "value": value,
+            "nested_value": value,
+            "text": text,
+            "parent_text": parent_text,
+            "labels": "",
+        }
+    )
+    return attrs
 
 
 def _locator_matches_hints(locator: Any, hints: list[str]) -> bool:
@@ -1272,24 +1522,6 @@ def _birthdate_segment_contains(locator: Any, expected: str) -> bool:
 
 
 def _focus_birthdate_segment(locator: Any) -> None:
-    try:
-        locator.evaluate(
-            """(el) => {
-                if (!el) return;
-                if (typeof el.focus === 'function') {
-                    el.focus();
-                }
-                try {
-                    const selection = window.getSelection();
-                    const range = document.createRange();
-                    range.selectNodeContents(el);
-                    selection.removeAllRanges();
-                    selection.addRange(range);
-                } catch {}
-            }"""
-        )
-    except Exception:
-        pass
     try:
         locator.click(timeout=1200)
     except Exception:
@@ -1687,146 +1919,91 @@ def _click_exact_action_texts(
     allow_generic_submit: bool = False,
     timeout_ms: int = 1500,
 ) -> bool:
-    """
-    按按钮完整文案精确点击，并走真人鼠标轨迹。
-    禁止用 :has-text('Continue') 子串匹配，也禁止纯 JS dispatchEvent 假点。
-    """
+    """按完整文案批量查找按钮，再交给真人轨迹点击。"""
     if page is None:
         return False
     wanted = [str(item or "").strip() for item in (preferred_texts or []) if str(item or "").strip()]
     if not wanted and not allow_generic_submit:
         return False
 
-    # 1) Playwright 精确文案定位 + 真人点击
-    for text in wanted:
-        safe = str(text).replace('"', '\\"')
-        locator = _first_visible_locator(
-            page,
-            [
-                f'button:text-is("{safe}")',
-                f'[role="button"]:text-is("{safe}")',
-                f'input[type="submit"][value="{safe}"]',
-                f'input[type="button"][value="{safe}"]',
-            ],
-        )
-        if locator is not None and _click_locator_human_like(page, locator, timeout_ms=timeout_ms):
-            return True
-
-    # 2) JS 只负责“找到并打标”，真正点击仍走真人轨迹（对齐 grok注册机 find + human_click）
     marker = f"data-human-click-{int(time.time() * 1000) % 10_000_000}"
-    try:
-        marked = bool(
-            page.evaluate(
-                """({ wanted, allowGenericSubmit, rejectProviders, marker }) => {
-                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-                    const lower = (value) => normalize(value).toLowerCase();
-                    const isVisible = (node) => {
-                        if (!node) return false;
-                        const rect = node.getBoundingClientRect();
-                        const style = window.getComputedStyle(node);
-                        return rect.width >= 8
-                            && rect.height >= 8
-                            && style.display !== 'none'
-                            && style.visibility !== 'hidden'
-                            && style.opacity !== '0'
-                            && style.pointerEvents !== 'none';
-                    };
-                    const readText = (node) => normalize(
-                        node?.innerText
-                        || node?.value
-                        || node?.getAttribute?.('aria-label')
-                        || node?.getAttribute?.('title')
-                        || ''
-                    );
-                    const isRejected = (text) => {
-                        const textLower = lower(text);
-                        if (!textLower) return false;
-                        return (rejectProviders || []).some((token) => textLower.includes(String(token || '').toLowerCase()));
-                    };
-                    const isEnabled = (node) => {
-                        if (!node || node.disabled) return false;
-                        const ariaDisabled = String(node.getAttribute?.('aria-disabled') || '').trim().toLowerCase();
-                        return ariaDisabled !== 'true';
-                    };
-                    try {
-                        document.querySelectorAll('[' + marker + ']').forEach((n) => n.removeAttribute(marker));
-                    } catch (e) {}
-                    const nodes = Array.from(document.querySelectorAll(
-                        'button, [role="button"], input[type="submit"], input[type="button"], a[href]'
-                    ));
-                    const wantedLower = (wanted || []).map((item) => lower(item)).filter(Boolean);
-                    const mark = (node) => {
-                        try { node.setAttribute(marker, '1'); return true; } catch (e) { return false; }
-                    };
-                    for (const want of wantedLower) {
-                        for (const node of nodes) {
-                            if (!isVisible(node) || !isEnabled(node)) continue;
-                            const text = readText(node);
-                            if (!text) continue;
-                            if (lower(text) !== want) continue;
-                            if (mark(node)) return true;
-                        }
-                    }
-                    if (allowGenericSubmit) {
-                        for (const node of nodes) {
-                            if (!isVisible(node) || !isEnabled(node)) continue;
-                            const tag = String(node.tagName || '').toLowerCase();
-                            const type = String(node.getAttribute?.('type') || '').toLowerCase();
-                            const text = readText(node);
-                            if (text && isRejected(text)) continue;
-                            const isSubmit = type === 'submit' || (tag === 'button' && (!type || type === 'submit'));
-                            if (!isSubmit) continue;
-                            if (!text || wantedLower.includes(lower(text))) {
-                                if (mark(node)) return true;
-                            }
-                        }
-                    }
-                    return false;
-                }""",
-                {
-                    "wanted": wanted,
-                    "allowGenericSubmit": bool(allow_generic_submit),
-                    "rejectProviders": [
-                        "google",
-                        "apple",
-                        "microsoft",
-                        "github",
-                        "facebook",
-                        "email",
-                        "邮箱",
-                        "sso",
-                        "with phone",
-                        "使用手机",
-                        "手机登录",
-                    ],
-                    "marker": marker,
-                },
-            )
-        )
-    except Exception:
+    wanted_lower = [re.sub(r"\s+", " ", item).strip().lower() for item in wanted]
+    reject_tokens = [
+        "google", "apple", "microsoft", "github", "facebook", "email", "邮箱",
+        "sso", "with phone", "使用手机", "手机登录",
+    ]
+    scan_script = """
+        ({ wanted, allowGenericSubmit, rejectTokens, marker }) => {
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const readText = (node) => normalize(
+                node?.innerText || node?.value || node?.getAttribute?.('aria-label') || node?.getAttribute?.('title') || ''
+            );
+            const rejected = (text) => rejectTokens.some((token) => text.includes(String(token || '').toLowerCase()));
+            const visible = (node) => {
+                if (!node || node.disabled || String(node.getAttribute?.('aria-disabled') || '').toLowerCase() === 'true') return false;
+                const rect = node.getBoundingClientRect?.();
+                const style = window.getComputedStyle?.(node);
+                return !!rect && rect.width >= 8 && rect.height >= 8
+                    && style?.display !== 'none' && style?.visibility !== 'hidden'
+                    && style?.opacity !== '0' && style?.pointerEvents !== 'none';
+            };
+            const nodes = Array.from(document.querySelectorAll(
+                'button, [role="button"], input[type="submit"], input[type="button"], a[href]'
+            ));
+            const mark = (node) => {
+                try { node.setAttribute(marker, '1'); return true; } catch (_) { return false; }
+            };
+            for (const want of wanted) {
+                for (const node of nodes) {
+                    if (!visible(node)) continue;
+                    const text = readText(node);
+                    if (text === want && mark(node)) return true;
+                }
+            }
+            if (!allowGenericSubmit) return false;
+            for (const node of nodes) {
+                if (!visible(node)) continue;
+                const text = readText(node);
+                const tag = String(node.tagName || '').toLowerCase();
+                const type = String(node.getAttribute?.('type') || '').toLowerCase();
+                const isSubmit = type === 'submit' || (tag === 'button' && (!type || type === 'submit'));
+                if (isSubmit && (!text || (!rejected(text) && wanted.includes(text))) && mark(node)) return true;
+            }
+            return false;
+        }
+    """
+    clear_script = """(marker) => {
+        try { document.querySelectorAll('[' + marker + ']').forEach((node) => node.removeAttribute(marker)); } catch (_) {}
+    }"""
+    for target in _iter_page_targets(page):
         marked = False
-    if marked:
-        locator = _first_visible_locator(page, [f'[{marker}="1"]'])
-        if locator is not None and _click_locator_human_like(page, locator, timeout_ms=timeout_ms):
-            try:
-                page.evaluate(
-                    """(marker) => {
-                        document.querySelectorAll('[' + marker + ']').forEach((n) => n.removeAttribute(marker));
-                    }""",
-                    marker,
-                )
-            except Exception:
-                pass
-            return True
         try:
-            page.evaluate(
-                """(marker) => {
-                    document.querySelectorAll('[' + marker + ']').forEach((n) => n.removeAttribute(marker));
-                }""",
-                marker,
+            marked = bool(
+                target.evaluate(
+                    scan_script,
+                    {
+                        "wanted": wanted_lower,
+                        "allowGenericSubmit": bool(allow_generic_submit),
+                        "rejectTokens": reject_tokens,
+                        "marker": marker,
+                    },
+                )
             )
         except Exception:
+            continue
+        if not marked:
+            continue
+        try:
+            locator = target.locator(f'[{marker}="1"]').first
+            if locator.is_visible() and _click_locator_human_like(page, locator, timeout_ms=timeout_ms):
+                return True
+        except Exception:
             pass
+        finally:
+            try:
+                target.evaluate(clear_script, marker)
+            except Exception:
+                pass
     return False
 
 
@@ -1869,20 +2046,8 @@ def _request_submit_with_button(locator: Any) -> bool:
     if locator is None:
         return False
     try:
-        return bool(
-            locator.evaluate(
-                """(el) => {
-                    const form = el.closest('form');
-                    if (!form) return false;
-                    if (typeof form.requestSubmit === 'function') {
-                        form.requestSubmit(el);
-                        return true;
-                    }
-                    form.submit();
-                    return true;
-                }"""
-            )
-        )
+        locator.press("Enter", timeout=1200)
+        return True
     except Exception:
         return False
 
@@ -1936,40 +2101,7 @@ def _click_retryable_error_action(page: Any) -> bool:
     ]
     if _click_first(page, selectors, timeout_ms=1500):
         return True
-    def _click_in_target(target: Any) -> bool:
-        try:
-            return bool(
-                target.evaluate(
-                    """() => {
-                        const texts = ['try again', 'retry', '重试', 'continue'];
-                        const isVisible = (el) => {
-                            if (!el) return false;
-                            const rect = el.getBoundingClientRect();
-                            const style = window.getComputedStyle(el);
-                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                        };
-                        const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="submit"]'));
-                        for (const node of nodes) {
-                            const raw = String(node.innerText || node.textContent || node.value || '').trim();
-                            const text = raw.toLowerCase();
-                            if (!raw || !isVisible(node)) continue;
-                            if (node.disabled || String(node.getAttribute('aria-disabled') || '').toLowerCase() === 'true') continue;
-                            if (!texts.some((item) => text === item || text.includes(item))) continue;
-                            try {
-                                node.click();
-                            } catch (e) {}
-                            if (typeof node.dispatchEvent === 'function') {
-                                node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                            }
-                            return true;
-                        }
-                        return false;
-                    }"""
-                )
-            )
-        except Exception:
-            return False
-    if _click_in_target(page):
+    if _click_first(page, selectors, timeout_ms=1200):
         return True
     try:
         frames = list(getattr(page, "frames", []) or [])
@@ -1978,7 +2110,7 @@ def _click_retryable_error_action(page: Any) -> bool:
     for frame in frames:
         if frame is None:
             continue
-        if _click_in_target(frame):
+        if _click_first(frame, selectors, timeout_ms=1200):
             return True
     return False
 
@@ -1997,33 +2129,61 @@ def _get_body_raw_text(page: Any) -> str:
             return str(text or "")
     except Exception:
         pass
-    try:
-        return str(
-            page.evaluate(
-                """() => {
-                    if (!document.body) return "";
-                    return document.body.textContent || document.body.innerText || "";
-                }"""
-            )
-            or ""
-        )
-    except Exception:
-        return ""
+    # page.evaluate 没有 timeout；渲染器失联时会把同步 Playwright 线程永久挂住。
+    # text_content 已经覆盖页面正文，失败时返回空串交给 URL/已有快照继续判断。
+    return ""
+
+
+def _get_alert_text(page: Any, *, max_items: int = 12) -> str:
+    """读取常见错误提示节点；每个节点有短 timeout，不调用 evaluate。"""
+    parts: list[str] = []
+    selectors = (
+        '[role="alert"]',
+        '[aria-live="assertive"]',
+        '[aria-live="polite"]',
+        '[role="heading"]',
+        "h1",
+        "h2",
+    )
+    item_limit = max(1, int(max_items or 1))
+    for target in _iter_page_targets(page):
+        for selector in selectors:
+            try:
+                locator = target.locator(selector)
+            except Exception:
+                continue
+            for index in range(item_limit):
+                try:
+                    text = str(locator.nth(index).inner_text(timeout=300) or "").strip()
+                except Exception:
+                    break
+                if text and text not in parts:
+                    parts.append(text)
+                    if len(parts) >= item_limit:
+                        return "\n".join(parts)
+    return "\n".join(parts)
 
 
 def _get_page_deep_text(page: Any) -> str:
     parts: list[str] = []
     seen: set[str] = set()
+    total_chars = 0
 
     def _push(text: str) -> None:
+        nonlocal total_chars
         normalized = str(text or "").strip()
         if not normalized:
             return
+        remaining = _PAGE_SNAPSHOT_MAX_BODY_CHARS - total_chars
+        if remaining <= 0:
+            return
+        normalized = normalized[:remaining]
         key = re.sub(r"\s+", " ", normalized)[:2000]
         if key in seen:
             return
         seen.add(key)
         parts.append(normalized)
+        total_chars += len(normalized) + 1
 
     _push(_get_body_raw_text(page))
     try:
@@ -2031,18 +2191,14 @@ def _get_page_deep_text(page: Any) -> str:
     except Exception:
         frames = []
     for frame in frames:
+        if total_chars >= _PAGE_SNAPSHOT_MAX_BODY_CHARS:
+            break
         if frame is None:
             continue
         try:
-            text = str(
-                frame.evaluate(
-                    """() => {
-                        if (!document || !document.body) return '';
-                        return document.body.textContent || document.body.innerText || '';
-                    }"""
-                )
-                or ""
-            )
+            text = str(frame.locator("body").text_content(timeout=1500) or "")
+            if not text.strip():
+                text = str(frame.locator("body").inner_text(timeout=1000) or "")
         except Exception:
             text = ""
         _push(text)
@@ -2155,23 +2311,7 @@ def _is_phone_sms_send_failed_error(url: str, body_text: str, page: Any = None) 
         return True
     if "auth.openai.com" not in url_lower and "/reset-password" not in url_lower:
         return False
-    try:
-        alert_text = str(
-            page.evaluate(
-                """() => {
-                    const nodes = Array.from(document.querySelectorAll('[role="alert"], [aria-live="assertive"], [aria-live="polite"]'));
-                    const parts = [];
-                    for (const node of nodes) {
-                        const text = String(node.innerText || node.textContent || '').trim();
-                        if (text) parts.push(text);
-                    }
-                    return parts.join('\\n');
-                }"""
-            )
-            or ""
-        )
-    except Exception:
-        alert_text = ""
+    alert_text = _get_alert_text(page)
     alert_lower = alert_text.lower()
     if any(hint in alert_lower for hint in english_hints):
         return True
@@ -2219,6 +2359,12 @@ def _is_virtual_phone_number_error(url: str, body_text: str, page: Any = None) -
 
 
 def _is_phone_number_existing_account_error(url: str, body_text: str, page: Any = None) -> bool:
+    """
+    手机号已绑定既有账号：应废弃当前号并重新取号。
+    常见文案：
+    - An account for this phone number already exists
+    - To continue, sign in to h****1@o****k.com using that account's usual sign-in method.
+    """
     url_lower = str(url or "").lower()
     text = str(body_text or "")
     text_lower = text.lower()
@@ -2229,6 +2375,29 @@ def _is_phone_number_existing_account_error(url: str, body_text: str, page: Any 
         "phone number already exists",
         "already have an account",
         "already associated with an account",
+        # 已绑邮箱，要求用原账号登录方式（号码已被注册）
+        "using that account's usual sign-in method",
+        "using that account's usual sign in method",
+        "using this account's usual sign-in method",
+        "usual sign-in method",
+        "usual sign in method",
+        "to continue, sign in to",
+        "to continue sign in to",
+        "sign in to that account",
+        "sign in with the email associated",
+        "an account already exists for this phone",
+        "this phone number is already associated",
+        "phone number is already linked",
+        "phone number is already registered",
+        # 不能用此手机号登录/注册：已存在账号或号码被封禁
+        "you can't log in or sign up with this phone number",
+        "can't log in or sign up with this phone number",
+        "this phone number cannot be used",
+        "phone number cannot be used for registration",
+        "phone number is blocked",
+        "phone number is not allowed",
+        "use your email address or another method",
+        "you can't use this phone number",
     )
     chinese_hints = (
         "此电话号码已存在账号",
@@ -2236,42 +2405,56 @@ def _is_phone_number_existing_account_error(url: str, body_text: str, page: Any 
         "该手机号已存在账号",
         "此号码已存在账号",
         "该号码已存在账号",
+        "该手机号已注册",
+        "此手机号已注册",
+        "手机号已绑定账号",
+        "使用该账户的常用登录方式",
+        "使用该账号的常用登录方式",
+        "使用此账户的常用登录方式",
+        "请使用该账户常用的登录方式",
+        "请使用该账号常用的登录方式",
+        "要继续，请登录",
+        "要继续请登录",
     )
-    if any(hint in text_lower for hint in english_hints):
-        return True
-    if any(hint in text for hint in chinese_hints):
+
+    def _match_existing(blob: str, blob_lower: str) -> bool:
+        if any(hint in blob_lower for hint in english_hints):
+            return True
+        if any(hint in blob for hint in chinese_hints):
+            return True
+        # To continue, sign in to h****1@o****k.com ...
+        # 遮罩邮箱 + sign in to / 登录到
+        if (
+            ("sign in to" in blob_lower or "sign-in to" in blob_lower or "登录到" in blob or "登录 " in blob)
+            and re.search(r"[a-z0-9*]{1,64}@[a-z0-9*.\-]{2,}\.[a-z*]{2,}", blob_lower)
+            and (
+                "usual" in blob_lower
+                or "continue" in blob_lower
+                or "that account" in blob_lower
+                or "this account" in blob_lower
+                or "常用" in blob
+                or "继续" in blob
+            )
+        ):
+            return True
+        return False
+
+    if _match_existing(text, text_lower):
         return True
     if page is None:
         return False
     raw_text = _get_body_raw_text(page)
     raw_lower = str(raw_text or "").lower()
-    if any(hint in raw_lower for hint in english_hints):
+    if _match_existing(str(raw_text or ""), raw_lower):
         return True
-    if any(hint in str(raw_text or "") for hint in chinese_hints):
-        return True
-    if "/create-account/password" not in url_lower and "create a password" not in text_lower:
-        return False
     try:
-        alert_text = str(
-            page.evaluate(
-                """() => {
-                    const nodes = Array.from(document.querySelectorAll('[role="alert"], [aria-live="assertive"], [aria-live="polite"]'));
-                    const parts = [];
-                    for (const node of nodes) {
-                        const text = String(node.innerText || node.textContent || '').trim();
-                        if (text) parts.push(text);
-                    }
-                    return parts.join('\\n');
-                }"""
-            )
-            or ""
-        )
+        deep = _get_page_deep_text(page)
     except Exception:
-        alert_text = ""
-    alert_lower = alert_text.lower()
-    if any(hint in alert_lower for hint in english_hints):
+        deep = ""
+    if deep and _match_existing(str(deep), str(deep).lower()):
         return True
-    if any(hint in alert_text for hint in chinese_hints):
+    alert_text = _get_alert_text(page)
+    if alert_text and _match_existing(alert_text, alert_text.lower()):
         return True
     return False
 
@@ -2306,23 +2489,7 @@ def _is_create_account_failed_error(url: str, body_text: str, page: Any = None) 
         return True
     if "auth.openai.com" not in url_lower and "/create-account" not in url_lower:
         return False
-    try:
-        alert_text = str(
-            page.evaluate(
-                """() => {
-                    const nodes = Array.from(document.querySelectorAll('[role="alert"], [aria-live="assertive"], [aria-live="polite"]'));
-                    const parts = [];
-                    for (const node of nodes) {
-                        const text = String(node.innerText || node.textContent || '').trim();
-                        if (text) parts.push(text);
-                    }
-                    return parts.join('\\n');
-                }"""
-            )
-            or ""
-        )
-    except Exception:
-        alert_text = ""
+    alert_text = _get_alert_text(page)
     alert_lower = alert_text.lower()
     if any(hint in alert_lower for hint in english_hints):
         return True
@@ -3149,8 +3316,11 @@ def _wait_for_post_about_you_page(
     started = time.time()
     deadline = started + max(1.0, float(timeout_ms or 0) / 1000.0)
     # 给 SPA 渲染 You're all set 的最短观察窗，避免空页被误判成首页
-    min_observe_s = min(3.0, max(1.2, (deadline - started) * 0.35))
+    min_observe_s = min(1.6, max(0.8, (deadline - started) * 0.25))
+    # 表单已离开且始终没有完成页：最多再观察这么久（避免无 You're all set 时空耗满 timeout）
+    no_all_set_grace_s = min(2.2, max(1.2, (deadline - started) * 0.35))
     logged_all_set = False
+    form_left_at = 0.0
     while time.time() < deadline:
         url, body = _read_page_url_body(page)
         result["url"], result["body"] = url, body
@@ -3194,13 +3364,18 @@ def _wait_for_post_about_you_page(
             return result
         if _about_you_form_still_visible(url, body, page):
             result["kind"] = "still_form"
+            form_left_at = 0.0
             # 表单还在可能是短暂过渡；接近超时再返回
-            if time.time() + 1.5 >= deadline:
+            if time.time() + 1.0 >= deadline:
                 return result
-            _sleep_with_page(page, 400)
+            _sleep_with_page(page, 280)
             continue
+        # 表单已离开
+        if form_left_at <= 0:
+            form_left_at = time.time()
         url_l = str(url or "").lower()
         elapsed = time.time() - started
+        form_left_for = time.time() - form_left_at
         # 明确进入登录/OAuth/验证码页，可结束等待
         if any(
             token in url_l
@@ -3209,6 +3384,8 @@ def _wait_for_post_about_you_page(
                 "email-verification",
                 "contact-verification",
                 "add-phone",
+                "choose-an-account",
+                "add-email",
             )
         ) and "about-you" not in url_l:
             result["kind"] = "auth"
@@ -3232,13 +3409,27 @@ def _wait_for_post_about_you_page(
             return result
         # 有 Continue 但主站 URL：按完成页
         if (
-            _is_logged_in_chatgpt_home(url, body)
-            and _find_youre_all_set_continue_locator(page) is not None
+            _find_youre_all_set_continue_locator(page) is not None
             and not _looks_like_chatgpt_composer_home(page, body)
+            and not _has_visible_about_you_controls(page)
         ):
             result["kind"] = "youre_all_set"
             return result
-        _sleep_with_page(page, 450)
+        # 关键加速：表单已离开、始终无完成页信号 → 短观察后放行，不再空耗满 timeout
+        # （本轮日志常见：about-you 后直接进步骤2，没有 You're all set）
+        if form_left_for >= no_all_set_grace_s and elapsed >= min_observe_s:
+            has_continue = _find_youre_all_set_continue_locator(page) is not None
+            if (
+                not has_continue
+                and not _body_has_youre_all_set_title(body)
+                and not _body_has_youre_all_set_disclaimer(body)
+            ):
+                if _looks_like_chatgpt_composer_home(page, body):
+                    result["kind"] = "home"
+                else:
+                    result["kind"] = "other"
+                return result
+        _sleep_with_page(page, 280)
     # 超时前最后一次判定
     url, body = _read_page_url_body(page)
     result["url"], result["body"] = url, body
@@ -3302,8 +3493,8 @@ def _pass_youre_all_set_page(
         kind = str(appear.get("kind") or "")
         if kind == "youre_all_set":
             result["was_page"] = True
-        elif kind in {"missing_email", "home", "auth"}:
-            # 没有完成页，直接视为已通过
+        elif kind in {"missing_email", "home", "auth", "other"}:
+            # 没有完成页（含 about-you 后直接跳过 You're all set 的常见路径），视为已通过
             result["left"] = True
             return result
         elif kind == "still_form":
@@ -3507,11 +3698,12 @@ def _detect_otp_inputs(page: Any) -> Dict[str, Any]:
     segmented = []
     try:
         inputs = page.locator('input, [contenteditable="true"], [role="spinbutton"], [role="textbox"]')
-        count = min(inputs.count(), 16)
-        for index in range(count):
+        for index in range(16):
             item = inputs.nth(index)
             try:
-                if not item.is_visible():
+                if not item.is_visible(timeout=300):
+                    if index == 0:
+                        break
                     continue
                 maxlength = str(item.get_attribute("maxlength") or "").strip()
                 inputmode = str(item.get_attribute("inputmode") or "").strip().lower()
@@ -3563,7 +3755,7 @@ def _summarize_otp_controls(page: Any) -> str:
             '[role="textbox"]',
             'button',
         ],
-        limit=16,
+        limit=8,
     )
     snippets: list[str] = []
     for item in controls:
@@ -3605,7 +3797,7 @@ def _summarize_primary_actions(page: Any) -> str:
             'input[type="submit"]',
             'a',
         ],
-        limit=20,
+        limit=8,
     )
     snippets: list[str] = []
     for item in controls:
@@ -3714,29 +3906,142 @@ def _write_text_to_locator(locator: Any, value: str, *, timeout_ms: int = 1200) 
         return True
     except Exception:
         pass
+    # 不使用无 timeout 的 locator.evaluate；前面的 fill/type/press 已覆盖可编辑控件。
+    return False
+
+
+def _write_password_to_locator(
+    locator: Any,
+    value: str,
+    *,
+    timeout_ms: int = 1200,
+) -> tuple[bool, str]:
+    """只对目标密码 Locator 写入并确认值，禁止依赖页面全局焦点。"""
+    text = str(value or "")
+    if locator is None or not text:
+        return False, "missing_locator_or_value"
+    timeout = max(400, int(timeout_ms or 1200))
+    last_reason = "not_attempted"
+
     try:
-        locator.evaluate(
-            """(el, newValue) => {
-                const applyValue = (node, val) => {
-                    node.focus();
-                    if ('value' in node) {
-                        node.value = val;
-                    } else if (node.isContentEditable) {
-                        node.textContent = val;
-                    } else {
-                        return false;
-                    }
-                    node.dispatchEvent(new Event('input', { bubbles: true }));
-                    node.dispatchEvent(new Event('change', { bubbles: true }));
-                    return true;
-                };
-                return applyValue(el, newValue);
-            }""",
-            text,
-        )
-        return True
+        locator.click(timeout=min(timeout, 900))
+    except Exception as exc:
+        last_reason = f"click:{type(exc).__name__}"
+
+    try:
+        locator.fill(text, timeout=timeout)
+        if _locator_value(locator, timeout_ms=min(500, timeout)) == text:
+            return True, "fill"
+        last_reason = "fill_value_mismatch"
+    except Exception as exc:
+        last_reason = f"fill:{type(exc).__name__}"
+
+    try:
+        locator.fill(text, timeout=min(timeout, 900), force=True)
+        if _locator_value(locator, timeout_ms=min(500, timeout)) == text:
+            return True, "fill_force"
+        last_reason = "fill_force_value_mismatch"
+    except Exception as exc:
+        last_reason = f"fill_force:{type(exc).__name__}"
+
+    # 某些受控密码组件拦截 fill；仍在同一 Locator 上清空并逐字触发输入事件。
+    try:
+        locator.fill("", timeout=min(timeout, 700))
     except Exception:
-        return False
+        pass
+    for method_name in ("press_sequentially", "type"):
+        try:
+            writer = getattr(locator, method_name)
+            writer(text, timeout=timeout)
+            if _locator_value(locator, timeout_ms=min(500, timeout)) == text:
+                return True, method_name
+            last_reason = f"{method_name}_value_mismatch"
+        except Exception as exc:
+            last_reason = f"{method_name}:{type(exc).__name__}"
+        try:
+            locator.fill("", timeout=min(timeout, 700))
+        except Exception:
+            pass
+    return False, last_reason
+
+
+def _find_visible_submit_locator(
+    page: Any,
+    preferred_texts: tuple[str, ...],
+    *,
+    max_candidates: int = 8,
+) -> Any:
+    """在主文档和 frame 内找可点击提交控件，避免无 timeout 的 page.evaluate。"""
+    preferred = tuple(
+        str(item or "").strip().lower()
+        for item in preferred_texts
+        if str(item or "").strip()
+    )
+    fallback = None
+    selectors = ('button[type="submit"]', "button", 'input[type="submit"]', '[role="button"]')
+    # OpenAI create-account/password 当前 Continue 控件具有稳定属性；先走精确路径，
+    # 避免在页面和 frame 中逐个扫描候选按钮。
+    fast_selectors = (
+        'button[type="submit"][name="intent"][value="validate"]',
+        'button[type="submit"][value="validate"]',
+        'button[type="submit"][data-dd-action-name="Continue"]',
+        'button[type="submit"]:has-text("Continue")',
+        'button[type="submit"]:has-text("继续")',
+    )
+    for target in _iter_page_targets(page):
+        for selector in fast_selectors:
+            try:
+                item = target.locator(selector).first
+                if not item.is_visible(timeout=180) or not item.is_enabled(timeout=180):
+                    continue
+                aria_disabled = str(item.get_attribute("aria-disabled", timeout=180) or "").strip().lower()
+                if aria_disabled == "true":
+                    continue
+                return item
+            except Exception:
+                continue
+    for target in _iter_page_targets(page):
+        for selector in selectors:
+            try:
+                locator = target.locator(selector)
+            except Exception:
+                continue
+            for index in range(max(1, int(max_candidates or 1))):
+                item = locator.nth(index)
+                try:
+                    if not item.is_visible(timeout=250):
+                        if index == 0:
+                            break
+                        continue
+                    if not item.is_enabled(timeout=250):
+                        continue
+                except Exception:
+                    if index == 0:
+                        break
+                    continue
+                text = ""
+                try:
+                    text = str(item.inner_text(timeout=250) or "").strip()
+                except Exception:
+                    pass
+                if not text:
+                    for attr_name in ("value", "aria-label"):
+                        try:
+                            text = str(item.get_attribute(attr_name, timeout=250) or "").strip()
+                        except Exception:
+                            text = ""
+                        if text:
+                            break
+                normalized = text.lower()
+                if "continue with" in normalized:
+                    continue
+                if fallback is None:
+                    fallback = item
+                if normalized and any(
+                    token == normalized or token in normalized for token in preferred
+                ):
+                    return item
+    return fallback
 
 
 def _submit_create_account_password_like_codex_registrar(
@@ -3745,11 +4050,12 @@ def _submit_create_account_password_like_codex_registrar(
     *,
     emitter: Any = None,
     step: str = "create_password",
+    check_page_ready: bool = True,
 ) -> Dict[str, str]:
     pwd = str(password or "").strip()
     if page is None or not pwd:
         return {"ok": "", "submitted": "", "reason": "missing_page_or_password"}
-    if not _is_create_account_password_ready_for_submit(page):
+    if check_page_ready and not _is_create_account_password_ready_for_submit(page):
         if emitter is not None:
             try:
                 emitter.warn(
@@ -3778,226 +4084,90 @@ def _submit_create_account_password_like_codex_registrar(
         ],
     )
     if password_input is None:
-        return {"ok": "", "submitted": "", "reason": "password_input_missing"}
-    try:
-        password_input.click(timeout=1500, click_count=3)
-    except Exception:
-        try:
-            password_input.click(timeout=1500)
-        except Exception:
-            pass
-    try:
-        password_input.press("Backspace", timeout=1000)
-    except Exception:
-        pass
-    typed = False
-    try:
-        page.keyboard.type(pwd, delay=30)
-        typed = True
-    except Exception:
-        typed = False
-    typed_value = _locator_value(password_input, timeout_ms=500)
-    if not typed or typed_value != pwd:
-        try:
-            password_input.fill("", timeout=1000)
-        except Exception:
-            pass
-    if (not typed or typed_value != pwd) and not _write_text_to_locator(password_input, pwd, timeout_ms=2000):
-        return {"ok": "", "submitted": "", "reason": "password_write_failed"}
-    typed_value = _locator_value(password_input, timeout_ms=500)
-    if typed_value != pwd:
-        try:
-            password_input.evaluate(
-                """(el, newValue) => {
-                    if (!el) return false;
-                    el.focus();
-                    if ('value' in el) {
-                        el.value = newValue;
-                    }
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    el.blur();
-                    return true;
-                }""",
-                pwd,
-            )
-        except Exception:
-            pass
-    typed_value = _locator_value(password_input, timeout_ms=500)
-    if typed_value != pwd:
         if emitter is not None:
             try:
                 emitter.warn(
-                    "浏览器模式2 create-account/password 密码输入值校验失败，当前页不会继续提交。"
-                    + f" input={_summarize_locator_compact(password_input)}"
-                    + f", actual={_mask_secret(typed_value, head=2, tail=2)}",
+                    "浏览器模式2 create-account/password 未找到可见密码输入框，"
+                    + "本轮不提交并交由外层重试。",
+                    step=step,
+                )
+            except Exception:
+                pass
+        return {"ok": "", "submitted": "", "reason": "password_input_missing"}
+    if emitter is not None:
+        try:
+            emitter.info(
+                "浏览器模式2 create-account/password 已定位密码输入框，开始使用同一元素填写并校验...",
+                step=step,
+            )
+        except Exception:
+            pass
+    password_write_started_at = time.monotonic()
+    typed, write_method = _write_password_to_locator(password_input, pwd, timeout_ms=1200)
+    typed_value = _locator_value(password_input, timeout_ms=450)
+    if not typed or typed_value != pwd:
+        if emitter is not None:
+            try:
+                emitter.warn(
+                    "浏览器模式2 create-account/password 密码未成功写入，当前页不会继续提交。"
+                    + f" method={write_method}, elapsed_ms={int((time.monotonic() - password_write_started_at) * 1000)}, "
+                    + f"actual={_mask_secret(typed_value, head=2, tail=2)}",
                     step=step,
                 )
             except Exception:
                 pass
         return {"ok": "", "submitted": "", "reason": "password_value_mismatch"}
-    _sleep_with_page(page, 500)
-    try:
-        page.keyboard.press("Enter")
-    except Exception:
-        pass
-    _sleep_with_page(page, 1000)
-    submit_position = None
-    try:
-        submit_position = page.evaluate(
-            """() => {
-                const preferredTexts = ['继续', 'Continue', 'Next', 'Verify', 'Submit', 'Create account', 'Sign up'];
-                const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                };
-                for (const button of buttons) {
-                    const text = String(button.innerText || '').trim();
-                    if (!isVisible(button) || button.disabled) continue;
-                    if (!preferredTexts.some((item) => text === item || text.includes(item))) continue;
-                    const rect = button.getBoundingClientRect();
-                    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text };
-                }
-                for (const button of buttons) {
-                    if (!isVisible(button) || button.disabled) continue;
-                    const rect = button.getBoundingClientRect();
-                    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: String(button.innerText || '').trim() || 'submit' };
-                }
-                return null;
-            }"""
-        )
-    except Exception:
-        submit_position = None
-    if isinstance(submit_position, dict):
+    if emitter is not None:
         try:
-            if emitter is not None:
-                emitter.info(
-                    "浏览器模式2 create-account/password 专用提交动作: 真人轨迹鼠标点击 "
-                    + str(submit_position.get("text") or "submit"),
-                    step=step,
-                )
-        except Exception:
-            pass
-        clicked_human = _click_at_point_human_like(
-            page,
-            float(submit_position.get("x") or 0),
-            float(submit_position.get("y") or 0),
-        )
-        if not clicked_human:
-            try:
-                page.mouse.click(
-                    float(submit_position.get("x") or 0),
-                    float(submit_position.get("y") or 0),
-                    delay=random.randint(50, 140),
-                )
-            except Exception:
-                pass
-    _sleep_with_page(page, 1200)
-    latest_url, latest_body = _describe_page(page, force_refresh=True)
-    deep_body_text = _get_page_deep_text(page)
-    if str(deep_body_text or "").strip():
-        latest_body = deep_body_text
-    if _is_create_account_failed_error(latest_url, latest_body, page):
-        if emitter is not None:
-            try:
-                emitter.warn(
-                    "浏览器模式2 create-account/password 提交后立即命中“Failed to create account”硬失败页，"
-                    + "当前轮注册直接判失败，外层将回到步骤1重新走流程...",
-                    step=step,
-                )
-            except Exception:
-                pass
-        return {"ok": "true", "submitted": "true", "reason": "create_account_failed"}
-    if _is_retryable_error_page(latest_url, latest_body):
-        if emitter is not None:
-            try:
-                emitter.warn(
-                    "浏览器模式2 create-account/password 提交后立即进入可重试错误页，"
-                    + "下一轮将优先走 Try again/Retry 原地恢复...",
-                    step=step,
-                )
-            except Exception:
-                pass
-        _wait_for_load(page, timeout_ms=1200)
-        return {"ok": "true", "submitted": "true", "reason": "retryable_error"}
-    if _is_create_account_password_page(latest_url, latest_body, page):
-        submit_result = None
-        try:
-            submit_result = page.evaluate(
-                """() => {
-                    const preferredTexts = ['继续', 'Continue', 'Next', 'Verify', 'Submit', 'Create account', 'Sign up'];
-                    const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, input[type="submit"], [role="button"]'));
-                    const isVisible = (el) => {
-                        if (!el) return false;
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                    };
-                    const pickButton = () => {
-                        for (const button of buttons) {
-                            const text = String(button.innerText || button.textContent || button.value || '').trim();
-                            if (!isVisible(button) || button.disabled) continue;
-                            if (!preferredTexts.some((item) => text === item || text.includes(item))) continue;
-                            return button;
-                        }
-                        for (const button of buttons) {
-                            if (!isVisible(button) || button.disabled) continue;
-                            return button;
-                        }
-                        return null;
-                    };
-                    const button = pickButton();
-                    if (!button) return { ok: false, method: 'none', text: '' };
-                    const text = String(button.innerText || button.textContent || button.value || '').trim() || 'submit';
-                    const form = button.closest('form');
-                    try { button.focus(); } catch (e) {}
-                    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
-                        try {
-                            button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-                        } catch (e) {}
-                    });
-                    try {
-                        if (form && typeof form.requestSubmit === 'function') {
-                            form.requestSubmit(button);
-                            return { ok: true, method: 'requestSubmit', text };
-                        }
-                    } catch (e) {}
-                    try {
-                        if (typeof button.click === 'function') {
-                            button.click();
-                            return { ok: true, method: 'button.click', text };
-                        }
-                    } catch (e) {}
-                    try {
-                        if (form && typeof form.submit === 'function') {
-                            form.submit();
-                            return { ok: true, method: 'form.submit', text };
-                        }
-                    } catch (e) {}
-                    return { ok: true, method: 'event-dispatch', text };
-                }"""
+            emitter.info(
+                "浏览器模式2 create-account/password 密码已写入并通过值校验，准备点击继续按钮。"
+                + f" method={write_method}, elapsed_ms={int((time.monotonic() - password_write_started_at) * 1000)}",
+                step=step,
             )
         except Exception:
-            submit_result = None
-        if isinstance(submit_result, dict) and emitter is not None:
+            pass
+    _sleep_with_page(page, 80)
+    submit_locator = _find_visible_submit_locator(
+        page,
+        ("继续", "Continue", "Next", "Verify", "Submit", "Create account", "Sign up"),
+    )
+    if submit_locator is None:
+        if emitter is not None:
             try:
-                emitter.info(
-                    "浏览器模式2 create-account/password 二次提交兜底动作: "
-                    + str(submit_result.get("method") or "unknown")
-                    + " -> "
-                    + str(submit_result.get("text") or "submit"),
+                emitter.warn(
+                    "浏览器模式2 create-account/password 密码已填入，但未找到可点击的继续按钮。",
                     step=step,
                 )
             except Exception:
                 pass
+        return {"ok": "", "submitted": "", "reason": "submit_button_missing"}
+    clicked = False
+    try:
+        submit_locator.click(
+            timeout=1500,
+            delay=random.randint(30, 80),
+            no_wait_after=True,
+        )
+        clicked = True
+    except Exception:
         try:
-            page.keyboard.press("Enter")
+            submit_locator.press("Enter", timeout=1000)
+            clicked = True
+        except Exception:
+            clicked = False
+    if emitter is not None:
+        try:
+            emitter.info(
+                "浏览器模式2 create-account/password 已执行继续按钮提交。"
+                + ("" if clicked else " 点击失败。"),
+                step=step,
+            )
         except Exception:
             pass
-    _wait_for_load(page, timeout_ms=2500)
+    if not clicked:
+        return {"ok": "", "submitted": "", "reason": "submit_click_failed"}
+    # 跳转、错误页和短信页由外层过渡观察器统一处理；这里不再重复读正文/扫描 frame。
+    # 这样点击成功后立即把控制权交回主循环，避免密码页收尾额外等待数秒。
     return {"ok": "true", "submitted": "true", "reason": "submitted"}
 
 
@@ -4669,20 +4839,7 @@ def _is_about_you_terms_soft_error(url: str, body_text: str, page: Any = None) -
         return True
     if any(hint in str(raw_text or "") for hint in chinese_hints):
         return True
-    try:
-        alert_text = str(
-            page.evaluate(
-                """() => {
-                    const nodes = Array.from(document.querySelectorAll(
-                        '[role="alert"], [aria-live="assertive"], [aria-live="polite"], .text-red-500, .text-danger, [class*="error"]'
-                    ));
-                    return nodes.map((node) => String(node.innerText || node.textContent || '').trim()).filter(Boolean).join('\\n');
-                }"""
-            )
-            or ""
-        )
-    except Exception:
-        alert_text = ""
+    alert_text = _get_alert_text(page)
     alert_lower = alert_text.lower()
     if any(hint in alert_lower for hint in english_hints):
         return True
@@ -4967,8 +5124,11 @@ def _describe_page(page: Any, *, force_refresh: bool = False) -> tuple[str, str]
         body_text = _get_body_text(page)
     except Exception:
         body_text = ""
+    if len(body_text) > _PAGE_SNAPSHOT_MAX_BODY_CHARS:
+        body_text = body_text[:_PAGE_SNAPSHOT_MAX_BODY_CHARS] + "\n[页面文本已截断]"
     with _PAGE_SNAPSHOT_CACHE_LOCK:
         _PAGE_SNAPSHOT_CACHE[cache_key] = (now, current_url, body_text)
+    _prune_page_snapshot_cache()
     return current_url, body_text
 
 
@@ -5025,7 +5185,30 @@ def _promote_auth_target_if_needed(page: Any, *, timeout_ms: int = 12000) -> tup
         )
         and best_lower != top_lower
     )
-    if should_promote and any(
+    # 密码页/短信页通常仍在 auth iframe 中。此时所有控件探测都会遍历
+    # _iter_page_targets，强制 page.goto() 只会同步等待同一页面再次加载。
+    # 返回 iframe 的逻辑 URL 即可继续处理；资料页、OAuth 页仍保留顶层提升。
+    iframe_fast_route = any(
+        token in best_lower
+        for token in (
+            "/create-account/password",
+            "/log-in/password",
+            "contact-verification",
+            "verify-phone",
+            "phone-verification",
+        )
+    )
+    top_fast_route = any(
+        token in top_lower
+        for token in (
+            "/create-account/password",
+            "/log-in/password",
+            "contact-verification",
+            "verify-phone",
+            "phone-verification",
+        )
+    )
+    if should_promote and not iframe_fast_route and any(
         token in best_lower
         for token in (
             "create-account/password",
@@ -5050,6 +5233,9 @@ def _promote_auth_target_if_needed(page: Any, *, timeout_ms: int = 12000) -> tup
             page.wait_for_timeout(500)
         except Exception:
             pass
+    if (iframe_fast_route and (should_promote or top_fast_route)) or (top_fast_route and not best_url):
+        # URL 已足够判定密码/短信阶段；调用方会从 frame 查控件，正文留给需要时再读。
+        return page, (best_url if iframe_fast_route else top_url), ""
     current_url, body_text = _describe_page(page, force_refresh=True)
     deep_body = _get_page_deep_text(page)
     if str(deep_body or "").strip():
@@ -5377,17 +5563,17 @@ def _click_choose_account_phone_card(page: Any, phone_number: str) -> Dict[str, 
 
     try:
         text_nodes = page.locator("span, div, p, button, a, [role=\"button\"], [role=\"listitem\"]")
-        count = min(text_nodes.count(), 120)
     except Exception:
-        count = 0
         text_nodes = None
 
     matched_text = ""
     found_candidate = False
-    for index in range(count):
+    for index in range(60):
         try:
             item = text_nodes.nth(index)
-            if not item.is_visible():
+            if not item.is_visible(timeout=300):
+                if index == 0:
+                    break
                 continue
             raw_text = str(item.inner_text(timeout=300) or "").strip()
         except Exception:
@@ -5409,11 +5595,11 @@ def _click_choose_account_phone_card(page: Any, phone_number: str) -> Dict[str, 
         for selector in candidate_selectors:
             try:
                 candidate = item.locator(selector).first
-                if not candidate.is_visible():
+                if not candidate.is_visible(timeout=300):
                     continue
             except Exception:
                 continue
-            if _activate_choose_account_candidate(page, candidate, previous_url, timeout_ms=3200):
+            if _activate_choose_account_candidate(page, candidate, previous_url, timeout_ms=1800):
                 return {"clicked": "true", "matched_text": matched_text, "reason": "matched_phone_card"}
         break
 
@@ -5502,11 +5688,72 @@ def _is_create_account_password_page(url: str, body_text: str, page: Any) -> boo
     return "create password" in body_lower or "创建密码" in body_text
 
 
-def _probe_create_account_password_page_state(page: Any) -> Dict[str, str]:
+def _probe_submit_button_state(page: Any, preferred_texts: tuple[str, ...]) -> Dict[str, str]:
+    """读取提交按钮状态；避免用无 timeout 的 DOM evaluate。"""
+    candidates = _collect_visible_locators(
+        page,
+        ['button[type="submit"]', "button", 'input[type="submit"]', '[role="button"]'],
+        limit=12,
+    )
+    preferred = tuple(str(item or "").strip().lower() for item in preferred_texts if str(item or "").strip())
+    selected = None
+    selected_text = ""
+    for locator in candidates:
+        try:
+            text = str(locator.inner_text(timeout=300) or "").strip()
+        except Exception:
+            text = ""
+        if not text:
+            for attr_name in ("value", "aria-label"):
+                try:
+                    text = str(locator.get_attribute(attr_name, timeout=300) or "").strip()
+                except Exception:
+                    text = ""
+                if text:
+                    break
+        normalized = text.lower()
+        if selected is None:
+            selected = locator
+            selected_text = text
+        if normalized and any(item == normalized or item in normalized for item in preferred):
+            selected = locator
+            selected_text = text
+            break
+    if selected is None:
+        return {}
+
+    def _attr(name: str) -> str:
+        try:
+            return str(selected.get_attribute(name, timeout=300) or "").strip().lower()
+        except Exception:
+            return ""
+
+    disabled_attr = _attr("disabled")
+    try:
+        disabled = not bool(selected.is_enabled(timeout=300))
+    except Exception:
+        disabled = disabled_attr in {"disabled", "true"}
+    return {
+        "submit_found": "true",
+        "submit_text": selected_text,
+        "submit_disabled": "true" if disabled else "false",
+        "submit_aria_disabled": _attr("aria-disabled"),
+        "submit_busy": _attr("aria-busy"),
+        "submit_state": _attr("data-state"),
+    }
+
+
+def _probe_create_account_password_page_state(
+    page: Any,
+    *,
+    include_deep_text: bool = True,
+    include_submit: bool = True,
+) -> Dict[str, str]:
     current_url, body_text = _describe_page(page, force_refresh=True)
-    deep_body_text = _get_page_deep_text(page)
-    if str(deep_body_text or "").strip():
-        body_text = deep_body_text
+    if include_deep_text:
+        deep_body_text = _get_page_deep_text(page)
+        if str(deep_body_text or "").strip():
+            body_text = deep_body_text
     info: Dict[str, str] = {
         "url": str(current_url or "").strip(),
         "state": _classify_page_state(current_url, body_text, page),
@@ -5540,46 +5787,13 @@ def _probe_create_account_password_page_state(page: Any) -> Dict[str, str]:
             info["password_readonly"] = str(password_input.get_attribute("readonly") or "").strip().lower()
         except Exception:
             info["password_readonly"] = ""
-    try:
-        submit_info = page.evaluate(
-            """() => {
-                const preferredTexts = ['继续', 'Continue', 'Next', 'Verify', 'Submit', 'Create account', 'Sign up', '下一步', '创建账户', '注册'];
-                const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, input[type="submit"], [role="button"]'));
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                };
-                const pick = (el) => {
-                    const text = String(el.innerText || el.textContent || el.value || '').trim();
-                    return {
-                        submit_found: 'true',
-                        submit_text: text,
-                        submit_disabled: el.disabled ? 'true' : 'false',
-                        submit_aria_disabled: String(el.getAttribute('aria-disabled') || '').trim().toLowerCase(),
-                        submit_busy: String(el.getAttribute('aria-busy') || '').trim().toLowerCase(),
-                        submit_state: String(el.getAttribute('data-state') || '').trim().toLowerCase(),
-                    };
-                };
-                for (const button of buttons) {
-                    if (!isVisible(button)) continue;
-                    const text = String(button.innerText || button.textContent || button.value || '').trim();
-                    if (!preferredTexts.some((item) => text === item || text.includes(item))) continue;
-                    return pick(button);
-                }
-                for (const button of buttons) {
-                    if (!isVisible(button)) continue;
-                    return pick(button);
-                }
-                return null;
-            }"""
+    if include_submit:
+        submit_info = _probe_submit_button_state(
+            page,
+            ("继续", "Continue", "Next", "Verify", "Submit", "Create account", "Sign up", "下一步", "创建账户", "注册"),
         )
-        if isinstance(submit_info, dict):
-            for key, value in submit_info.items():
-                info[str(key)] = str(value or "").strip().lower() if key != "submit_text" else str(value or "").strip()
-    except Exception:
-        pass
+        for key, value in submit_info.items():
+            info[str(key)] = str(value or "").strip().lower() if key != "submit_text" else str(value or "").strip()
     return info
 
 
@@ -5669,45 +5883,12 @@ def _probe_add_email_page_state(page: Any) -> Dict[str, str]:
         info["input_readonly"] = ""
         info["input_aria_disabled"] = ""
 
-    try:
-        submit_info = page.evaluate(
-            """() => {
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
-                    const rect = el.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
-                };
-                const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
-                const pick = (el) => ({
-                    submit_found: 'true',
-                    submit_text: String(el.innerText || el.textContent || el.value || '').trim(),
-                    submit_disabled: String(Boolean(el.disabled)).trim().toLowerCase(),
-                    submit_aria_disabled: String(el.getAttribute('aria-disabled') || '').trim().toLowerCase(),
-                    submit_busy: String(el.getAttribute('aria-busy') || '').trim().toLowerCase(),
-                    submit_state: String(el.getAttribute('data-state') || '').trim().toLowerCase(),
-                });
-                for (const button of buttons) {
-                    if (!isVisible(button)) continue;
-                    const text = String(button.innerText || button.textContent || button.value || '').trim().toLowerCase();
-                    if (!text) continue;
-                    if (['continue', 'next', 'verify', 'submit', '继续', '下一步', '验证'].some((item) => text === item || text.includes(item))) {
-                        return pick(button);
-                    }
-                }
-                for (const button of buttons) {
-                    if (!isVisible(button)) continue;
-                    return pick(button);
-                }
-                return null;
-            }"""
-        )
-        if isinstance(submit_info, dict):
-            for key, value in submit_info.items():
-                info[str(key)] = str(value or "").strip().lower() if key != "submit_text" else str(value or "").strip()
-    except Exception:
-        pass
+    submit_info = _probe_submit_button_state(
+        page,
+        ("continue", "next", "verify", "submit", "继续", "下一步", "验证"),
+    )
+    for key, value in submit_info.items():
+        info[str(key)] = str(value or "").strip().lower() if key != "submit_text" else str(value or "").strip()
     return info
 
 
@@ -5810,14 +5991,32 @@ def _submit_add_email_continue(page: Any) -> bool:
     )
 
 
-def _wait_for_create_account_password_ready(page: Any, *, timeout_ms: int = 12000) -> bool:
-    deadline = time.time() + max(2.0, float(timeout_ms or 0) / 1000.0)
-    stable_rounds = 0
-    last_signature = ""
+def _wait_for_create_account_password_ready(page: Any, *, timeout_ms: int = 8000) -> bool:
+    deadline = time.time() + max(1.5, float(timeout_ms or 0) / 1000.0)
+    first_round = True
     while time.time() < deadline:
-        _wait_for_load(page, timeout_ms=1200)
-        current_url, body_text = _describe_page(page)
-        if not _is_create_account_password_page(current_url, body_text, page):
+        # 这里由主循环刚确认过密码页；不再等待 networkidle，避免站点后台长连接
+        # 把“输入框已经出现”人为拖成数秒。
+        if first_round:
+            _sleep_with_page(page, 80)
+            first_round = False
+        try:
+            current_url = str(page.url or "").strip()
+        except Exception:
+            current_url = ""
+        frame_url = _best_auth_target_url(page)
+        frame_url_lower = frame_url.lower()
+        current_url_lower = current_url.lower()
+        is_password_url = (
+            "/create-account/password" in current_url_lower
+            or "/create-account/password" in frame_url_lower
+            or "/log-in/password" in current_url_lower
+            or "/log-in/password" in frame_url_lower
+        )
+        # 密码路由已经由 URL 确认，正文只会增加一次同步 CDP 读取；离开密码路由后
+        # 再读取正文用于错误页/资料页判定。
+        body_text = "" if is_password_url else _describe_page(page)[1]
+        if not is_password_url and not _is_create_account_password_page(current_url, body_text, page):
             if (
                 _is_contact_verification_page(current_url, body_text, page)
                 or _is_phone_sms_send_failed_error(current_url, body_text, page)
@@ -5826,49 +6025,34 @@ def _wait_for_create_account_password_ready(page: Any, *, timeout_ms: int = 1200
                 or _is_login_password_page(current_url, body_text, page)
             ):
                 return True
-            _sleep_with_page(page, 350)
+            _sleep_with_page(page, 160)
             continue
-        probe = _probe_create_account_password_page_state(page)
-        if probe.get("password_visible") != "true":
-            _sleep_with_page(page, 350)
-            continue
-        disabled = str(probe.get("password_disabled") or "").strip().lower()
-        readonly = str(probe.get("password_readonly") or "").strip().lower()
-        submit_found = str(probe.get("submit_found") or "").strip().lower()
-        submit_disabled = str(probe.get("submit_disabled") or "").strip().lower()
-        submit_aria_disabled = str(probe.get("submit_aria_disabled") or "").strip().lower()
-        submit_busy = str(probe.get("submit_busy") or "").strip().lower()
-        submit_state = str(probe.get("submit_state") or "").strip().lower()
-        submit_ready = (
-            submit_found == "true"
-            and submit_disabled in {"", "false"}
-            and submit_aria_disabled in {"", "false"}
-            and submit_busy in {"", "false"}
-            and "loading" not in submit_state
-            and "pending" not in submit_state
-        )
-        signature = "|".join(
+        password_input = _first_visible_locator(
+            page,
             [
-                str(current_url or ""),
-                disabled,
-                readonly,
-                submit_found,
-                submit_disabled,
-                submit_aria_disabled,
-                submit_busy,
-                submit_state,
-                str(probe.get("submit_text") or ""),
-            ]
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[name="new-password"]',
+                'input[autocomplete="new-password"]',
+                'input[id*="password" i]',
+            ],
         )
-        if disabled in {"", "false"} and readonly in {"", "false"} and submit_ready:
-            if signature == last_signature:
-                stable_rounds += 1
-            else:
-                last_signature = signature
-                stable_rounds = 1
-            if stable_rounds >= 2:
-                return True
-        _sleep_with_page(page, 350)
+        if password_input is None:
+            _sleep_with_page(page, 160)
+            continue
+        try:
+            disabled = str(password_input.get_attribute("disabled", timeout=250) or "").strip().lower()
+        except Exception:
+            disabled = ""
+        try:
+            readonly = str(password_input.get_attribute("readonly", timeout=250) or "").strip().lower()
+        except Exception:
+            readonly = ""
+        # Continue 在密码为空时可能被站点主动置灰；密码框可编辑即可立即填入，
+        # 填值后再重新定位/点击提交按钮，不在这里空等按钮解锁。
+        if disabled in {"", "false"} and readonly in {"", "false"}:
+            return True
+        _sleep_with_page(page, 140)
     current_url, body_text = _describe_page(page, force_refresh=True)
     if (
         _is_contact_verification_page(current_url, body_text, page)
@@ -6085,11 +6269,12 @@ def _is_reset_password_success_page(url: str, body_text: str) -> bool:
 def _locator_value(locator: Any, *, timeout_ms: int = 300) -> str:
     if locator is None:
         return ""
+    timeout = max(100, int(timeout_ms or 300))
     try:
-        return str(locator.input_value(timeout=timeout_ms) or "").strip()
+        return str(locator.input_value(timeout=timeout) or "").strip()
     except Exception:
         try:
-            return str(locator.get_attribute("value") or "").strip()
+            return str(locator.get_attribute("value", timeout=timeout) or "").strip()
         except Exception:
             return ""
 
@@ -6779,12 +6964,16 @@ def _is_add_email_page(url: str, body_text: str, page: Any) -> bool:
     )
 
 
-def _wait_for_add_email_ready(page: Any, *, timeout_ms: int = 12000) -> bool:
-    deadline = time.time() + max(2.0, float(timeout_ms or 0) / 1000.0)
+def _wait_for_add_email_ready(page: Any, *, timeout_ms: int = 8000) -> bool:
+    deadline = time.time() + max(1.5, float(timeout_ms or 0) / 1000.0)
     stable_rounds = 0
     last_signature = ""
+    first_round = True
     while time.time() < deadline:
-        _wait_for_load(page, timeout_ms=1200)
+        # 仅首轮做较长 load 等待；后续快轮询，避免每轮 +1.2s
+        if first_round:
+            _wait_for_load(page, timeout_ms=800)
+            first_round = False
         current_url, body_text = _describe_page(page)
         if not _is_add_email_page(current_url, body_text, page):
             if (
@@ -6795,7 +6984,7 @@ def _wait_for_add_email_ready(page: Any, *, timeout_ms: int = 12000) -> bool:
                 or _is_logged_in_chatgpt_home(current_url, body_text)
             ):
                 return True
-            _sleep_with_page(page, 300)
+            _sleep_with_page(page, 180)
             continue
         probe_locator = _first_visible_locator(
             page,
@@ -6813,7 +7002,7 @@ def _wait_for_add_email_ready(page: Any, *, timeout_ms: int = 12000) -> bool:
             ],
         )
         if probe_locator is None:
-            _sleep_with_page(page, 300)
+            _sleep_with_page(page, 180)
             continue
         try:
             disabled = str(probe_locator.get_attribute("aria-disabled") or "").strip().lower()
@@ -6835,9 +7024,10 @@ def _wait_for_add_email_ready(page: Any, *, timeout_ms: int = 12000) -> bool:
             else:
                 last_signature = signature
                 stable_rounds = 1
-            if stable_rounds >= 2:
+            # 输入框已可用且签名稳定 1 轮即可（原 2 轮偏慢）
+            if stable_rounds >= 1:
                 return True
-        _sleep_with_page(page, 300)
+        _sleep_with_page(page, 160)
     return False
 
 
@@ -7254,7 +7444,223 @@ def _unregister_active_temp_user_data_dir(path: str) -> None:
         _ACTIVE_TEMP_USER_DATA_DIRS.discard(value)
 
 
+def _canonical_uc_temp_profile(path: Any) -> str:
+    """只接受系统临时目录下的 opo_uc_* profile，避免误碰普通 Chrome。"""
+    value = str(path or "").strip().strip("\"'")
+    if not value:
+        return ""
+    try:
+        resolved = Path(value).expanduser().resolve()
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        relative = resolved.relative_to(temp_root)
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    if not relative.parts or not str(relative.parts[0]).startswith(_UC_TEMP_DIR_PREFIX):
+        return ""
+    return str(resolved)
+
+
+def _uc_profile_from_command(command: Any) -> str:
+    text = str(command or "")
+    match = re.search(
+        r"--user-data-dir(?:=|\s+)(\"[^\"]+\"|'[^']+'|[^\s]+)",
+        text,
+    )
+    if not match:
+        return ""
+    return _canonical_uc_temp_profile(match.group(1))
+
+
+def _has_project_process_ancestor(
+    pid: int,
+    rows: dict[int, tuple[int, int, str]],
+) -> bool:
+    """有项目服务祖先的浏览器视为仍在使用，不能在启动新任务时误杀。"""
+    project_root = str(Path(__file__).resolve().parents[1])
+    visited: set[int] = set()
+    current_pid = int(pid)
+    while current_pid not in visited:
+        visited.add(current_pid)
+        row = rows.get(current_pid)
+        if row is None:
+            return False
+        parent_pid = int(row[0] or 0)
+        if parent_pid <= 1:
+            return False
+        if parent_pid == os.getpid():
+            return True
+        parent_command = str(rows.get(parent_pid, (0, 0, ""))[2] or "")
+        if project_root and project_root in parent_command:
+            return True
+        current_pid = parent_pid
+    return False
+
+
+def _process_depth(pid: int, rows: dict[int, tuple[int, int, str]]) -> int:
+    depth = 0
+    current_pid = int(pid)
+    visited: set[int] = set()
+    while current_pid not in visited:
+        visited.add(current_pid)
+        row = rows.get(current_pid)
+        if row is None:
+            break
+        parent_pid = int(row[0] or 0)
+        if parent_pid <= 1:
+            break
+        depth += 1
+        current_pid = parent_pid
+    return depth
+
+
+def _terminate_processes(
+    pids: set[int],
+    rows: dict[int, tuple[int, int, str]],
+    children: dict[int, list[int]],
+) -> int:
+    """先优雅终止，再强制终止指定进程集合；集合只来自已校验的 UC profile。"""
+    if not pids:
+        return 0
+    ordered = sorted(
+        (int(pid) for pid in pids if int(pid) != os.getpid()),
+        key=lambda pid: _process_depth(pid, rows),
+        reverse=True,
+    )
+    signaled = 0
+    for pid in ordered:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            signaled += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+
+    deadline = time.monotonic() + _UC_PROCESS_SHUTDOWN_WAIT_SECONDS
+    remaining = set(ordered)
+    while remaining and time.monotonic() < deadline:
+        try:
+            current_rows, _ = _read_process_table()
+            remaining = {pid for pid in remaining if pid in current_rows}
+        except Exception:
+            remaining = {pid for pid in remaining if _process_depth(pid, rows) >= 0}
+        if not remaining:
+            break
+        time.sleep(0.2)
+
+    hard_kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    for pid in sorted(remaining, key=lambda item: _process_depth(item, rows), reverse=True):
+        try:
+            os.kill(pid, hard_kill_signal)
+            signaled += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+    return signaled
+
+
+def _cleanup_orphan_uc_processes(
+    emitter: Any = None,
+    *,
+    profile_dirs: Optional[set[str]] = None,
+    step: str = "memory",
+) -> int:
+    """清理无项目服务祖先的 UC Chrome；普通 Chrome 不满足 profile 条件，不会被触碰。"""
+    try:
+        rows, children = _read_process_table()
+    except Exception:
+        return 0
+
+    forced_profiles = {
+        canonical
+        for canonical in (_canonical_uc_temp_profile(item) for item in (profile_dirs or set()))
+        if canonical
+    }
+    with _ACTIVE_TEMP_USER_DATA_DIRS_LOCK:
+        active_profiles = {
+            canonical
+            for canonical in (_canonical_uc_temp_profile(item) for item in _ACTIVE_TEMP_USER_DATA_DIRS)
+            if canonical
+        }
+
+    roots: set[int] = set()
+    for pid, row in rows.items():
+        profile = _uc_profile_from_command(row[2])
+        if not profile:
+            continue
+        if forced_profiles:
+            if profile not in forced_profiles:
+                continue
+        else:
+            if profile in active_profiles or _has_project_process_ancestor(pid, rows):
+                continue
+        roots.add(int(pid))
+
+    if not roots:
+        return 0
+    process_ids: set[int] = set()
+    for root_pid in roots:
+        process_ids.update(_process_descendants(root_pid, children))
+    killed = _terminate_processes(process_ids, rows, children)
+    if killed and emitter is not None:
+        try:
+            emitter.info(
+                f"已终止 {killed} 个无主 UC 浏览器进程，profile={', '.join(sorted(forced_profiles)) or '历史临时目录'}",
+                step=step,
+            )
+        except Exception:
+            pass
+    return killed
+
+
+def _shutdown_browser_for_memory_pressure(
+    resources: Optional[BrowserLaunchResources],
+    playwright: Any,
+    emitter: Any,
+    *,
+    target_bytes: int,
+) -> tuple[int, int, int, int]:
+    """关闭当前浏览器、终止残留子进程并等待进程树 RSS 降到目标以下。"""
+    before = _process_tree_rss_bytes()
+    profile_dirs: set[str] = set()
+    if resources is not None:
+        profile = _canonical_uc_temp_profile(getattr(resources, "temp_user_data_dir", ""))
+        if profile:
+            profile_dirs.add(profile)
+        try:
+            resources.playwright = playwright
+        except Exception:
+            pass
+        _close_launch_resources(resources)
+    else:
+        try:
+            if playwright is not None:
+                playwright.stop()
+        except Exception:
+            pass
+
+    killed = _cleanup_orphan_uc_processes(
+        emitter,
+        profile_dirs=profile_dirs or None,
+        step="memory",
+    )
+    deadline = time.monotonic() + _UC_PROCESS_SHUTDOWN_WAIT_SECONDS
+    after = _process_tree_rss_bytes()
+    while after >= int(target_bytes or 0) and time.monotonic() < deadline:
+        if profile_dirs:
+            killed += _cleanup_orphan_uc_processes(
+                emitter,
+                profile_dirs=profile_dirs,
+                step="memory",
+            )
+        after = _process_tree_rss_bytes()
+        if after < int(target_bytes or 0):
+            break
+        time.sleep(0.2)
+    collected = gc.collect()
+    after = _process_tree_rss_bytes()
+    return before, after, collected, killed
+
+
 def _cleanup_stale_temp_user_data_dirs(emitter: Any) -> None:
+    _cleanup_orphan_uc_processes(emitter, step="oauth_init")
     now = time.time()
     temp_root = Path(tempfile.gettempdir())
     removed_count = 0
@@ -7676,6 +8082,15 @@ def _launch_via_local_uc_bridge(playwright: Any, ctx: BrowserRunContext, cfg: Di
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
         options.add_argument("--ignore-certificate-errors")
+        # 注册流程只需一个页面；关闭浏览器后台服务和过多 renderer，降低单轮原生内存。
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-component-update")
+        options.add_argument("--disable-sync")
+        options.add_argument("--no-pings")
+        options.add_argument("--renderer-process-limit=4")
+        if cfg["browser_headless"]:
+            options.add_argument("--disable-gpu")
         if cfg.get("browser_realistic_profile", True):
             options.add_argument("--disable-features=ImprovedCookieControls,ThirdPartyStoragePartitioning,BlockThirdPartyCookies")
         options.add_argument("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
@@ -7985,8 +8400,23 @@ def run_browser_registration(
         emitter,
         owner_thread_id=threading.get_ident(),
     )
+    _cleanup_stale_temp_user_data_dirs(emitter)
 
     cfg = normalize_browser_config(browser_config)
+    _, memory_soft_limit, memory_hard_limit = _browser_memory_thresholds()
+    startup_rss = _process_tree_rss_bytes()
+    if startup_rss >= memory_soft_limit:
+        before_rss, after_rss, collected = _release_memory_pressure(emitter)
+        emitter.warn(
+            "启动浏览器前检测到进程内存偏高，已清理历史浏览器现场/页面快照并执行垃圾回收："
+            + f"before={before_rss / 1024 / 1024:.0f}MB, after={after_rss / 1024 / 1024:.0f}MB, gc={collected}",
+            step="memory",
+        )
+        if after_rss >= memory_hard_limit:
+            raise RuntimeError(
+                "进程内存仍接近 PM2 上限，已阻止启动新的浏览器任务；"
+                + f"rss={after_rss / 1024 / 1024:.0f}MB, hard_limit={memory_hard_limit / 1024 / 1024:.0f}MB"
+            )
     current_oauth = generate_oauth_url_func()
     current_phase = "signup"
     account_password = (
@@ -8286,15 +8716,12 @@ def run_browser_registration(
             if not _page_is_usable(candidate_page):
                 continue
             try:
-                candidate_url, candidate_body = _describe_page(candidate_page)
+                # 活动页选择阶段只读本地 URL；正文/控件探测可能触发 CDP 等待，交给主循环处理。
+                candidate_url = str(candidate_page.url or "").strip()
             except Exception:
                 continue
             if "code=" in str(candidate_url or "").lower() and "state=" in str(candidate_url or "").lower():
                 _record_callback(candidate_url)
-            else:
-                callback_candidate = _extract_callback_url_from_page(candidate_url, candidate_body)
-                if callback_candidate:
-                    _record_callback(callback_candidate)
             if callback_state["url"]:
                 return True
         return bool(callback_state["url"])
@@ -8310,6 +8737,7 @@ def run_browser_registration(
             candidates: list[Any] = []
             if preferred_page is not None:
                 candidates.append(preferred_page)
+            _touch_browser_watchdog("活动页选择/枚举页面")
             try:
                 context_pages = list(getattr(context, "pages", []) or [])
             except Exception:
@@ -8328,49 +8756,20 @@ def run_browser_registration(
                 if not _page_is_usable(candidate_page):
                     continue
                 _wire_page_once(candidate_page)
+                _touch_browser_watchdog("活动页选择/读取页面状态")
                 try:
                     candidate_url = str(candidate_page.url or "").strip()
                 except Exception:
                     candidate_url = ""
                 score = _page_priority_from_url(candidate_url)
                 candidate_url_lower = candidate_url.lower()
-                try:
-                    candidate_state = _classify_page_state(candidate_url, _describe_page(candidate_page)[1], candidate_page)
-                except Exception:
-                    candidate_state = ""
-                candidate_visible = False
-                candidate_focused = False
-                try:
-                    visibility_info = candidate_page.evaluate(
-                        """() => ({
-                            visible: document.visibilityState === 'visible',
-                            focused: typeof document.hasFocus === 'function' ? document.hasFocus() : false,
-                        })"""
-                    )
-                    if isinstance(visibility_info, dict):
-                        candidate_visible = bool(visibility_info.get("visible"))
-                        candidate_focused = bool(visibility_info.get("focused"))
-                except Exception:
-                    candidate_visible = False
-                    candidate_focused = False
+                # 只按 URL/句柄选择活动页；正文和控件状态留给主循环一次性判断。
                 if preferred_page is not None and candidate_page is preferred_page:
                     score += 3
                 if page is not None and candidate_page is page:
                     score += 2
                 if "auth.openai.com" in candidate_url_lower:
                     score += 2
-                if candidate_visible:
-                    score += 3
-                if candidate_focused:
-                    score += 4
-                if candidate_state == "contact_verification":
-                    score += 6
-                if candidate_state == "passkey_challenge":
-                    score += 5
-                if candidate_state == "password" or candidate_state == "auth":
-                    score += 4
-                if candidate_state == "login_with_bridge":
-                    score -= 8
                 rank = (score, -len(seen_ids))
                 if selected_page is None or selected_rank is None or rank > selected_rank:
                     selected_page = candidate_page
@@ -8443,6 +8842,7 @@ def run_browser_registration(
         last_exc: Optional[Exception] = None
         total_attempts = max(1, int(max_attempts or 1))
         for attempt in range(1, total_attempts + 1):
+            _touch_browser_watchdog(f"{step}/导航第 {attempt} 次")
             nav_page = _ensure_navigable_page(step=step, reason=reason, timeout_ms=1500)
             try:
                 nav_page.goto(
@@ -8503,6 +8903,7 @@ def run_browser_registration(
 
     def _goto_manual_v2_phone_auth_entry(*, reason: str, prefer_login: bool = False) -> bool:
         """点击失败或点了没跳转时，直接走手机号登录/注册入口 URL（步骤1/补资料共用）。"""
+        _touch_browser_watchdog("手机号入口直链兜底")
         candidates = []
         try:
             for frame in _iter_page_targets(page):
@@ -8510,20 +8911,20 @@ def run_browser_registration(
                     loc = frame.locator(
                         'a[data-auth-provider="phone"], a[href*="usernameKind=phone"], a._X60mza_providerButton'
                     )
-                    count = min(int(loc.count() or 0), 8)
                 except Exception:
-                    count = 0
-                for index in range(count):
-                    item = loc.nth(index)
+                    loc = None
+                if loc is not None:
+                    item = loc.first
                     try:
-                        if not item.is_visible():
-                            continue
-                        href = str(item.get_attribute("href") or "").strip()
+                        href = (
+                            str(item.get_attribute("href", timeout=300) or "").strip()
+                            if item.is_visible(timeout=300)
+                            else ""
+                        )
                     except Exception:
                         href = ""
                     if href:
                         candidates.append(href)
-                        break
                 if candidates:
                     break
         except Exception:
@@ -8577,10 +8978,12 @@ def run_browser_registration(
                     emitter.info("浏览器模式2 已通过手机号入口直链进入认证流程。", step="oauth_init")
                     return True
             except Exception as exc:
+                _touch_browser_watchdog("手机号入口直链失败收口")
                 emitter.warn(f"浏览器模式2 手机号入口直链失败: {exc}", step="oauth_init")
         return False
 
     def _bootstrap_manual_v2_phone_entry(current_url: str, body_text: str) -> bool:
+        _touch_browser_watchdog("注册入口探测")
         nonlocal manual_v2_entry_bootstrap_signature, manual_v2_entry_bootstrap_seen_at
         nonlocal manual_v2_entry_bootstrap_wait_logged
         nonlocal manual_v2_entry_unavailable_since, manual_v2_entry_fallback_attempts
@@ -8679,11 +9082,13 @@ def run_browser_registration(
             latest_body = previous_body
             previous_url_lower = str(previous_url or "").lower()
             while time.time() < quick_deadline:
+                _touch_browser_watchdog("注册入口过渡等待")
                 active_page = _resolve_active_page(page, timeout_ms=300)
                 if active_page is not None:
                     # ensure outer page handle follows new tabs if any
                     pass
                 latest_url, latest_body = _describe_page(page, force_refresh=True)
+                _touch_browser_watchdog("注册入口过渡结果")
                 latest_url_lower = str(latest_url or "").lower()
                 if _entry_flow_ready(latest_url, latest_body):
                     return latest_url, latest_body
@@ -8708,6 +9113,7 @@ def run_browser_registration(
             while time.time() < settle_deadline:
                 _wait_for_load(page, timeout_ms=1200)
                 latest_url, latest_body = _describe_page(page, force_refresh=True)
+                _touch_browser_watchdog("注册入口稳定结果")
                 if _entry_flow_ready(latest_url, latest_body):
                     return latest_url, latest_body
                 if "auth.openai.com" in str(latest_url or "").lower() or "chatgpt.com/auth/" in str(latest_url or "").lower():
@@ -8718,47 +9124,40 @@ def run_browser_registration(
             return latest_url, latest_body
 
         def _extract_phone_provider_href() -> str:
-            try:
-                href = page.evaluate(
-                    """() => {
-                        const isVisible = (el) => {
-                            if (!el) return false;
-                            const rect = el.getBoundingClientRect();
-                            const style = window.getComputedStyle(el);
-                            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                        };
-                        const candidates = Array.from(document.querySelectorAll(
-                            'a[data-auth-provider="phone"], a[href*="usernameKind=phone"], a._X60mza_providerButton, a'
-                        ));
-                        for (const el of candidates) {
-                            if (!isVisible(el)) continue;
-                            const provider = String(el.getAttribute('data-auth-provider') || '').toLowerCase();
-                            const href = String(el.getAttribute('href') || '').trim();
-                            const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                            if (!href) continue;
-                            if (
-                                provider === 'phone'
-                                || href.toLowerCase().includes('usernamekind=phone')
-                                || text.includes('continue with phone')
-                                || text.includes('use phone instead')
-                                || text.includes('继续使用手机')
-                            ) {
-                                try {
-                                    return new URL(href, window.location.origin).toString();
-                                } catch (e) {
-                                    return href;
-                                }
-                            }
-                        }
-                        return '';
-                    }"""
-                )
-                return str(href or "").strip()
-            except Exception:
-                return ""
+            selectors = (
+                'a[data-auth-provider="phone"]',
+                'a[href*="usernameKind=phone"]',
+                'a._X60mza_providerButton',
+                "a[href]",
+            )
+            for target in _iter_page_targets(page):
+                for selector in selectors:
+                    try:
+                        locator = target.locator(selector)
+                    except Exception:
+                        continue
+                    item = locator.first
+                    try:
+                        if not item.is_visible(timeout=300):
+                            continue
+                        href = str(item.get_attribute("href", timeout=300) or "").strip()
+                        provider = str(item.get_attribute("data-auth-provider", timeout=300) or "").strip().lower()
+                        text = str(item.inner_text(timeout=300) or "").strip().lower()
+                    except Exception:
+                        continue
+                    if href and (
+                        provider == "phone"
+                        or "usernamekind=phone" in href.lower()
+                        or "continue with phone" in text
+                        or "use phone instead" in text
+                        or "继续使用手机" in text
+                    ):
+                        return href
+            return ""
 
         def _goto_phone_auth_entry(*, reason: str) -> bool:
             """兼容旧调用：统一复用外层手机号入口直链兜底。"""
+            _touch_browser_watchdog("手机号入口直链兜底")
             extracted = _extract_phone_provider_href()
             if extracted:
                 try:
@@ -8780,6 +9179,7 @@ def run_browser_registration(
                         emitter.info("浏览器模式2 已通过手机号入口直链进入认证流程。", step="oauth_init")
                         return True
                 except Exception as exc:
+                    _touch_browser_watchdog("手机号入口直链失败收口")
                     emitter.warn(f"浏览器模式2 页面提取手机号入口直链失败: {exc}", step="oauth_init")
             return _goto_manual_v2_phone_auth_entry(reason=reason, prefer_login=False)
 
@@ -8798,7 +9198,9 @@ def run_browser_registration(
         clicked = False
         signup_visible = _first_visible_locator(page, signup_selectors) is not None
         phone_entry_visible = _first_visible_locator(page, phone_entry_selectors) is not None
+        _touch_browser_watchdog("注册入口控件探测结果")
         blocker_reason = _detect_homepage_blocker(current_url, body_text)
+        _touch_browser_watchdog("首页状态探测结果")
         if blocker_reason:
             blocker_signature = f"blocker:{url_lower}:{blocker_reason}"
             now = time.time()
@@ -8829,16 +9231,19 @@ def run_browser_registration(
                     manual_v2_entry_unavailable_since = 0.0
         entry_signature = f"{url_lower}|signup:{1 if signup_visible else 0}|phone_entry:{1 if phone_entry_visible else 0}"
         if not signup_visible and not phone_entry_visible:
+            _touch_browser_watchdog("注册入口等待收口")
             now = time.time()
             wait_signature = f"pending:{url_lower}"
             if wait_signature != manual_v2_entry_bootstrap_signature or now - manual_v2_entry_bootstrap_seen_at >= 15:
                 manual_v2_entry_bootstrap_signature = wait_signature
                 manual_v2_entry_bootstrap_seen_at = now
                 manual_v2_entry_bootstrap_wait_logged = False
+                actions_summary = _summarize_primary_actions(page)
+                _touch_browser_watchdog("首页入口诊断结果")
                 emitter.info(
                     "浏览器模式2 首页暂未识别到注册入口，继续等待页面渲染..."
                     + " actions="
-                    + _summarize_primary_actions(page),
+                    + actions_summary,
                     step="oauth_init",
                 )
             if (
@@ -8877,79 +9282,38 @@ def run_browser_registration(
                 manual_v2_entry_bootstrap_wait_logged = False
 
         def _js_click_mobile_auth_signup() -> bool:
-            try:
-                return bool(
-                    page.evaluate(
-                        """() => {
-                            const isVisible = (el) => {
-                                if (!el) return false;
-                                const rect = el.getBoundingClientRect();
-                                const style = window.getComputedStyle(el);
-                                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                            };
-                            const candidates = Array.from(document.querySelectorAll(
-                                'button[data-mobile-auth-entry-action="signup"], button.wm-app-signupButton, button[commandfor="mobile-auth-dialog"], button, a, [role="button"]'
-                            ));
-                            for (const el of candidates) {
-                                if (!isVisible(el)) continue;
-                                const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                                const action = String(el.getAttribute('data-mobile-auth-entry-action') || '').toLowerCase();
-                                if (action === 'signup' || text === 'sign up for free' || text === 'sign up' || text.includes('sign up for free') || text === '免费注册' || text === '注册') {
-                                    try { el.click(); return true; } catch (e) {}
-                                    try {
-                                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                                        return true;
-                                    } catch (e2) {}
-                                }
-                            }
-                            return false;
-                        }"""
-                    )
-                )
-            except Exception:
-                return False
+            # 保留旧函数名，实际使用 locator 点击，避免无 timeout page.evaluate。
+            return _click_first(
+                page,
+                [
+                    'button[data-mobile-auth-entry-action="signup"]',
+                    "button.wm-app-signupButton",
+                    'button[commandfor="mobile-auth-dialog"]',
+                    'button:has-text("Sign up for free")',
+                    'button:has-text("Sign up")',
+                    'a:has-text("Sign up for free")',
+                    'a:has-text("Sign up")',
+                    'button:has-text("免费注册")',
+                    'button:has-text("注册")',
+                ],
+                timeout_ms=1000,
+            )
 
         def _js_click_phone_provider() -> bool:
-            try:
-                return bool(
-                    page.evaluate(
-                        """() => {
-                            const isVisible = (el) => {
-                                if (!el) return false;
-                                const rect = el.getBoundingClientRect();
-                                const style = window.getComputedStyle(el);
-                                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-                            };
-                            const candidates = Array.from(document.querySelectorAll(
-                                'a[data-auth-provider="phone"], a[href*="usernameKind=phone"], a._X60mza_providerButton, a, button, [role="button"], div'
-                            ));
-                            for (const el of candidates) {
-                                if (!isVisible(el)) continue;
-                                const provider = String(el.getAttribute('data-auth-provider') || '').toLowerCase();
-                                const href = String(el.getAttribute('href') || '').toLowerCase();
-                                const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                                if (
-                                    provider === 'phone'
-                                    || href.includes('usernamekind=phone')
-                                    || text === 'continue with phone'
-                                    || text.includes('continue with phone')
-                                    || text === 'use phone instead'
-                                    || text.includes('继续使用手机')
-                                    || text === '手机登录'
-                                ) {
-                                    try { el.click(); return true; } catch (e) {}
-                                    try {
-                                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                                        return true;
-                                    } catch (e2) {}
-                                }
-                            }
-                            return false;
-                        }"""
-                    )
-                )
-            except Exception:
-                return False
+            return _click_first(
+                page,
+                [
+                    'a[data-auth-provider="phone"]',
+                    'a[href*="usernameKind=phone"]',
+                    'a._X60mza_providerButton',
+                    'a:has-text("Continue with phone")',
+                    'button:has-text("Continue with phone")',
+                    'button:has-text("Use phone instead")',
+                    'button:has-text("继续使用手机")',
+                    'button:has-text("手机登录")',
+                ],
+                timeout_ms=1000,
+            )
 
         if not phone_entry_visible and signup_visible:
             signup_clicked = (
@@ -9519,9 +9883,44 @@ def run_browser_registration(
             page = active_page
             if not callback_state["url"]:
                 _consume_loopback_callback()
+            # 先读 frame URL/Continue 控件，再读整页正文。密码页按钮已出现时，
+            # 交给外层精确提交路径处理，不能先被正文读取和网络轮询拖住。
+            frame_target_url = _best_auth_target_url(page)
+            frame_target_lower = str(frame_target_url or "").lower()
+            if any(
+                token in frame_target_lower
+                for token in ("contact-verification", "verify-phone", "phone-verification")
+            ):
+                manual_v2_contact_network_seen = True
+                return frame_target_url, ""
+            if any(
+                token in frame_target_lower
+                for token in ("/create-account/password", "/log-in/password")
+            ):
+                continue_locator = _find_visible_submit_locator(
+                    page,
+                    ("继续", "Continue", "Next", "Verify", "Submit"),
+                )
+                if continue_locator is not None:
+                    return frame_target_url, ""
             latest_url, latest_body = _describe_page(page, force_refresh=True)
             latest_url_lower = latest_url.lower()
-            if "/create-account/password" in latest_url_lower or "auth.openai.com" in latest_url_lower:
+            # 提交后 auth 业务页可能先在 iframe 内切换，顶层 URL 仍短暂停留在密码页。
+            # 直接读取 frame URL，避免等网络事件或超时后才把控制权交回主循环。
+            frame_target_url = _best_auth_target_url(page)
+            frame_target_lower = str(frame_target_url or "").lower()
+            if any(
+                token in frame_target_lower
+                for token in ("contact-verification", "verify-phone", "phone-verification")
+            ):
+                manual_v2_contact_network_seen = True
+                return frame_target_url, latest_body
+            # URL 已是 contact-verification：最快路径，跳过深文案/CF
+            if "contact-verification" in latest_url_lower or "verify-phone" in latest_url_lower:
+                manual_v2_contact_network_seen = True
+                return latest_url, latest_body
+            # 仅仍停在密码页时做深文案（每轮 deep text 很慢）
+            if "/create-account/password" in latest_url_lower:
                 raw_body_text = _get_page_deep_text(page)
                 if str(raw_body_text or "").strip():
                     latest_body = str(raw_body_text or "")
@@ -9547,15 +9946,24 @@ def run_browser_registration(
                         + f" blocker={_preview_text(cloudflare_blocker, 120) or '-'}",
                         step=step,
                     )
-                _wait_for_load(page, timeout_ms=1200)
-                _simulate_human_idle(page)
-                _sleep_with_page(page, 1200)
+                _wait_for_load(page, timeout_ms=800)
+                # CF 等待期间只做轻量空闲，避免每次 +1.2s idle + 1.2s sleep
+                if random.random() < 0.35:
+                    _simulate_human_idle(page)
+                _sleep_with_page(page, 450)
                 continue
             if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
                 return latest_url, latest_body
-            if _has_recent_network_url(recent_network_events, "contact-verification", within_seconds=8.0):
+            if _has_recent_network_url(recent_network_events, "contact-verification", within_seconds=12.0):
                 manual_v2_contact_network_seen = True
                 return latest_url, latest_body
+            if _has_recent_network_url(recent_network_events, "phone-otp/send", within_seconds=12.0):
+                manual_v2_contact_network_seen = True
+                # 发码请求已出：再稍等 URL 切过去，最多 1.2s
+                if register_send_wait_started_at <= 0.0:
+                    register_send_wait_started_at = time.time()
+                if time.time() - register_send_wait_started_at >= 1.2:
+                    return latest_url, latest_body
             if _is_create_account_failed_error(latest_url, latest_body, page):
                 return latest_url, latest_body
             if _is_phone_number_existing_account_error(latest_url, latest_body, page):
@@ -9581,11 +9989,15 @@ def run_browser_registration(
                 )
                 if recent_phone_otp_send:
                     manual_v2_contact_network_seen = True
-                    return latest_url, latest_body
+                    if register_send_wait_started_at <= 0.0:
+                        register_send_wait_started_at = time.time()
+                    # 发码已发出：1.2s 内 URL 仍未切就返回，交给主循环继续盯
+                    if time.time() - register_send_wait_started_at >= 1.2:
+                        return latest_url, latest_body
                 if recent_register_request or recent_phone_otp_send:
                     if register_send_wait_started_at <= 0.0:
                         register_send_wait_started_at = time.time()
-                    if time.time() - register_send_wait_started_at >= 3.5:
+                    if time.time() - register_send_wait_started_at >= 1.8:
                         return latest_url, latest_body
                     if not wait_logged:
                         wait_logged = True
@@ -9593,8 +10005,7 @@ def run_browser_registration(
                             "create-account/password 提交后已检测到注册/发码网络请求，页面仍停留在密码页时先继续等待站点完成切换...",
                             step=step,
                         )
-                    _wait_for_load(page, timeout_ms=1200)
-                    _sleep_with_page(page, 300)
+                    _sleep_with_page(page, 180)
                     continue
             if latest_state != previous_state:
                 return latest_url, latest_body
@@ -9603,14 +10014,15 @@ def run_browser_registration(
             if not wait_logged:
                 wait_logged = True
                 emitter.info("create-account/password 已提交，等待页面稳定并切换到下一阶段...", step=step)
-            _sleep_with_page(page, 250)
+            _sleep_with_page(page, 150)
         emitter.warn(
             "浏览器模式2 create-account/password 提交后的短轮询观察超时，先返回当前页面继续主循环诊断..."
             + f" current_url={_mask_secret(latest_url, head=56, tail=12)}"
             + f", state={_classify_page_state(latest_url, latest_body, page)}",
             step=step,
         )
-        return _describe_page(page, force_refresh=True)
+        # 最新快照已在本轮读取；把页面复查交给主循环，避免超时分支再同步读一次正文。
+        return latest_url, latest_body
 
     def _wait_for_manual_v2_contact_submit_transition(
         previous_url: str,
@@ -10019,6 +10431,7 @@ def run_browser_registration(
                 _sleep_with_page(page, 500)
                 landing_url, landing_body = _describe_page(page, force_refresh=True)
         except Exception as exc:
+            _touch_browser_watchdog("回首页入口预热失败收口")
             emitter.warn(f"浏览器模式2 回首页入口预热失败，将交由主循环继续重试: {exc}", step="oauth_init")
     manual_v2_require_phone_resubmit = False
     manual_v2_reset_password_flow_started = False
@@ -10089,14 +10502,54 @@ def run_browser_registration(
         ).strip()
 
     def _ensure_manual_v2_auto_phone(*, step: str, prompt: str) -> str:
+        nonlocal launch_resources
         nonlocal manual_v2_phone_number, manual_v2_sms_activation_id, manual_v2_sms_provider_done, manual_v2_sms_purchased_at
         nonlocal manual_v2_sms_country_id, manual_v2_sms_country_iso, manual_v2_sms_country_name, manual_v2_sms_country_result_recorded
         if manual_v2_phone_number:
             return manual_v2_phone_number
         if not manual_v2_auto_phone_mode or sms_provider is None:
             raise RuntimeError("浏览器模式2 当前未启用自动手机号模式")
+        _touch_browser_watchdog("SMSBower 取号")
+        # 短暂取号轮询也可能阻塞主循环；进入 API 前先做一次内存闸门检查。
+        current_rss = _process_tree_rss_bytes()
+        if current_rss >= memory_soft_limit:
+            cdp_purged = _purge_active_browser_memory(context, page)
+            before_rss, after_rss, collected = _release_memory_pressure(emitter)
+            if after_rss >= memory_hard_limit:
+                top_before = _process_tree_rss_report()
+                _, closed_rss, close_gc, killed = _shutdown_browser_for_memory_pressure(
+                    launch_resources,
+                    playwright,
+                    emitter,
+                    target_bytes=memory_hard_limit,
+                )
+                launch_resources = None
+                emitter.warn(
+                    "短信取号前检测到进程内存偏高，已关闭当前浏览器并清理残留进程："
+                    + f"rss={current_rss / 1024 / 1024:.0f}MB, before={before_rss / 1024 / 1024:.0f}MB, "
+                    + f"after={closed_rss / 1024 / 1024:.0f}MB, gc={collected + close_gc}, killed={killed}, "
+                    + f"cdp_purge={cdp_purged}, top_before={top_before}",
+                    step="memory",
+                )
+                raise RuntimeError(
+                    "短信取号前进程内存仍超过安全阈值，已停止当前浏览器流程并交由外层重试；"
+                    + f"rss_before_close={after_rss / 1024 / 1024:.0f}MB, "
+                    + f"rss_after_close={closed_rss / 1024 / 1024:.0f}MB, "
+                    + f"hard_limit={memory_hard_limit / 1024 / 1024:.0f}MB"
+                )
+            emitter.warn(
+                "短信取号前检测到进程内存偏高，已清理历史浏览器现场/页面快照并执行垃圾回收："
+                + f"rss={current_rss / 1024 / 1024:.0f}MB, before={before_rss / 1024 / 1024:.0f}MB, "
+                + f"after={after_rss / 1024 / 1024:.0f}MB, gc={collected}, cdp_purge={cdp_purged}",
+                step="memory",
+            )
         emitter.info(prompt, step=step)
-        sms_order = sms_provider.acquire_number(proxy=ctx.proxy, stop_event=ctx.stop_event)
+        # 取号属于外部 HTTP 轮询，不访问浏览器；长时间无库存时暂停浏览器看门狗，避免误杀 Chrome。
+        _pause_browser_watchdog(f"{manual_v2_auto_phone_provider_label} 取号轮询")
+        try:
+            sms_order = sms_provider.acquire_number(proxy=ctx.proxy, stop_event=ctx.stop_event)
+        finally:
+            _resume_browser_watchdog("短信取号完成，恢复浏览器流程")
         price_tier_options = sms_order.get("price_tier_options") if isinstance(sms_order.get("price_tier_options"), list) else []
         operator_options = sms_order.get("operator_options") if isinstance(sms_order.get("operator_options"), list) else []
         auto_country_mode = bool(sms_order.get("auto_country_mode"))
@@ -10291,15 +10744,19 @@ def run_browser_registration(
             emitter.success(f"浏览器模式2 已直接复用此前收到的 {manual_v2_auto_phone_provider_label} 短信验证码: {code}", step=step)
             return code
         emitter.info(prompt, step=step)
-        raw_code = str(
-            sms_provider.wait_for_code(
-                manual_v2_sms_activation_id,
-                proxy=ctx.proxy,
-                timeout_seconds=timeout_seconds,
-                stop_event=stop_event,
-            )
-            or ""
-        ).strip()
+        _pause_browser_watchdog(f"{manual_v2_auto_phone_provider_label} 等待短信")
+        try:
+            raw_code = str(
+                sms_provider.wait_for_code(
+                    manual_v2_sms_activation_id,
+                    proxy=ctx.proxy,
+                    timeout_seconds=timeout_seconds,
+                    stop_event=stop_event,
+                )
+                or ""
+            ).strip()
+        finally:
+            _resume_browser_watchdog("短信等待完成，恢复浏览器流程")
         code = _normalize_manual_v2_sms_code(raw_code)
         if code:
             emitter.success(f"浏览器模式2 已从 {manual_v2_auto_phone_provider_label} 自动收到短信验证码: {code}", step=step)
@@ -10758,6 +11215,43 @@ def run_browser_registration(
     playwright = sync_playwright().start()
     launch_resources: Optional[BrowserLaunchResources] = None
     preserve_browser_on_error = False
+    watchdog_stop = threading.Event()
+    watchdog_triggered = threading.Event()
+    watchdog_state_lock = threading.Lock()
+    flow_thread_id = threading.get_ident()
+    watchdog_state: dict[str, Any] = {
+        "at": time.monotonic(),
+        "label": "浏览器启动",
+        "paused": False,
+    }
+    watchdog_thread: Optional[threading.Thread] = None
+
+    def _touch_browser_watchdog(label: str) -> None:
+        if watchdog_triggered.is_set():
+            raise RuntimeError(
+                "浏览器自动流程看门狗已终止当前 Chrome，当前流程立即退出并交由外层重试"
+            )
+        with watchdog_state_lock:
+            watchdog_state["at"] = time.monotonic()
+            watchdog_state["label"] = str(label or "浏览器流程")
+            watchdog_state["paused"] = False
+
+    def _pause_browser_watchdog(label: str) -> None:
+        """暂停看门狗，仅用于明确不会访问浏览器的外部等待（如短信平台轮询）。"""
+        if watchdog_triggered.is_set():
+            raise RuntimeError(
+                "浏览器自动流程看门狗已终止当前 Chrome，当前流程立即退出并交由外层重试"
+            )
+        with watchdog_state_lock:
+            watchdog_state["paused"] = True
+            watchdog_state["label"] = str(label or "外部等待")
+
+    def _resume_browser_watchdog(label: str) -> None:
+        with watchdog_state_lock:
+            watchdog_state["paused"] = False
+            watchdog_state["at"] = time.monotonic()
+            watchdog_state["label"] = str(label or "浏览器流程")
+
     try:
         if cfg.get("browser_engine") == "roxy":
             try:
@@ -10775,6 +11269,167 @@ def run_browser_registration(
         browser = launch_resources.browser
         context = launch_resources.context
         page = launch_resources.page
+
+        if manual_v2_auto_phone_mode and str(cfg.get("browser_engine") or "uc").strip().lower() == "uc":
+            watchdog_profile = _canonical_uc_temp_profile(
+                getattr(launch_resources, "temp_user_data_dir", "")
+            )
+            if watchdog_profile:
+                def _browser_stall_watchdog() -> None:
+                    while not watchdog_stop.wait(5.0):
+                        if manual_v2_contact_seen:
+                            continue
+                        with watchdog_state_lock:
+                            last_heartbeat = float(watchdog_state.get("at") or 0.0)
+                            last_label = str(watchdog_state.get("label") or "浏览器流程")
+                            is_paused = bool(watchdog_state.get("paused"))
+                        if is_paused:
+                            continue
+                        stalled_seconds = max(0.0, time.monotonic() - last_heartbeat)
+                        if stalled_seconds < _BROWSER_STALL_WATCHDOG_SECONDS:
+                            continue
+                        if watchdog_triggered.is_set():
+                            return
+                        watchdog_triggered.set()
+                        # Chrome 被杀后，Playwright driver/chromedriver 仍可能保持 pipe/CDP
+                        # 阻塞；精确终止本次任务自己的驱动进程，促使主线程收到连接关闭异常。
+                        driver_pids: set[int] = set()
+                        try:
+                            transport = getattr(
+                                getattr(
+                                    getattr(playwright, "_impl_obj", None),
+                                    "_connection",
+                                    None,
+                                ),
+                                "_transport",
+                                None,
+                            )
+                            driver_pid = int(getattr(getattr(transport, "_proc", None), "pid", 0) or 0)
+                            if driver_pid > 0:
+                                driver_pids.add(driver_pid)
+                        except Exception:
+                            pass
+                        try:
+                            cdp_process = getattr(
+                                getattr(getattr(launch_resources, "cdp_driver", None), "service", None),
+                                "process",
+                                None,
+                            )
+                            cdp_pid = int(getattr(cdp_process, "pid", 0) or 0)
+                            if cdp_pid > 0:
+                                driver_pids.add(cdp_pid)
+                        except Exception:
+                            pass
+                        driver_pids.discard(os.getpid())
+                        killed_driver_pids = 0
+                        try:
+                            driver_rows, _ = _read_process_table()
+                        except Exception:
+                            driver_rows = {}
+                        for driver_pid in sorted(driver_pids):
+                            driver_command = str(driver_rows.get(driver_pid, (0, 0, ""))[2] or "").lower()
+                            if driver_command and not (
+                                "playwright/driver/node" in driver_command
+                                or "chromedriver" in driver_command
+                            ):
+                                continue
+                            try:
+                                os.kill(driver_pid, signal.SIGTERM)
+                                killed_driver_pids += 1
+                            except (ProcessLookupError, PermissionError, OSError):
+                                continue
+                        if driver_pids:
+                            driver_deadline = time.monotonic() + 1.0
+                            pending_driver_pids = set(driver_pids)
+                            current_driver_rows = driver_rows
+                            while pending_driver_pids and time.monotonic() < driver_deadline:
+                                try:
+                                    current_driver_rows, _ = _read_process_table()
+                                    pending_driver_pids &= set(current_driver_rows)
+                                except Exception:
+                                    break
+                                if not pending_driver_pids:
+                                    break
+                                time.sleep(0.1)
+                            for driver_pid in sorted(pending_driver_pids):
+                                try:
+                                    current_command = str(
+                                        current_driver_rows.get(driver_pid, (0, 0, ""))[2] or ""
+                                    ).lower()
+                                except Exception:
+                                    current_command = ""
+                                if current_command and not (
+                                    "playwright/driver/node" in current_command
+                                    or "chromedriver" in current_command
+                                ):
+                                    continue
+                                try:
+                                    os.kill(driver_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                                    killed_driver_pids += 1
+                                except (ProcessLookupError, PermissionError, OSError):
+                                    continue
+                        current_rss = _process_tree_rss_bytes()
+                        top_before = _process_tree_rss_report()
+                        stack_text = ""
+                        try:
+                            flow_frame = sys._current_frames().get(flow_thread_id)
+                            if flow_frame is not None:
+                                stack_text = " ".join(traceback.format_stack(flow_frame)).strip()
+                                stack_text = stack_text[-5000:]
+                        except Exception as exc:
+                            stack_text = f"stack_unavailable={type(exc).__name__}"
+                        try:
+                            emitter.error(
+                                "浏览器自动流程超过看门狗等待时间没有进度，已终止当前 Chrome 并交由外层重试："
+                                + f"stalled={stalled_seconds:.0f}s, last_step={last_label}, "
+                                + f"rss={current_rss / 1024 / 1024:.0f}MB, top={top_before}, "
+                                + f"driver_killed={killed_driver_pids}, "
+                                + f"stack={stack_text or '-'}",
+                                step="runtime",
+                            )
+                        except Exception:
+                            pass
+                        _cleanup_orphan_uc_processes(
+                            emitter,
+                            profile_dirs={watchdog_profile},
+                            step="runtime",
+                        )
+                        return
+
+                watchdog_thread = threading.Thread(
+                    target=_browser_stall_watchdog,
+                    name="opo-browser-stall-watchdog",
+                    daemon=True,
+                )
+                watchdog_thread.start()
+
+        def _trim_obsolete_browser_pages(active_page: Any) -> int:
+            """多次 OAuth 重试时关闭不再参与认证的旧首页页签。"""
+            try:
+                pages = list(getattr(context, "pages", []) or [])
+            except Exception:
+                return 0
+            if len(pages) <= 4:
+                return 0
+            closed = 0
+            for candidate_page in pages:
+                if len(pages) - closed <= 4 or candidate_page is active_page:
+                    continue
+                try:
+                    url = str(candidate_page.url or "").strip().lower()
+                except Exception:
+                    url = ""
+                if "code=" in url and "state=" in url:
+                    continue
+                if "auth.openai.com" in url:
+                    continue
+                try:
+                    candidate_page.close()
+                    closed += 1
+                except Exception:
+                    pass
+            return closed
+
         if not use_plain_browser_env:
             try:
                 # 只有用户明确要拦媒体，且未启用拟真档案时，才在无头模式下拦截资源。
@@ -10787,6 +11442,7 @@ def run_browser_registration(
             except Exception:
                 pass
         _wire_page_once(page)
+        last_memory_check_at = 0.0
         try:
             context.on("page", _wire_page_once)
         except Exception:
@@ -10847,6 +11503,7 @@ def run_browser_registration(
                         _sleep_with_page(page, 500)
                         landing_url, landing_body = _describe_page(page, force_refresh=True)
                 except Exception as exc:
+                    _touch_browser_watchdog("首页入口预热失败收口")
                     emitter.warn(f"浏览器模式2 首页入口启动预热失败，将交由主循环继续重试: {exc}", step="oauth_init")
             else:
                 _start_oauth_flow(page, current_oauth, current_phase)
@@ -10859,6 +11516,48 @@ def run_browser_registration(
             while time.time() < deadline:
                 if _stopped(ctx.stop_event):
                     return None
+                _touch_browser_watchdog("浏览器主循环")
+
+                now = time.time()
+                if now - last_memory_check_at >= _BROWSER_MEMORY_CHECK_INTERVAL_SECONDS:
+                    last_memory_check_at = now
+                    _touch_browser_watchdog("内存检查/清理")
+                    current_rss = _process_tree_rss_bytes()
+                    if current_rss >= memory_soft_limit:
+                        closed_pages = _trim_obsolete_browser_pages(page)
+                        cdp_purged = _purge_active_browser_memory(context, page)
+                        before_rss, after_rss, collected = _release_memory_pressure(emitter)
+                        if after_rss >= memory_hard_limit:
+                            top_before = _process_tree_rss_report()
+                            _, closed_rss, close_gc, killed = _shutdown_browser_for_memory_pressure(
+                                launch_resources,
+                                playwright,
+                                emitter,
+                                target_bytes=memory_hard_limit,
+                            )
+                            launch_resources = None
+                            emitter.warn(
+                                "浏览器任务检测到进程内存偏高，已关闭当前浏览器并清理残留进程："
+                                + f"rss={current_rss / 1024 / 1024:.0f}MB, before={before_rss / 1024 / 1024:.0f}MB, "
+                                + f"after={closed_rss / 1024 / 1024:.0f}MB, closed_pages={closed_pages}, "
+                                + f"gc={collected + close_gc}, killed={killed}, cdp_purge={cdp_purged}, "
+                                + f"top_before={top_before}",
+                                step="memory",
+                            )
+                            raise RuntimeError(
+                                "进程内存超过浏览器任务安全阈值，已停止当前浏览器流程并交由外层重试；"
+                                + f"rss_before_close={after_rss / 1024 / 1024:.0f}MB, "
+                                + f"rss_after_close={closed_rss / 1024 / 1024:.0f}MB, "
+                                + f"hard_limit={memory_hard_limit / 1024 / 1024:.0f}MB"
+                            )
+                        emitter.warn(
+                            "浏览器任务检测到进程内存偏高，已主动清理缓存/历史保留现场并执行垃圾回收："
+                            + f"rss={current_rss / 1024 / 1024:.0f}MB, before={before_rss / 1024 / 1024:.0f}MB, "
+                            + f"after={after_rss / 1024 / 1024:.0f}MB, closed_pages={closed_pages}, "
+                            + f"gc={collected}, cdp_purge={cdp_purged}",
+                            step="memory",
+                        )
+                    _touch_browser_watchdog("内存检查完成")
 
                 if not callback_state["url"]:
                     loopback_callback = _consume_loopback_callback()
@@ -11071,6 +11770,8 @@ def run_browser_registration(
                         _finish_manual_v2_sms_provider(success=True)
                         return token_json
 
+                _touch_browser_watchdog("解析当前浏览器页面")
+                _touch_browser_watchdog("活动页选择")
                 active_page = _resolve_active_page(page, timeout_ms=1500)
                 if active_page is None:
                     if callback_state["url"]:
@@ -11078,9 +11779,11 @@ def run_browser_registration(
                     _sleep_with_page(None, 300)
                     continue
 
+                _touch_browser_watchdog("页面正文读取")
                 current_url, body_text = _describe_page(page)
                 current_url_lower = current_url.lower()
                 body_lower = body_text.lower()
+                _touch_browser_watchdog("页面状态分类")
                 cloudflare_blocker = _detect_cloudflare_blocker(page, current_url, body_text)
                 if cloudflare_blocker:
                     blocker_key = f"cf:{current_url_lower}:{cloudflare_blocker}"
@@ -11216,6 +11919,7 @@ def run_browser_registration(
 
                 if is_manual_v2_mode:
                     _extend_manual_v2_deadline(1800)
+                    _touch_browser_watchdog("认证页/frame 提升")
                     page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=6000)
                     current_url_lower = str(current_url or "").lower()
                     body_lower = str(body_text or "").lower()
@@ -11233,12 +11937,46 @@ def run_browser_registration(
                             or _is_phone_verification_page(current_url, body_text, page)
                         )
                     )
+                    _touch_browser_watchdog("手机输入值读取")
                     captured_phone = _extract_input_value_by_hints(
                         page,
                         ["phone", "mobile", "手机号", "电话", "tel"],
                     )
                     if captured_phone:
                         manual_v2_phone_number = captured_phone
+
+                    # 步骤1任意阶段：号码已绑定旧账号（含 “sign in to h****@o****.com using usual sign-in method”）
+                    # 立即废弃当前号并重新取号，不要卡在登录引导页。
+                    _touch_browser_watchdog("手机号状态识别")
+                    if (
+                        not manual_v2_login_flow_started
+                        and _is_phone_number_existing_account_error(current_url, body_text, page)
+                    ):
+                        password_submitted = False
+                        profile_submitted = False
+                        manual_v2_password_page_logged = False
+                        manual_v2_create_password_submit_attempts = 0
+                        manual_v2_contact_seen = False
+                        manual_v2_phone_submit_stall_attempts = 0
+                        if manual_v2_auto_phone_mode:
+                            _finish_manual_v2_sms_provider(success=False)
+                            manual_v2_phone_number = ""
+                            manual_v2_sms_activation_id = ""
+                            manual_v2_sms_purchased_at = 0.0
+                            manual_v2_sms_provider_done = False
+                            _prepare_manual_v2_signup_flow(
+                                "浏览器模式2 步骤1检测到手机号已绑定既有账号"
+                                + "（如 To continue, sign in to ***@***.com using that account's usual sign-in method）；"
+                                + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                            )
+                        else:
+                            manual_v2_phone_number = ""
+                            _prepare_manual_v2_signup_flow(
+                                "浏览器模式2 步骤1检测到手机号已绑定既有账号"
+                                + "（如要求使用原邮箱/常用登录方式登录）；"
+                                + "已回到步骤1，请重新输入新的手机号..."
+                            )
+                        continue
 
                     if (
                         is_phone_stage_page
@@ -11268,6 +12006,7 @@ def run_browser_registration(
                         and "chatgpt.com" in current_url_lower
                         and not _has_phone_input(page)
                     ):
+                        _touch_browser_watchdog("注册入口探测")
                         if not manual_v2_entry_bootstrap_logged:
                             manual_v2_entry_bootstrap_logged = True
                             emitter.info("浏览器模式2 检测到 ChatGPT 首页，正在尝试自动打开手机号注册入口...", step="oauth_init")
@@ -11314,7 +12053,9 @@ def run_browser_registration(
                             "phone-otp/send",
                             within_seconds=30.0,
                         )
-                        hero_sms_code_ready = bool(_probe_manual_v2_auto_sms_code())
+                        # 已有 contact/发码网络线索时直接进入验证码阶段；真正验证码由 wait_for_code 轮询，
+                        # 这里不再同步调用 HeroSMS peek_code 阻塞主循环。
+                        hero_sms_code_ready = bool(manual_v2_cached_sms_code)
                         if recent_contact_verification_network or recent_phone_otp_send or hero_sms_code_ready or _is_contact_verification_page(current_url, body_text, page):
                             manual_v2_contact_seen = True
                             manual_v2_contact_network_seen = True
@@ -11370,7 +12111,14 @@ def run_browser_registration(
                             ),
                             step="create_password",
                         )
-                        if not _wait_for_create_account_password_ready(page, timeout_ms=12000):
+                        password_ready_started_at = time.monotonic()
+                        password_ready = _wait_for_create_account_password_ready(page, timeout_ms=6000)
+                        emitter.info(
+                            "浏览器模式2 create-account/password 就绪探针完成："
+                            + f"ready={str(password_ready).lower()}, elapsed_ms={int((time.monotonic() - password_ready_started_at) * 1000)}",
+                            step="create_password",
+                        )
+                        if not password_ready:
                             emitter.warn(
                                 "浏览器模式2 create-account/password ready 探针诊断: "
                                 + _summarize_create_account_password_probe(page),
@@ -11382,9 +12130,20 @@ def run_browser_registration(
                             ctx.account_password,
                             emitter=emitter,
                             step="create_password",
+                            check_page_ready=False,
+                        )
+                        emitter.info(
+                            "浏览器模式2 create-account/password 专用提交流程返回："
+                            + f"ok={submit_password_result.get('ok') or '-'}, "
+                            + f"submitted={submit_password_result.get('submitted') or '-'}, "
+                            + f"reason={submit_password_result.get('reason') or '-'}",
+                            step="create_password",
                         )
                         if str(submit_password_result.get("ok") or "").strip().lower() != "true":
-                            raise RuntimeError("浏览器模式2 create-account/password 专用提交流程失败")
+                            raise RuntimeError(
+                                "浏览器模式2 create-account/password 专用提交流程失败: "
+                                + str(submit_password_result.get("reason") or "unknown")
+                            )
                         if str(submit_password_result.get("submitted") or "").strip().lower() == "true":
                             password_submitted = True
                             emitter.info(
@@ -11397,7 +12156,9 @@ def run_browser_registration(
                         current_url, body_text = _wait_for_manual_v2_create_password_transition(
                             previous_url,
                             previous_body,
-                            timeout_ms=20000,
+                            # frame URL/网络事件未立即出现时只短暂观察，随后交回主循环；
+                            # 不让一次提交同步占住整个注册流程。
+                            timeout_ms=2500,
                         )
                         recent_contact_verification_network = _has_recent_network_url(
                             recent_network_events,
@@ -11411,12 +12172,10 @@ def run_browser_registration(
                             or recent_contact_verification_network
                             or manual_v2_contact_network_seen
                         )
-                        hero_sms_code_ready = bool(_probe_manual_v2_auto_sms_code())
+                        hero_sms_code_ready = bool(manual_v2_cached_sms_code)
                         if hero_sms_code_ready:
                             transition_detected_contact_verification = True
                             manual_v2_contact_network_seen = True
-                        if not transition_detected_contact_verification:
-                            current_url, body_text = _describe_page(page, force_refresh=True)
                         if _is_contact_verification_page(current_url, body_text, page):
                             manual_v2_contact_seen = True
                             manual_v2_contact_transition_last_key = ""
@@ -11428,6 +12187,7 @@ def run_browser_registration(
                                 step="phone_verification",
                             )
                             continue
+
                         if transition_detected_contact_verification:
                             manual_v2_contact_seen = True
                             manual_v2_contact_transition_last_key = ""
@@ -11445,6 +12205,7 @@ def run_browser_registration(
                                 step="phone_verification",
                             )
                             continue
+
                         if _is_phone_sms_send_failed_error(current_url, body_text, page):
                             password_submitted = False
                             manual_v2_password_page_logged = False
@@ -11515,6 +12276,44 @@ def run_browser_registration(
                                 )
                             continue
                         if _is_create_account_password_page(current_url, body_text, page):
+                            # 上一次点击后仍停在密码页时，先看精确的 Continue 是否仍可用。
+                            # 可用说明提交事件未被消费，直接再次点击，不进入后面的多轮正文刷新。
+                            recent_contact_or_send = (
+                                _has_recent_network_url(recent_network_events, "contact-verification", within_seconds=4.0)
+                                or _has_recent_network_url(recent_network_events, "phone-otp/send", within_seconds=4.0)
+                            )
+                            if not recent_contact_or_send and not _has_recent_challenge_network(
+                                recent_network_events,
+                                within_seconds=4.0,
+                            ):
+                                continue_locator = _find_visible_submit_locator(
+                                    page,
+                                    ("继续", "Continue", "Next", "Verify", "Submit"),
+                                )
+                                if continue_locator is not None:
+                                    retry_clicked = False
+                                    try:
+                                        continue_locator.click(
+                                            timeout=1200,
+                                            delay=random.randint(30, 70),
+                                            no_wait_after=True,
+                                        )
+                                        retry_clicked = True
+                                    except Exception:
+                                        try:
+                                            continue_locator.press("Enter", timeout=800)
+                                            retry_clicked = True
+                                        except Exception:
+                                            retry_clicked = False
+                                    if retry_clicked:
+                                        password_submitted = False
+                                        manual_v2_password_page_logged = False
+                                        emitter.info(
+                                            "浏览器模式2 create-account/password 检测到仍可用的 Continue 按钮，"
+                                            + "已直接再次提交，跳过多轮页面正文等待...",
+                                            step="create_password",
+                                        )
+                                        continue
                             if _has_recent_challenge_network(recent_network_events, within_seconds=10.0):
                                 manual_v2_create_password_submit_attempts = max(0, manual_v2_create_password_submit_attempts - 1)
                                 emitter.info(
@@ -11548,7 +12347,7 @@ def run_browser_registration(
                                     "phone-otp/send",
                                     within_seconds=25.0,
                                 )
-                                hero_sms_code_ready = bool(_probe_manual_v2_auto_sms_code())
+                                hero_sms_code_ready = bool(manual_v2_cached_sms_code)
                                 if recent_contact_verification_network or recent_phone_otp_send or hero_sms_code_ready:
                                     manual_v2_contact_network_seen = True
                                     break
@@ -11585,7 +12384,7 @@ def run_browser_registration(
                                 "phone-otp/send",
                                 within_seconds=25.0,
                             )
-                            hero_sms_code_ready = bool(_probe_manual_v2_auto_sms_code())
+                            hero_sms_code_ready = bool(manual_v2_cached_sms_code)
                             if recent_contact_verification_network or manual_v2_contact_network_seen or recent_phone_otp_send or hero_sms_code_ready:
                                 manual_v2_contact_seen = True
                                 manual_v2_contact_network_seen = True
@@ -11754,10 +12553,32 @@ def run_browser_registration(
                                         continue
                             if _is_login_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
-                                emitter.info(
-                                    "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
-                                    step="create_password",
-                                )
+                                # 已判定老号：立刻废弃取号，不要只打日志再空等下一轮主循环（可白白多等十几秒）
+                                password_submitted = False
+                                manual_v2_password_page_logged = False
+                                manual_v2_create_password_submit_attempts = 0
+                                if manual_v2_auto_phone_mode:
+                                    _finish_manual_v2_sms_provider(success=False)
+                                    manual_v2_phone_number = ""
+                                    manual_v2_sms_activation_id = ""
+                                    manual_v2_sms_purchased_at = 0.0
+                                    manual_v2_sms_provider_done = False
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 Enter your password（号码已是老号）；"
+                                        + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                                    )
+                                elif manual_v2_manual_restart_on_enter_password:
+                                    manual_v2_phone_number = ""
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 Enter your password（号码已是老号）；"
+                                        + "已立即回到步骤1，请重新输入新的手机号..."
+                                    )
+                                else:
+                                    emitter.info(
+                                        "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
+                                        step="create_password",
+                                    )
+                                continue
                             elif _is_create_account_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
                                 emitter.info(
@@ -11767,10 +12588,25 @@ def run_browser_registration(
                                 )
                             elif _is_passkey_challenge_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
-                                emitter.info(
-                                    "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页，判定当前手机号已是老号，准备回到步骤1重开...",
-                                    step="add_phone",
-                                )
+                                password_submitted = False
+                                manual_v2_password_page_logged = False
+                                manual_v2_create_password_submit_attempts = 0
+                                manual_v2_phone_number = ""
+                                if manual_v2_auto_phone_mode:
+                                    _finish_manual_v2_sms_provider(success=False)
+                                    manual_v2_sms_activation_id = ""
+                                    manual_v2_sms_purchased_at = 0.0
+                                    manual_v2_sms_provider_done = False
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页（号码已是老号）；"
+                                        + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                                    )
+                                else:
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页（号码已是老号）；"
+                                        + "已立即回到步骤1，请重新输入新的手机号..."
+                                    )
+                                continue
                             elif _is_phone_input_page(current_url, body_text, page):
                                 emitter.warn(
                                     "浏览器模式2 步骤1手机号提交后仍停留在手机号页，当前号码可能未被站点接受..."
@@ -11805,11 +12641,20 @@ def run_browser_registration(
                                 except HeroSMSAcquireRetryableError as exc:
                                     emitter.warn(str(exc), step="add_phone")
                                     emitter.info(
-                                        f"浏览器模式2 {manual_v2_auto_phone_provider_label} 当前取号失败，但不结束本轮浏览器流程；等待后继续在当前手机号页重试取号...",
+                                        f"浏览器模式2 {manual_v2_auto_phone_provider_label} 当前暂无可用号码/价档，"
+                                        + "不结束本轮浏览器、不进外层休息；留在手机号页继续轮询取号...",
                                         step="add_phone",
                                     )
-                                    _wait_for_load(page, timeout_ms=1200)
-                                    if _sleep_with_page_until(page, 3000, ctx.stop_event):
+                                    _wait_for_load(page, timeout_ms=800)
+                                    # 价档/库存空：短等后重试；比外层 5~30s 休息快得多
+                                    retry_wait_ms = 2500
+                                    exc_text = str(exc or "")
+                                    if any(
+                                        token in exc_text
+                                        for token in ("价格区间", "价档", "没有国家", "无可用国家", "NO_NUMBERS")
+                                    ):
+                                        retry_wait_ms = 2000
+                                    if _sleep_with_page_until(page, retry_wait_ms, ctx.stop_event):
                                         emitter.info(
                                             f"浏览器模式2 {manual_v2_auto_phone_provider_label} 重试等待期间收到停止请求，当前流程立即收尾退出...",
                                             step="add_phone",
@@ -11887,10 +12732,32 @@ def run_browser_registration(
                                         continue
                             if _is_login_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
-                                emitter.info(
-                                    "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
-                                    step="create_password",
-                                )
+                                # 已判定老号：立刻废弃取号，不要只打日志再空等下一轮主循环（可白白多等十几秒）
+                                password_submitted = False
+                                manual_v2_password_page_logged = False
+                                manual_v2_create_password_submit_attempts = 0
+                                if manual_v2_auto_phone_mode:
+                                    _finish_manual_v2_sms_provider(success=False)
+                                    manual_v2_phone_number = ""
+                                    manual_v2_sms_activation_id = ""
+                                    manual_v2_sms_purchased_at = 0.0
+                                    manual_v2_sms_provider_done = False
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 Enter your password（号码已是老号）；"
+                                        + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                                    )
+                                elif manual_v2_manual_restart_on_enter_password:
+                                    manual_v2_phone_number = ""
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 Enter your password（号码已是老号）；"
+                                        + "已立即回到步骤1，请重新输入新的手机号..."
+                                    )
+                                else:
+                                    emitter.info(
+                                        "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
+                                        step="create_password",
+                                    )
+                                continue
                             elif _is_create_account_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
                                 emitter.info(
@@ -11900,10 +12767,25 @@ def run_browser_registration(
                                 )
                             elif _is_passkey_challenge_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
-                                emitter.info(
-                                    "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页，判定当前手机号已是老号，准备回到步骤1重开...",
-                                    step="add_phone",
-                                )
+                                password_submitted = False
+                                manual_v2_password_page_logged = False
+                                manual_v2_create_password_submit_attempts = 0
+                                manual_v2_phone_number = ""
+                                if manual_v2_auto_phone_mode:
+                                    _finish_manual_v2_sms_provider(success=False)
+                                    manual_v2_sms_activation_id = ""
+                                    manual_v2_sms_purchased_at = 0.0
+                                    manual_v2_sms_provider_done = False
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页（号码已是老号）；"
+                                        + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                                    )
+                                else:
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页（号码已是老号）；"
+                                        + "已立即回到步骤1，请重新输入新的手机号..."
+                                    )
+                                continue
                             elif _is_phone_input_page(current_url, body_text, page):
                                 emitter.warn(
                                     "浏览器模式2 步骤1手机号提交后仍停留在手机号页，当前号码可能未被站点接受..."
@@ -12001,10 +12883,32 @@ def run_browser_registration(
                                         continue
                             if _is_login_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
-                                emitter.info(
-                                    "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
-                                    step="create_password",
-                                )
+                                # 已判定老号：立刻废弃取号，不要只打日志再空等下一轮主循环（可白白多等十几秒）
+                                password_submitted = False
+                                manual_v2_password_page_logged = False
+                                manual_v2_create_password_submit_attempts = 0
+                                if manual_v2_auto_phone_mode:
+                                    _finish_manual_v2_sms_provider(success=False)
+                                    manual_v2_phone_number = ""
+                                    manual_v2_sms_activation_id = ""
+                                    manual_v2_sms_purchased_at = 0.0
+                                    manual_v2_sms_provider_done = False
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 Enter your password（号码已是老号）；"
+                                        + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                                    )
+                                elif manual_v2_manual_restart_on_enter_password:
+                                    manual_v2_phone_number = ""
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 Enter your password（号码已是老号）；"
+                                        + "已立即回到步骤1，请重新输入新的手机号..."
+                                    )
+                                else:
+                                    emitter.info(
+                                        "浏览器模式2 步骤1手机号已被站点识别为已存在账号，已自动转入 Enter your password / Forgot password 流程...",
+                                        step="create_password",
+                                    )
+                                continue
                             elif _is_create_account_password_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
                                 emitter.info(
@@ -12014,10 +12918,25 @@ def run_browser_registration(
                                 )
                             elif _is_passkey_challenge_page(current_url, body_text, page):
                                 manual_v2_phone_submit_stall_attempts = 0
-                                emitter.info(
-                                    "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页，判定当前手机号已是老号，准备回到步骤1重开...",
-                                    step="add_phone",
-                                )
+                                password_submitted = False
+                                manual_v2_password_page_logged = False
+                                manual_v2_create_password_submit_attempts = 0
+                                manual_v2_phone_number = ""
+                                if manual_v2_auto_phone_mode:
+                                    _finish_manual_v2_sms_provider(success=False)
+                                    manual_v2_sms_activation_id = ""
+                                    manual_v2_sms_purchased_at = 0.0
+                                    manual_v2_sms_provider_done = False
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页（号码已是老号）；"
+                                        + f"已立即废弃本轮 {manual_v2_auto_phone_provider_label} 号码并回到步骤1重新取新号..."
+                                    )
+                                else:
+                                    _prepare_manual_v2_signup_flow(
+                                        "浏览器模式2 步骤1手机号提交后命中 passkey 挑战页（号码已是老号）；"
+                                        + "已立即回到步骤1，请重新输入新的手机号..."
+                                    )
+                                continue
                             elif _is_phone_input_page(current_url, body_text, page):
                                 emitter.warn(
                                     "浏览器模式2 步骤1手机号提交后仍停留在手机号页，当前号码可能未被站点接受..."
@@ -12280,9 +13199,9 @@ def run_browser_registration(
                             page,
                             emitter=emitter,
                             step="create_account",
-                            max_attempts=8,
-                            settle_ms=1600,
-                            wait_appear_ms=12000,
+                            max_attempts=6,
+                            settle_ms=900,
+                            wait_appear_ms=5500,
                         )
                         try:
                             current_url = str(all_set.get("url") or current_url)
@@ -12664,9 +13583,9 @@ def run_browser_registration(
                             page,
                             emitter=emitter,
                             step="create_account",
-                            max_attempts=8,
-                            settle_ms=1600,
-                            wait_appear_ms=10000,
+                            max_attempts=6,
+                            settle_ms=900,
+                            wait_appear_ms=5000,
                         )
                         try:
                             current_url = str(all_set.get("url") or current_url)
@@ -12717,8 +13636,8 @@ def run_browser_registration(
                             page,
                             emitter=emitter,
                             step="create_account",
-                            max_attempts=8,
-                            settle_ms=1600,
+                            max_attempts=6,
+                            settle_ms=900,
                             wait_appear_ms=0,
                         )
                         profile_submitted = True
@@ -12956,9 +13875,9 @@ def run_browser_registration(
                             page,
                             emitter=emitter,
                             step="create_account",
-                            max_attempts=8,
-                            settle_ms=1600,
-                            wait_appear_ms=12000,
+                            max_attempts=6,
+                            settle_ms=900,
+                            wait_appear_ms=5500,
                         )
                         try:
                             current_url = str(all_set.get("url") or current_url)
@@ -13188,7 +14107,7 @@ def run_browser_registration(
                                 ),
                                 step="oauth_init",
                             )
-                            _wait_for_load(page, timeout_ms=2500)
+                            _wait_for_load(page, timeout_ms=1200)
                             continue
                         if str(choose_account_result.get("reason") or "").strip() == "candidate_not_clickable":
                             manual_v2_choose_account_click_failures += 1
@@ -13820,7 +14739,7 @@ def run_browser_registration(
                                 "api/accounts/phone-otp/send",
                                 within_seconds=20.0,
                             )
-                            hero_sms_code_ready = bool(_probe_manual_v2_auto_sms_code())
+                            hero_sms_code_ready = bool(manual_v2_cached_sms_code)
                             if recent_register_request or recent_phone_otp_send or hero_sms_code_ready:
                                 if hero_sms_code_ready:
                                     manual_v2_contact_seen = True
@@ -14264,9 +15183,9 @@ def run_browser_registration(
                             page,
                             emitter=emitter,
                             step="create_account",
-                            max_attempts=8,
-                            settle_ms=1600,
-                            wait_appear_ms=12000,
+                            max_attempts=6,
+                            settle_ms=900,
+                            wait_appear_ms=5500,
                         )
                         try:
                             current_url = str(all_set.get("url") or current_url)
@@ -15063,7 +15982,7 @@ def run_browser_registration(
                         + _preview_text(body_text, 180)
                     )
 
-                time.sleep(0.8)
+                time.sleep(0.35)
 
             raise RuntimeError("浏览器注册超时，未在限定时间内获取 callback")
         except Exception:
@@ -15074,8 +15993,22 @@ def run_browser_registration(
                     "浏览器流程异常，已保留浏览器现场，便于人工继续观察排查",
                     step="runtime",
                 )
-            raise
+                raise
     finally:
+        watchdog_stop.set()
+        if watchdog_thread is not None and watchdog_thread.is_alive():
+            watchdog_thread.join(timeout=0.5)
+        # 看门狗已经主动杀掉浏览器，现场不可继续复用；即使配置要求保留错误现场，也必须走强制收尾。
+        if watchdog_triggered.is_set():
+            preserve_browser_on_error = False
+        final_rss = _process_tree_rss_bytes()
+        if preserve_browser_on_error and final_rss >= memory_soft_limit:
+            preserve_browser_on_error = False
+            emitter.warn(
+                "进程内存已接近 PM2 上限，忽略错误现场保留并立即关闭浏览器，避免触发 SIGKILL："
+                + f"rss={final_rss / 1024 / 1024:.0f}MB, soft_limit={memory_soft_limit / 1024 / 1024:.0f}MB",
+                step="memory",
+            )
         if preserve_browser_on_error:
             if launch_resources is not None:
                 launch_resources.playwright = playwright
@@ -15090,8 +16023,21 @@ def run_browser_registration(
             )
         else:
             if launch_resources is not None:
-                _close_launch_resources(launch_resources)
+                # 看门狗已终止 Chrome 时，跳过 context/browser/CDP close；这些调用依赖已失联的
+                # Playwright 通道，可能再次卡住外层重试。进程/profile 清理仍在 helper 内执行。
+                _close_launch_resources(
+                    launch_resources,
+                    skip_browser_protocol=watchdog_triggered.is_set(),
+                )
             try:
+                # stop 只关闭 Playwright driver，不再访问 Chrome；即使浏览器已被看门狗清理也应执行。
                 playwright.stop()
             except Exception:
                 pass
+        try:
+            wired_page_ids.clear()
+            recent_network_events.clear()
+        except Exception:
+            pass
+        _prune_page_snapshot_cache()
+        gc.collect()

@@ -150,7 +150,7 @@ HANDLER_API_PROVIDER_LABELS: Dict[str, str] = {
 }
 
 SMSBOWER_AUTO_COUNTRY_ID = 0
-SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO", "CA", "AR", "IT", "BR", "UA", "MA", "GE", "NO"}
+SMSBOWER_EXCLUDED_COUNTRY_ISO_CODES = {"ID", "PH", "RO", "CA", "AR", "IT", "BR", "UA", "MA", "GE", "NO", "CM", "NL", "IL", "PT", "SA", "KE"}
 SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "indonesia",
     "indonesian",
@@ -177,6 +177,21 @@ SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "georgian",
     "norway",
     "norwegian",
+    "cameroon",
+    "cameroonian",
+    "netherlands",
+    "netherland",
+    "dutch",
+    "holland",
+    "israel",
+    "israeli",
+    "portugal",
+    "portuguese",
+    "saudi arabia",
+    "saudi",
+    "ksa",
+    "kenya",
+    "kenyan",
     "印度尼西亚",
     "菲律宾",
     "罗马尼亚",
@@ -188,6 +203,13 @@ SMSBOWER_EXCLUDED_COUNTRY_NAMES = {
     "摩洛哥",
     "格鲁吉亚",
     "挪威",
+    "喀麦隆",
+    "荷兰",
+    "以色列",
+    "葡萄牙",
+    "沙特阿拉伯",
+    "沙特",
+    "肯尼亚",
 }
 
 # 连败国家软禁已停用（原：同国连续失败 5 次禁 5 分钟）。
@@ -689,19 +711,25 @@ class HeroSMSProvider(SMSProvider):
             timeout=timeout_seconds,
             impersonate="chrome",
         )
-        content_type = str(response.headers.get("content-type") or "").lower()
-        if "application/json" in content_type:
+        try:
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "application/json" in content_type:
+                try:
+                    return response.json()
+                except Exception:
+                    pass
+            text = str(response.text or "").strip()
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    return response.json()
+                except Exception:
+                    return text
+            return text
+        finally:
             try:
-                return response.json()
+                response.close()
             except Exception:
                 pass
-        text = str(response.text or "").strip()
-        if text.startswith("{") or text.startswith("["):
-            try:
-                return response.json()
-            except Exception:
-                return text
-        return text
 
     def _request_offers(self, *, proxy: str = "", timeout_seconds: int = 30, service: str = "", country: Optional[int] = None) -> Any:
         normalized_proxy = _normalize_proxy_url(proxy)
@@ -722,16 +750,22 @@ class HeroSMSProvider(SMSProvider):
             timeout=timeout_seconds,
             impersonate="chrome",
         )
-        content_type = str(response.headers.get("content-type") or "").lower()
-        if "application/json" in content_type:
-            return response.json()
-        text = str(response.text or "").strip()
-        if text.startswith("{") or text.startswith("["):
-            try:
+        try:
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "application/json" in content_type:
                 return response.json()
+            text = str(response.text or "").strip()
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    return response.json()
+                except Exception:
+                    return text
+            return text
+        finally:
+            try:
+                response.close()
             except Exception:
-                return text
-        return text
+                pass
 
     def get_balance(self, *, proxy: str = "") -> Optional[float]:
         data = self._request("getBalance", proxy=proxy)
@@ -845,12 +879,21 @@ class HeroSMSProvider(SMSProvider):
                     return nested_result
         return result
 
-    def list_countries(self, *, proxy: str = "") -> List[Dict[str, Any]]:
+    def list_countries(
+        self,
+        *,
+        proxy: str = "",
+        timeout_seconds: int = 30,
+    ) -> List[Dict[str, Any]]:
+        try:
+            request_timeout = max(3, min(int(timeout_seconds or 30), 30))
+        except (TypeError, ValueError):
+            request_timeout = 30
         merged: List[Dict[str, Any]] = []
         seen_ids: set[int] = set()
         for action in ("getCountries", "getCountriesList"):
             try:
-                data = self._request(action, proxy=proxy)
+                data = self._request(action, proxy=proxy, timeout_seconds=request_timeout)
             except Exception:
                 continue
             if isinstance(data, str):
@@ -1390,7 +1433,23 @@ class HeroSMSProvider(SMSProvider):
     ) -> Dict[str, Any]:
         last_error = ""
         provider_label = self._provider_label()
-        selection = self.resolve_country_and_operator(proxy=proxy)
+        # 自动国家/价档库存会瞬时为空：先在取号入口内短轮询，避免直接整轮失败。
+        selection: Dict[str, Any] = {}
+        resolve_attempts = max(3, min(8, int(getattr(self, "max_acquire_retries", 5) or 5)))
+        for resolve_attempt in range(1, resolve_attempts + 1):
+            try:
+                selection = self.resolve_country_and_operator(proxy=proxy)
+                break
+            except HeroSMSAcquireRetryableError as exc:
+                last_error = str(exc)
+                if resolve_attempt >= resolve_attempts:
+                    raise HeroSMSAcquireRetryableError(
+                        last_error
+                        + f"（已在取号入口轮询 {resolve_attempts} 次仍无可用国家/价档）"
+                    ) from exc
+                if _interruptible_sleep(2.0, stop_event):
+                    raise HeroSMSAcquireStoppedError(f"{provider_label} 取号已停止") from exc
+                continue
         self._ensure_fixed_price_matches_known_tier(selection)
         selected_country_id = self._parse_integer(selection.get("hero_sms_country"))
         if selected_country_id is None:
@@ -2134,6 +2193,7 @@ class HeroSMSProvider(SMSProvider):
 class SMSBowerProvider(HeroSMSProvider):
     BASE_URL = "https://smsbower.page/stubs/handler_api.php"
     API_V1_BASE_URL = "https://smsbower.page/api/v1"
+    INVENTORY_REQUEST_TIMEOUT_SECONDS = 8
 
     def _supports_global_auto_country(self) -> bool:
         return True
@@ -2178,7 +2238,12 @@ class SMSBowerProvider(HeroSMSProvider):
     def _request_global_price_matrix(self, *, proxy: str = "") -> tuple[Any, str]:
         for action in ("getPricesV3", "getPricesV2", "getPrices"):
             try:
-                data = self._request(action, proxy=proxy, service=self.service)
+                data = self._request(
+                    action,
+                    proxy=proxy,
+                    service=self.service,
+                    timeout_seconds=self.INVENTORY_REQUEST_TIMEOUT_SECONDS,
+                )
             except Exception:
                 continue
             parsed = self._coerce_json_payload(data)
@@ -2197,7 +2262,10 @@ class SMSBowerProvider(HeroSMSProvider):
                 parsed_country_id = self._parse_integer(key)
                 if parsed_country_id is not None:
                     country_ids.add(parsed_country_id)
-        for item in self.list_countries(proxy=proxy):
+        for item in self.list_countries(
+            proxy=proxy,
+            timeout_seconds=self.INVENTORY_REQUEST_TIMEOUT_SECONDS,
+        ):
             parsed_country_id = self._parse_integer(item.get("heroSmsCountry"))
             if parsed_country_id is not None:
                 country_ids.add(parsed_country_id)
@@ -2246,7 +2314,10 @@ class SMSBowerProvider(HeroSMSProvider):
         if raw_matrix is None:
             return []
         countries_by_id: Dict[int, Dict[str, Any]] = {}
-        for item in self.list_countries(proxy=proxy):
+        for item in self.list_countries(
+            proxy=proxy,
+            timeout_seconds=self.INVENTORY_REQUEST_TIMEOUT_SECONDS,
+        ):
             parsed_country_id = self._parse_integer(item.get("heroSmsCountry"))
             if parsed_country_id is None:
                 continue
@@ -2337,15 +2408,22 @@ class SMSBowerProvider(HeroSMSProvider):
             return super().resolve_country_and_operator(proxy=proxy)
         candidates = self._build_global_country_candidates(proxy=proxy)
         if not candidates:
+            # 库存/价档会波动：按可重试错误抛出，浏览器会话内继续轮询取号，
+            # 不要整轮注册失败再走外层 5~30 秒“休息中”。
             if (self.min_target_price is not None or self.max_target_price is not None) and self.fixed_price:
-                raise RuntimeError(
-                    f"SMSBower 自动国家模式下，没有国家命中固定价/区间 {self._price_target_label()}。"
+                raise HeroSMSAcquireRetryableError(
+                    f"SMSBower 自动国家模式下，没有国家命中固定价/区间 {self._price_target_label()}；"
+                    + "将在当前流程内继续轮询取号，不结束本轮浏览器会话。"
                 )
             if self.min_target_price is not None or self.max_target_price is not None:
-                raise RuntimeError(
-                    f"SMSBower 自动国家模式下，没有国家存在命中价格区间 {self._price_target_label()} 的可用价档。"
+                raise HeroSMSAcquireRetryableError(
+                    f"SMSBower 自动国家模式下，没有国家存在命中价格区间 {self._price_target_label()} 的可用价档；"
+                    + "将在当前流程内继续轮询取号，不结束本轮浏览器会话。"
                 )
-            raise RuntimeError("SMSBower 自动国家模式下，没有找到可用国家报价。")
+            raise HeroSMSAcquireRetryableError(
+                "SMSBower 自动国家模式下，没有找到可用国家报价；"
+                + "将在当前流程内继续轮询取号，不结束本轮浏览器会话。"
+            )
         first = dict(candidates[0])
         first["country_candidates"] = [dict(item) for item in candidates]
         first["auto_country_mode"] = True
