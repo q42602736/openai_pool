@@ -3553,8 +3553,8 @@ def _pass_youre_all_set_page(
                     )
                 except Exception:
                     pass
-        _wait_for_load(page, timeout_ms=min(3000, int(settle_ms or 1800) + 800))
-        _sleep_with_page(page, max(500, int(settle_ms or 0)))
+        _wait_for_load(page, timeout_ms=min(1800, int(settle_ms or 1800) + 600))
+        _sleep_with_page(page, max(400, int(settle_ms or 0)))
         url, body = _read_page_url_body(page)
         result["url"], result["body"] = url, body
         if not _is_youre_all_set_page(url, body, page):
@@ -4400,7 +4400,7 @@ def _fill_birthdate(page: Any, birthdate: str) -> bool:
             month_values.append(value)
     day_values = [str(int(day)), day]
     year_values = [year]
-    _sleep_with_page(page, 500)
+    _sleep_with_page(page, 200)
 
     birthdate_controls = _collect_visible_locators(
         page,
@@ -4950,8 +4950,8 @@ def _submit_about_you_finish_with_terms_retry(
         if not _click_about_you_finish_button(page):
             continue
         result["clicked"] = True
-        _wait_for_load(page, timeout_ms=2200)
-        _sleep_with_page(page, max(400, int(settle_ms or 0)))
+        _wait_for_load(page, timeout_ms=1500)
+        _sleep_with_page(page, max(300, int(settle_ms or 0)))
         last_url, last_body = _describe_page(page, force_refresh=True)
         deep_body = _get_page_deep_text(page)
         if str(deep_body or "").strip():
@@ -5233,7 +5233,12 @@ def _promote_auth_target_if_needed(page: Any, *, timeout_ms: int = 12000) -> tup
             page.wait_for_timeout(500)
         except Exception:
             pass
-    if (iframe_fast_route and (should_promote or top_fast_route)) or (top_fast_route and not best_url):
+    # about-you 已提升到顶层时不再深读全文：控件探测走 frame 遍历即可，省去每次深读的几秒。
+    about_you_promoted = (
+        "about-you" in best_lower
+        and "about-you" in top_lower
+    )
+    if (iframe_fast_route and (should_promote or top_fast_route)) or (top_fast_route and not best_url) or about_you_promoted:
         # URL 已足够判定密码/短信阶段；调用方会从 frame 查控件，正文留给需要时再读。
         return page, (best_url if iframe_fast_route else top_url), ""
     current_url, body_text = _describe_page(page, force_refresh=True)
@@ -13157,7 +13162,7 @@ def run_browser_registration(
                             page,
                             ctx,
                             max_attempts=3,
-                            settle_ms=1600,
+                            settle_ms=800,
                         )
                         if finish_result.get("terms_retried"):
                             emitter.warn(
@@ -13203,8 +13208,8 @@ def run_browser_registration(
                             emitter=emitter,
                             step="create_account",
                             max_attempts=6,
-                            settle_ms=900,
-                            wait_appear_ms=5500,
+                            settle_ms=700,
+                            wait_appear_ms=3500,
                         )
                         try:
                             current_url = str(all_set.get("url") or current_url)
@@ -13567,7 +13572,7 @@ def run_browser_registration(
                             page,
                             ctx,
                             max_attempts=3,
-                            settle_ms=1400,
+                            settle_ms=800,
                         )
                         current_url = str(finish_result.get("url") or current_url)
                         body_text = str(finish_result.get("body") or body_text)
@@ -13587,8 +13592,8 @@ def run_browser_registration(
                             emitter=emitter,
                             step="create_account",
                             max_attempts=6,
-                            settle_ms=900,
-                            wait_appear_ms=5000,
+                            settle_ms=700,
+                            wait_appear_ms=3500,
                         )
                         try:
                             current_url = str(all_set.get("url") or current_url)
@@ -13800,7 +13805,7 @@ def run_browser_registration(
                             page,
                             ctx,
                             max_attempts=3,
-                            settle_ms=1600,
+                            settle_ms=800,
                         )
                         if finish_result.get("terms_retried"):
                             emitter.warn(
@@ -13879,8 +13884,8 @@ def run_browser_registration(
                             emitter=emitter,
                             step="create_account",
                             max_attempts=6,
-                            settle_ms=900,
-                            wait_appear_ms=5500,
+                            settle_ms=700,
+                            wait_appear_ms=3500,
                         )
                         try:
                             current_url = str(all_set.get("url") or current_url)
@@ -15106,7 +15111,7 @@ def run_browser_registration(
                         page,
                         ctx,
                         max_attempts=3,
-                        settle_ms=1600,
+                        settle_ms=800,
                     )
                     if finish_result.get("terms_retried"):
                         emitter.warn(
@@ -15187,8 +15192,8 @@ def run_browser_registration(
                             emitter=emitter,
                             step="create_account",
                             max_attempts=6,
-                            settle_ms=900,
-                            wait_appear_ms=5500,
+                            settle_ms=700,
+                            wait_appear_ms=3500,
                         )
                         try:
                             current_url = str(all_set.get("url") or current_url)
