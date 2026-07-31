@@ -11944,18 +11944,22 @@ def run_browser_registration(
                         )
                     )
                     _touch_browser_watchdog("手机输入值读取")
-                    captured_phone = _extract_input_value_by_hints(
-                        page,
-                        ["phone", "mobile", "手机号", "电话", "tel"],
-                    )
-                    if captured_phone:
-                        manual_v2_phone_number = captured_phone
+                    # 仅在手机号输入阶段才遍历 input 回读手机号；密码/验证码/资料页无 phone 输入框，
+                    # 跳过可避免每轮对全部 input 做 evaluate+input_value（可省数秒）。
+                    if is_phone_stage_page:
+                        captured_phone = _extract_input_value_by_hints(
+                            page,
+                            ["phone", "mobile", "手机号", "电话", "tel"],
+                        )
+                        if captured_phone:
+                            manual_v2_phone_number = captured_phone
 
                     # 步骤1任意阶段：号码已绑定旧账号（含 “sign in to h****@o****.com using usual sign-in method”）
                     # 立即废弃当前号并重新取号，不要卡在登录引导页。
                     _touch_browser_watchdog("手机号状态识别")
                     if (
                         not manual_v2_login_flow_started
+                        and not manual_v2_contact_seen
                         and _is_phone_number_existing_account_error(current_url, body_text, page)
                     ):
                         password_submitted = False
