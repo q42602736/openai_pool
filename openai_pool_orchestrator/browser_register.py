@@ -9781,14 +9781,14 @@ def run_browser_registration(
                 continue
             if not callback_state["url"]:
                 _consume_loopback_callback()
-            page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=8000)
+            page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=2500)
             latest_url_lower = latest_url.lower()
             latest_state = _classify_page_state(latest_url, latest_body, page)
             latest_signature = _page_snapshot_signature(latest_url, latest_body)
             if callback_state["url"] or ("code=" in latest_url_lower and "state=" in latest_url_lower):
                 return latest_url, latest_body
             if _has_recent_network_url(recent_network_events, "create-account/password", within_seconds=20.0):
-                page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=2500)
                 latest_url_lower = latest_url.lower()
             if _is_create_account_password_page(latest_url, latest_body, page):
                 return latest_url, latest_body
@@ -10064,7 +10064,7 @@ def run_browser_registration(
             page = active_page
             if not callback_state["url"]:
                 _consume_loopback_callback()
-            page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=8000)
+            page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=2500)
             latest_url_lower = latest_url.lower()
             latest_state = _classify_page_state(latest_url, latest_body, page)
             latest_body_lower = str(latest_body or "").lower()
@@ -10095,7 +10095,7 @@ def run_browser_registration(
             + f", pages={_page_navigation_debug_summary(page)}",
             step=step,
         )
-        page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=8000)
+        page, latest_url, latest_body = _promote_auth_target_if_needed(page, timeout_ms=2500)
         return latest_url, latest_body
 
     def _wait_for_manual_v2_reset_password_continue_transition(
@@ -10751,6 +10751,7 @@ def run_browser_registration(
                     manual_v2_sms_activation_id,
                     proxy=ctx.proxy,
                     timeout_seconds=timeout_seconds,
+                    poll_interval_seconds=2.5,
                     stop_event=stop_event,
                 )
                 or ""
@@ -10796,7 +10797,7 @@ def run_browser_registration(
         active_page = _resolve_active_page(page, timeout_ms=1800)
         if active_page is not None:
             page = active_page
-        page, recheck_url, recheck_body = _promote_auth_target_if_needed(page, timeout_ms=10000)
+        page, recheck_url, recheck_body = _promote_auth_target_if_needed(page, timeout_ms=2500)
         password_input_visible = _first_visible_locator(
             page,
             [
@@ -11859,7 +11860,7 @@ def run_browser_registration(
                             + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
                             step="phone_verification",
                         )
-                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                         current_url_lower = str(current_url or "").lower()
                         # 若是可点的会话结束壳，只点 Log in / Continue，不要清注册状态。
                         _click_first(
@@ -11920,7 +11921,7 @@ def run_browser_registration(
                 if is_manual_v2_mode:
                     _extend_manual_v2_deadline(1800)
                     _touch_browser_watchdog("认证页/frame 提升")
-                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=6000)
+                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                     current_url_lower = str(current_url or "").lower()
                     body_lower = str(body_text or "").lower()
                     is_create_password_page = _is_create_account_password_page(current_url, body_text, page)
@@ -12325,18 +12326,9 @@ def run_browser_registration(
                                 _sleep_with_page(page, 500)
                                 continue
                             refreshed_retryable = False
+                            # 网络事件判定是纯内存操作，最先检查：发码链路已触发就立即切换验证码阶段，
+                            # 不必先做 4 轮全文刷新（每轮 _describe_page + _get_page_deep_text 可能耗时数秒）。
                             for _ in range(4):
-                                current_url, refreshed_body = _describe_page(page, force_refresh=True)
-                                deep_retry_body = _get_page_deep_text(page)
-                                if str(deep_retry_body or "").strip():
-                                    body_text = str(deep_retry_body or "")
-                                else:
-                                    body_text = refreshed_body
-                                if _is_create_account_failed_error(current_url, body_text, page):
-                                    break
-                                if _is_retryable_error_page(current_url, body_text):
-                                    refreshed_retryable = True
-                                    break
                                 recent_contact_verification_network = _has_recent_network_url(
                                     recent_network_events,
                                     "contact-verification",
@@ -12350,6 +12342,17 @@ def run_browser_registration(
                                 hero_sms_code_ready = bool(manual_v2_cached_sms_code)
                                 if recent_contact_verification_network or recent_phone_otp_send or hero_sms_code_ready:
                                     manual_v2_contact_network_seen = True
+                                    break
+                                current_url, refreshed_body = _describe_page(page, force_refresh=True)
+                                deep_retry_body = _get_page_deep_text(page)
+                                if str(deep_retry_body or "").strip():
+                                    body_text = str(deep_retry_body or "")
+                                else:
+                                    body_text = refreshed_body
+                                if _is_create_account_failed_error(current_url, body_text, page):
+                                    break
+                                if _is_retryable_error_page(current_url, body_text):
+                                    refreshed_retryable = True
                                     break
                                 _wait_for_load(page, timeout_ms=600)
                                 _sleep_with_page(page, 180)
@@ -12492,9 +12495,9 @@ def run_browser_registration(
                                 previous_body,
                                 timeout_ms=18000,
                             )
-                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                             if _is_login_with_bridge_page(current_url, body_text, page):
-                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                                 # 若其实已进入密码/passkey 页，不要按桥接失败处理。
                                 if (
                                     _is_create_account_password_page(current_url, body_text, page)
@@ -12533,7 +12536,7 @@ def run_browser_registration(
                                     if _handle_manual_v2_phone_submit_stall(current_url, body_text):
                                         continue
                                     # stall 返回 False 后，再提升一次页面再判定；真正进入密码页则落回主循环。
-                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                                     if (
                                         _is_create_account_password_page(current_url, body_text, page)
                                         or _is_login_password_page(current_url, body_text, page)
@@ -12671,9 +12674,9 @@ def run_browser_registration(
                                 previous_body,
                                 timeout_ms=18000,
                             )
-                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                             if _is_login_with_bridge_page(current_url, body_text, page):
-                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                                 # 若其实已进入密码/passkey 页，不要按桥接失败处理。
                                 if (
                                     _is_create_account_password_page(current_url, body_text, page)
@@ -12712,7 +12715,7 @@ def run_browser_registration(
                                     if _handle_manual_v2_phone_submit_stall(current_url, body_text):
                                         continue
                                     # stall 返回 False 后，再提升一次页面再判定；真正进入密码页则落回主循环。
-                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                                     if (
                                         _is_create_account_password_page(current_url, body_text, page)
                                         or _is_login_password_page(current_url, body_text, page)
@@ -12822,9 +12825,9 @@ def run_browser_registration(
                                 previous_body,
                                 timeout_ms=18000,
                             )
-                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                             if _is_login_with_bridge_page(current_url, body_text, page):
-                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                                 # 若其实已进入密码/passkey 页，不要按桥接失败处理。
                                 if (
                                     _is_create_account_password_page(current_url, body_text, page)
@@ -12863,7 +12866,7 @@ def run_browser_registration(
                                     if _handle_manual_v2_phone_submit_stall(current_url, body_text):
                                         continue
                                     # stall 返回 False 后，再提升一次页面再判定；真正进入密码页则落回主循环。
-                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                                    page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                                     if (
                                         _is_create_account_password_page(current_url, body_text, page)
                                         or _is_login_password_page(current_url, body_text, page)
@@ -13110,7 +13113,7 @@ def run_browser_registration(
                         # 仅在真正进入资料页后才标记短信已完成；密码页误判时不能短路接码。
                         manual_v2_sms_code_submitted = True
                         _extend_manual_v2_deadline(1800)
-                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=3000)
                         # promote 后若其实仍在密码页，立即退出本分支，交给密码/短信流程。
                         if (
                             _is_create_account_password_page(current_url, body_text, page)
@@ -13347,7 +13350,7 @@ def run_browser_registration(
                                 body_text,
                                 timeout_ms=18000,
                             )
-                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                             if _is_profile_page(current_url, body_text, page) or "about-you" in str(current_url or "").lower():
                                 emitter.info(
                                     "浏览器模式2 短信验证码通过后已进入 about-you 资料页，下一轮自动填写姓名/年龄并点击 Finish creating account..."
@@ -13414,7 +13417,7 @@ def run_browser_registration(
                                 body_text,
                                 timeout_ms=18000,
                             )
-                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=10000)
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=2500)
                             if _is_profile_page(current_url, body_text, page) or "about-you" in str(current_url or "").lower():
                                 emitter.info(
                                     "浏览器模式2 短信验证码通过后已进入 about-you 资料页，下一轮自动填写姓名/年龄并点击 Finish creating account..."
@@ -13756,7 +13759,7 @@ def run_browser_registration(
                         # 短信验证后即使 contact_seen 标志丢失，也要能进入资料页。
                         manual_v2_contact_seen = True
                         _extend_manual_v2_deadline(1800)
-                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                        page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=3000)
                         if (
                             _is_create_account_password_page(current_url, body_text, page)
                             or (
@@ -14010,7 +14013,7 @@ def run_browser_registration(
                                 + f" current_url={_mask_secret(current_url, head=72, tail=18)}",
                                 step="phone_verification",
                             )
-                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                            page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=3000)
                             if _is_profile_page(current_url, body_text, page) or "about-you" in str(current_url or "").lower():
                                 continue
                             # 给站点一次自然恢复机会；若持续停留再由主循环其它分支处理。
@@ -14035,7 +14038,7 @@ def run_browser_registration(
                                     body_text,
                                     timeout_ms=8000,
                                 )
-                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=8000)
+                                page, current_url, body_text = _promote_auth_target_if_needed(page, timeout_ms=3000)
                                 if _is_contact_verification_page(current_url, body_text, page) or (
                                     "contact-verification" in str(current_url or "").lower()
                                 ):
