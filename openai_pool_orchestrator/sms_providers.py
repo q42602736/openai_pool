@@ -698,74 +698,112 @@ class HeroSMSProvider(SMSProvider):
         return abs(left_number - right_number) <= cls.PRICE_COMPARE_EPSILON
 
     def _request(self, action: str, *, proxy: str = "", timeout_seconds: int = 30, **params: Any) -> Any:
-        normalized_proxy = _normalize_proxy_url(proxy)
-        proxies = {"http": normalized_proxy, "https": normalized_proxy} if normalized_proxy else None
-        response = requests.get(
-            self.BASE_URL,
-            params={
-                "api_key": self.api_key,
-                "action": action,
-                **params,
-            },
-            proxies=proxies,
-            timeout=timeout_seconds,
-            impersonate="chrome",
+        return self._request_with_tls_retry(
+            lambda **call_kwargs: requests.get(
+                self.BASE_URL,
+                params={
+                    "api_key": self.api_key,
+                    "action": action,
+                    **params,
+                },
+                **call_kwargs,
+            ),
+            proxy=proxy,
+            timeout_seconds=timeout_seconds,
+            action_label=action,
         )
-        try:
-            content_type = str(response.headers.get("content-type") or "").lower()
-            if "application/json" in content_type:
-                try:
-                    return response.json()
-                except Exception:
-                    pass
-            text = str(response.text or "").strip()
-            if text.startswith("{") or text.startswith("["):
-                try:
-                    return response.json()
-                except Exception:
-                    return text
-            return text
-        finally:
-            try:
-                response.close()
-            except Exception:
-                pass
 
     def _request_offers(self, *, proxy: str = "", timeout_seconds: int = 30, service: str = "", country: Optional[int] = None) -> Any:
-        normalized_proxy = _normalize_proxy_url(proxy)
-        proxies = {"http": normalized_proxy, "https": normalized_proxy} if normalized_proxy else None
         params: Dict[str, Any] = {}
         if service:
             params["services"] = service
         if country is not None:
             params["countries"] = str(int(country))
-        response = requests.get(
-            f"{self.API_V1_BASE_URL}/activations/offers",
-            headers={
-                "Authorization": f"ApiKey {self.api_key}",
-                "Accept": "application/json",
-            },
-            params=params,
-            proxies=proxies,
-            timeout=timeout_seconds,
-            impersonate="chrome",
+        return self._request_with_tls_retry(
+            lambda **call_kwargs: requests.get(
+                f"{self.API_V1_BASE_URL}/activations/offers",
+                headers={
+                    "Authorization": f"ApiKey {self.api_key}",
+                    "Accept": "application/json",
+                },
+                params=params,
+                **call_kwargs,
+            ),
+            proxy=proxy,
+            timeout_seconds=timeout_seconds,
+            action_label="activations/offers",
         )
-        try:
-            content_type = str(response.headers.get("content-type") or "").lower()
-            if "application/json" in content_type:
-                return response.json()
-            text = str(response.text or "").strip()
-            if text.startswith("{") or text.startswith("["):
-                try:
-                    return response.json()
-                except Exception:
-                    return text
-            return text
-        finally:
+
+    # curl_cffi 走代理访问接码平台时偶发 TLS 握手被重置（curl: (35) OPENSSL_internal:invalid library），
+    # 非代码问题，重试 + 降级 HTTP/1.1 即可恢复；不重试会让整轮注册因一次网络抖动失败。
+    _TRANSIENT_TLS_RETRY_COUNT = 2
+    _TRANSIENT_TLS_ERROR_HINTS = (
+        "curl: (35)",
+        "TLS connect error",
+        "OPENSSL_internal:invalid library",
+        "SSL_ERROR_SYSCALL",
+    )
+
+    @classmethod
+    def _is_transient_tls_error(cls, exc: Any) -> bool:
+        message = str(exc or "")
+        return any(hint in message for hint in cls._TRANSIENT_TLS_ERROR_HINTS)
+
+    def _request_with_tls_retry(
+        self,
+        request_func: Any,
+        *,
+        proxy: str = "",
+        timeout_seconds: int = 30,
+        action_label: str = "",
+    ) -> Any:
+        normalized_proxy = _normalize_proxy_url(proxy)
+        proxies = {"http": normalized_proxy, "https": normalized_proxy} if normalized_proxy else None
+
+        def _perform(call_kwargs: Dict[str, Any]) -> Any:
+            response = request_func(**call_kwargs)
             try:
-                response.close()
-            except Exception:
-                pass
+                content_type = str(response.headers.get("content-type") or "").lower()
+                if "application/json" in content_type:
+                    try:
+                        return response.json()
+                    except Exception:
+                        pass
+                text = str(response.text or "").strip()
+                if text.startswith("{") or text.startswith("["):
+                    try:
+                        return response.json()
+                    except Exception:
+                        return text
+                return text
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+        base_kwargs: Dict[str, Any] = {
+            "proxies": proxies,
+            "timeout": timeout_seconds,
+            "impersonate": "chrome",
+        }
+        candidates: List[Dict[str, Any]] = [dict(base_kwargs)]
+        candidates.append({**base_kwargs, "http_version": "v1"})
+        last_exc: Optional[Exception] = None
+        for candidate in candidates:
+            for attempt in range(self._TRANSIENT_TLS_RETRY_COUNT):
+                try:
+                    return _perform(candidate)
+                except Exception as exc:
+                    last_exc = exc
+                    message = str(exc)
+                    if not self._is_transient_tls_error(exc):
+                        raise
+                    if attempt < self._TRANSIENT_TLS_RETRY_COUNT - 1:
+                        time.sleep(min(0.4 * (attempt + 1), 1.2))
+        raise last_exc if last_exc is not None else RuntimeError(
+            f"HeroSMS API 请求失败: {action_label or 'unknown'}"
+        )
 
     def get_balance(self, *, proxy: str = "") -> Optional[float]:
         data = self._request("getBalance", proxy=proxy)
